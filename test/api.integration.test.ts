@@ -487,6 +487,35 @@ describe('Keiko session API', () => {
     });
   });
 
+  it('keeps one snapshot when duplicate queue deliveries process the same job concurrently', async () => {
+    const userId = `concurrent-backup-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
+       VALUES (?, ?, 'queued', ?)`
+    ).bind(jobId, userId, new Date().toISOString()).run();
+    const acks = [vi.fn(), vi.fn()];
+    const retries = [vi.fn(), vi.fn()];
+    const messages = [0, 1].map((index) => ({
+      body: { jobId, userId },
+      attempts: 1,
+      retry: retries[index],
+      ack: acks[index],
+    } as unknown as Message<{ jobId: string; userId: string }>));
+
+    await Promise.all(messages.map((message) => processBackupMessage(message, testEnv)));
+
+    const snapshots = await env.DB.prepare(
+      'SELECT id FROM backup_snapshots WHERE job_id = ?'
+    ).bind(jobId).all();
+    expect(snapshots.results).toHaveLength(1);
+    expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(jobId).first()).toMatchObject({
+      status: 'completed',
+    });
+    expect(acks.every((ack) => ack.mock.calls.length === 1)).toBe(true);
+    expect(retries.every((retry) => retry.mock.calls.length === 0)).toBe(true);
+  });
+
   it('deduplicates scheduled backup jobs for the same schedule occurrence', async () => {
     const userId = `scheduled-backup-${crypto.randomUUID()}`;
     await env.DB.prepare(
@@ -538,6 +567,43 @@ describe('Keiko session API', () => {
     expect(jobs.results[0]).toMatchObject({ status: 'queued' });
     expect(send.mock.calls[0]?.[0]).toMatchObject({ jobId: jobs.results[0]?.id });
     expect(send.mock.calls[1]?.[0]).toMatchObject({ jobId: jobs.results[0]?.id });
+  });
+
+  it('recovers a stale scheduled job from an earlier occurrence', async () => {
+    const userId = `scheduled-stale-${crypto.randomUUID()}`;
+    await env.DB.prepare('DELETE FROM github_installations').run();
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`
+    ).bind(userId, 99003, 'owner', 'repo', 99003, new Date().toISOString()).run();
+    const oldJobId = `job-${crypto.randomUUID()}`;
+    const staleDispatchAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs
+       (id, user_id, status, requested_at, schedule_key, dispatch_attempted_at)
+       VALUES (?, ?, 'queued', ?, ?, ?)`
+    ).bind(
+      oldJobId,
+      userId,
+      new Date(Date.now() - 24 * 60 * 60_000).toISOString(),
+      '0 3 * * *:previous-occurrence',
+      staleDispatchAt
+    ).run();
+    const send = vi.fn(async (_message: unknown) => {});
+    const scheduledEnv = Object.assign(Object.create(env), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+
+    await worker.scheduled!(
+      { cron: '0 3 * * *', scheduledTime: Date.now() } as ScheduledController,
+      scheduledEnv
+    );
+
+    expect(send).toHaveBeenCalledWith({ jobId: oldJobId, userId });
+    expect(await env.DB.prepare('SELECT dispatch_attempted_at FROM backup_jobs WHERE id = ?').bind(oldJobId).first()).not.toMatchObject({
+      dispatch_attempted_at: staleDispatchAt,
+    });
   });
 
   it('exposes read-only MCP tools backed by the same user-scoped session service', async () => {
