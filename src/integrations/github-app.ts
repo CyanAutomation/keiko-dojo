@@ -185,6 +185,12 @@ function validSessionDate(value: string): boolean {
 
 function sessionMarkdown(row: SnapshotSession): string {
   const session = markdownSession(row);
+  const escapeMarkdown = (value: string) => value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/([\\`*_{}\[\]()#+\-.!|~])/g, '\\$1');
+  const escapeTechnique = (value: string) => escapeMarkdown(value.replace(/[\r\n\t]+/g, ' ').trim());
   const frontmatter = [
     `id: ${JSON.stringify(session.id)}`,
     `date: ${JSON.stringify(session.date)}`,
@@ -194,9 +200,9 @@ function sessionMarkdown(row: SnapshotSession): string {
     ...(session.videoUrl ? [`videoUrl: ${JSON.stringify(session.videoUrl)}`] : []),
   ];
   const techniques = session.techniques.length
-    ? session.techniques.map((technique) => `- ${technique}`).join('\n')
+    ? session.techniques.map((technique) => `- ${escapeTechnique(technique)}`).join('\n')
     : '- (none recorded)';
-  return `---\n${frontmatter.join('\n')}\n---\n\n# ${session.date} - Judo Session: ${session.category}\n\n## Techniques Practiced\n${techniques}\n\n## Session Description\n\n${session.description ?? ''}\n\n## Notes\n\n${session.notes ?? ''}\n`;
+  return `---\n${frontmatter.join('\n')}\n---\n\n# ${session.date} - Judo Session: ${session.category}\n\n## Techniques Practiced\n${techniques}\n\n## Session Description\n\n${escapeMarkdown(session.description ?? '')}\n\n## Notes\n\n${escapeMarkdown(session.notes ?? '')}\n`;
 }
 
 function sessionFilePath(session: SnapshotSession): string {

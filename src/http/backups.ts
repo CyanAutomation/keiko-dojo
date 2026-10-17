@@ -1,5 +1,7 @@
 import { authenticateRequest, AuthFailure } from '../auth/bearer-auth';
+import { isEffortLevel, isJsonObject, isSessionCategory, validateSessionPayload } from '../domain/session';
 import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../integrations/github-app';
+import { readJsonBodyLimited } from './request-body';
 import { jsonError, jsonResponse } from './responses';
 
 type BackupMessage = { jobId: string; userId: string };
@@ -22,19 +24,36 @@ function authError(error: AuthFailure, requestId: string): Response {
   return jsonError(requestId, status, code, error.message);
 }
 
-async function bodyObject(request: Request): Promise<Record<string, unknown> | null> {
-  try {
-    const value: unknown = await request.json();
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
+type BodyObjectResult =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; reason: 'invalid' | 'too_large' };
+
+async function bodyObject(request: Request): Promise<BodyObjectResult> {
+  const parsed = await readJsonBodyLimited(request, 64 * 1024);
+  if (!parsed.ok) return parsed;
+  return isJsonObject(parsed.value)
+    ? { ok: true, value: parsed.value }
+    : { ok: false, reason: 'invalid' };
+}
+
+function bodyError(requestId: string, result: Extract<BodyObjectResult, { ok: false }>, message: string): Response {
+  return result.reason === 'too_large'
+    ? jsonError(requestId, 413, 'payload_too_large', 'Request body exceeds the 64 KiB limit')
+    : jsonError(requestId, 400, 'bad_request', message);
 }
 
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+function isCanonicalTimestamp(value: string): boolean {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return false;
+  try {
+    return new Date(timestamp).toISOString() === value;
+  } catch {
+    return false;
+  }
 }
 
 async function hashState(value: string): Promise<string> {
@@ -61,8 +80,10 @@ function githubResultRedirect(env: Env, result: 'connected' | 'failed'): Respons
 
 async function beginGitHubInstallation(request: Request, env: Env, requestId: string): Promise<Response> {
   const principal = await authenticateRequest(request, env, 'backups:write');
-  const body = await bodyObject(request);
-  if (!body || Object.keys(body).length !== 0) return jsonError(requestId, 400, 'bad_request', 'Invalid installation request');
+  const parsed = await bodyObject(request);
+  if (!parsed.ok) return bodyError(requestId, parsed, 'Invalid installation request');
+  const body = parsed.value;
+  if (Object.keys(body).length !== 0) return jsonError(requestId, 400, 'bad_request', 'Invalid installation request');
   const installUrlText = env.GITHUB_APP_INSTALL_URL;
   let installUrl: URL;
   try { installUrl = new URL(installUrlText); } catch { return jsonError(requestId, 503, 'internal_error', 'GitHub App is not configured'); }
@@ -160,8 +181,9 @@ async function status(request: Request, env: Env, requestId: string): Promise<Re
 
 async function requestBackup(request: Request, env: Env, requestId: string): Promise<Response> {
   const principal = await authenticateRequest(request, env, 'backups:write');
-  const body = await bodyObject(request);
-  if (!body || Object.keys(body).length !== 0) {
+  const parsed = await bodyObject(request);
+  if (!parsed.ok) return bodyError(requestId, parsed, 'Invalid backup request');
+  if (Object.keys(parsed.value).length !== 0) {
     return jsonError(requestId, 400, 'bad_request', 'Invalid backup request');
   }
   const id = crypto.randomUUID();
@@ -188,13 +210,14 @@ async function previewRestore(
   requestId: string
 ): Promise<Response> {
   const snapshot = await env.DB.prepare(
-    `SELECT id, created_at, session_count, payload FROM backup_snapshots WHERE id = ? AND user_id = ?`
-  ).bind(snapshotId, userId).first<{ id: string; created_at: string; session_count: number; payload: string }>();
+    `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots WHERE id = ? AND user_id = ?`
+  ).bind(snapshotId, userId).first<SnapshotRow>();
   if (!snapshot) return jsonError(requestId, 404, 'not_found', 'Backup not found');
+  const snapshotRows = await validatedSnapshotRows(snapshot);
+  if (!snapshotRows) return jsonError(requestId, 500, 'internal_error', 'Backup snapshot is invalid');
   const rows = await env.DB.prepare(
     'SELECT id, updated_at FROM sessions WHERE user_id = ?'
   ).bind(userId).all<{ id: string; updated_at: string }>();
-  const snapshotRows = JSON.parse(snapshot.payload) as SnapshotSession[];
   const snapshotIds = new Set(snapshotRows.map((row) => row.id));
   const preservedNewerCount = rows.results.filter((row) =>
     row.updated_at > snapshot.created_at || !snapshotIds.has(row.id)
@@ -220,15 +243,18 @@ async function restore(
   env: Env,
   requestId: string
 ): Promise<Response> {
-  const body = await bodyObject(request);
-  if (!body || Object.keys(body).length !== 1 || body.confirm !== true) {
+  const parsed = await bodyObject(request);
+  if (!parsed.ok) return bodyError(requestId, parsed, 'Explicit restore confirmation is required');
+  const body = parsed.value;
+  if (Object.keys(body).length !== 1 || body.confirm !== true) {
     return jsonError(requestId, 400, 'bad_request', 'Explicit restore confirmation is required');
   }
   const snapshot = await env.DB.prepare(
-    `SELECT id, created_at, payload FROM backup_snapshots WHERE id = ? AND user_id = ?`
-  ).bind(snapshotId, userId).first<{ id: string; created_at: string; payload: string }>();
+    `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots WHERE id = ? AND user_id = ?`
+  ).bind(snapshotId, userId).first<SnapshotRow>();
   if (!snapshot) return jsonError(requestId, 404, 'not_found', 'Backup not found');
-  const snapshotRows = JSON.parse(snapshot.payload) as SnapshotSession[];
+  const snapshotRows = await validatedSnapshotRows(snapshot);
+  if (!snapshotRows) return jsonError(requestId, 500, 'internal_error', 'Backup snapshot is invalid');
   const current = await env.DB.prepare(
     'SELECT id, updated_at FROM sessions WHERE user_id = ?'
   ).bind(userId).all<{ id: string; updated_at: string }>();
@@ -300,6 +326,71 @@ export async function handleBackupRequest(
   }
 }
 
+type SnapshotRow = {
+  id: string;
+  created_at: string;
+  session_count: number;
+  checksum: string;
+  payload: string;
+};
+
+async function validatedSnapshotRows(snapshot: SnapshotRow): Promise<SnapshotSession[] | null> {
+  if (
+    !snapshot.id ||
+    !isCanonicalTimestamp(snapshot.created_at) ||
+    !Number.isInteger(snapshot.session_count) || snapshot.session_count < 0 ||
+    !/^[a-f0-9]{64}$/.test(snapshot.checksum)
+  ) return null;
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(snapshot.payload));
+  if (hex(new Uint8Array(digest)) !== snapshot.checksum) return null;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(snapshot.payload) as unknown;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(decoded) || decoded.length !== snapshot.session_count) return null;
+  const seen = new Set<string>();
+  const rows: SnapshotSession[] = [];
+  for (const value of decoded) {
+    if (
+      !isJsonObject(value) ||
+      typeof value.id !== 'string' ||
+      typeof value.session_date !== 'string' ||
+      typeof value.category !== 'string' ||
+      !isSessionCategory(value.category) ||
+      !isEffortLevel(value.effort) ||
+      typeof value.payload !== 'string' ||
+      !Number.isInteger(value.revision) || (value.revision as number) < 1 ||
+      typeof value.updated_at !== 'string' ||
+      !isCanonicalTimestamp(value.updated_at) ||
+      seen.has(value.id)
+    ) return null;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(value.payload) as unknown;
+    } catch {
+      return null;
+    }
+    if (!isJsonObject(payload)) return null;
+    const validation = validateSessionPayload(payload, {
+      routeId: value.id,
+      generateIdWhenMissing: false,
+    });
+    if (
+      !validation.ok ||
+      payload.id !== value.id ||
+      validation.session.id !== value.id ||
+      validation.session.date !== value.session_date ||
+      validation.session.category !== value.category ||
+      validation.session.effort !== value.effort
+    ) return null;
+    seen.add(value.id);
+    rows.push(value as unknown as SnapshotSession);
+  }
+  return rows;
+}
+
 export async function processBackupMessage(
   message: Message<BackupMessage>,
   env: Env
@@ -321,19 +412,26 @@ export async function processBackupMessage(
        FROM sessions WHERE user_id = ? ORDER BY session_date DESC, id DESC`
     ).bind(userId).all<SnapshotSession>();
     const existing = await env.DB.prepare(
-      `SELECT id, created_at, payload FROM backup_snapshots WHERE job_id = ? AND user_id = ?`
-    ).bind(jobId, userId).first<{ id: string; created_at: string; payload: string }>();
+      `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots WHERE job_id = ? AND user_id = ?`
+    ).bind(jobId, userId).first<SnapshotRow>();
     let snapshotId = existing?.id;
     let createdAt = existing?.created_at;
     let snapshotRows = rows.results;
     if (existing) {
-      snapshotRows = JSON.parse(existing.payload) as SnapshotSession[];
+      const validRows = await validatedSnapshotRows(existing);
+      if (!validRows) throw new Error('Backup snapshot is invalid');
+      snapshotRows = validRows;
     } else {
       createdAt = new Date().toISOString();
+      snapshotId = crypto.randomUUID();
       const payload = JSON.stringify(snapshotRows);
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
       const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
-      snapshotId = crypto.randomUUID();
+      const validatedRows = await validatedSnapshotRows({
+        id: snapshotId, created_at: createdAt, session_count: snapshotRows.length, checksum, payload,
+      });
+      if (!validatedRows) throw new Error('Session snapshot is invalid');
+      snapshotRows = validatedRows;
       await env.DB.prepare(
         `INSERT INTO backup_snapshots (id, user_id, job_id, created_at, session_count, checksum, payload)
          VALUES (?, ?, ?, ?, ?, ?, ?)`

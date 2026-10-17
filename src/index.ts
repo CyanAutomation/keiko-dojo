@@ -143,18 +143,53 @@ const worker = {
       }
     }
   },
-  async scheduled(_controller: ScheduledController, env: Env) {
+  async scheduled(controller: ScheduledController, env: Env) {
     const installations = await env.DB.prepare(
       'SELECT user_id FROM github_installations WHERE revoked_at IS NULL'
     ).all<{ user_id: string }>();
+    const requestedAt = new Date(controller.scheduledTime).toISOString();
+    const scheduleKey = `${controller.cron}:${requestedAt}`;
+    const dispatchAttemptedAt = new Date().toISOString();
+    const staleDispatchCutoff = new Date(Date.now() - 60_000).toISOString();
     for (const { user_id: userId } of installations.results) {
       const id = crypto.randomUUID();
-      const requestedAt = new Date().toISOString();
-      await env.DB.prepare(
-        `INSERT INTO backup_jobs (id, user_id, status, requested_at)
-         VALUES (?, ?, 'queued', ?)`
-      ).bind(id, userId, requestedAt).run();
-      await env.BACKUP_QUEUE.send({ jobId: id, userId });
+      const inserted = await env.DB.prepare(
+        `INSERT OR IGNORE INTO backup_jobs
+         (id, user_id, status, requested_at, schedule_key, dispatch_attempted_at)
+         VALUES (?, ?, 'queued', ?, ?, ?)`
+      ).bind(id, userId, requestedAt, scheduleKey, dispatchAttemptedAt).run();
+      let jobId: string = id;
+      let shouldQueue = inserted.meta.changes === 1;
+      if (!shouldQueue) {
+        const existing = await env.DB.prepare(
+          `SELECT id FROM backup_jobs
+           WHERE user_id = ? AND schedule_key = ? AND (
+             (status = 'failed' AND error_code = 'queue_unavailable') OR
+             (status = 'queued' AND dispatch_attempted_at <= ?)
+           )`
+        ).bind(userId, scheduleKey, staleDispatchCutoff).first<{ id: string }>();
+        if (existing) {
+          const retried = await env.DB.prepare(
+            `UPDATE backup_jobs
+             SET status = 'queued', error_code = NULL, dispatch_attempted_at = ?
+             WHERE id = ? AND user_id = ? AND (
+               (status = 'failed' AND error_code = 'queue_unavailable') OR
+               (status = 'queued' AND dispatch_attempted_at <= ?)
+             )`
+          ).bind(dispatchAttemptedAt, existing.id, userId, staleDispatchCutoff).run();
+          shouldQueue = retried.meta.changes === 1;
+          jobId = existing.id;
+        }
+      }
+      if (!shouldQueue) continue;
+      try {
+        await env.BACKUP_QUEUE.send({ jobId, userId });
+      } catch {
+        await env.DB.prepare(
+          `UPDATE backup_jobs SET status = 'failed', error_code = 'queue_unavailable'
+           WHERE id = ? AND user_id = ? AND status = 'queued'`
+        ).bind(jobId, userId).run();
+      }
     }
   },
 } satisfies ExportedHandler<Env>;
