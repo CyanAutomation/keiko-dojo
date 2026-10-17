@@ -166,7 +166,9 @@ describe('GitHub App selected-repository backup adapter', () => {
         id: 's-2', session_date: '2026-10-16', category: 'Randori', effort: 4,
         payload: JSON.stringify({
           id: 's-2', date: '2026-10-16', effort: 4, category: 'Randori',
-          techniques: [], notes: '',
+          techniques: ['Randori drills\n# injected heading'],
+          description: 'Warm-up\n---\n# Injected heading\n<script>alert(1)</script>',
+          notes: '[link](https://evil.test)\n- injected list\n```html',
         }),
         revision: 2, updated_at: '2026-10-17T00:00:00.000Z',
       },
@@ -213,6 +215,13 @@ describe('GitHub App selected-repository backup adapter', () => {
     expect(JSON.parse(String(uploads[1]?.init?.body))).toMatchObject({
       sha: 'existing-session-sha',
     });
+    const secondMarkdown = Buffer.from(
+      JSON.parse(String(uploads[1]?.init?.body)).content,
+      'base64'
+    ).toString('utf8');
+    expect(secondMarkdown).toContain('- Randori drills \\# injected heading');
+    expect(secondMarkdown).toContain('Warm\\-up\n\\-\\-\\-\n\\# Injected heading\n&lt;script&gt;alert\\(1\\)&lt;/script&gt;');
+    expect(secondMarkdown).toContain('\\[link\\]\\(https://evil\\.test\\)\n\\- injected list\n\\`\\`\\`html');
   });
 
   it('rejects GitHub App installations with all-repository access or more than one selected repository', async () => {

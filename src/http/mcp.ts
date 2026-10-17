@@ -1,5 +1,6 @@
 import { authenticateRequest, AuthFailure } from '../auth/bearer-auth';
 import { SessionService } from '../application/session-service';
+import { readJsonBodyLimited } from './request-body';
 import { jsonError } from './responses';
 
 const MCP_VERSION = '2025-11-25';
@@ -97,15 +98,15 @@ export async function handleMcpRequest(
     return jsonError(requestId, 403, 'authentication_required', 'Request origin could not be verified');
   }
   let body: JsonRpcRequest;
-  try {
-    const length = Number(request.headers.get('content-length') ?? 0);
-    if (length > 1024 * 1024) return jsonError(requestId, 413, 'payload_too_large', 'Request body exceeds the 1 MiB limit');
-    const value: unknown = await request.json();
-    if (!isObject(value)) return rpcError(null, -32600, 'Invalid request');
-    body = value as JsonRpcRequest;
-  } catch {
+  const parsed = await readJsonBodyLimited(request, 1024 * 1024);
+  if (!parsed.ok && parsed.reason === 'too_large') {
+    return jsonError(requestId, 413, 'payload_too_large', 'Request body exceeds the 1 MiB limit');
+  }
+  if (!parsed.ok) {
     return rpcError(null, -32700, 'Parse error');
   }
+  if (!isObject(parsed.value)) return rpcError(null, -32600, 'Invalid request');
+  body = parsed.value as JsonRpcRequest;
   if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
     return rpcError(body.id, -32600, 'Invalid request');
   }

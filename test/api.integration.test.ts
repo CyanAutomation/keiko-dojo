@@ -3,6 +3,7 @@ import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { authenticateRequest } from '../src/auth/bearer-auth';
 import worker from '../src/index';
+import { processBackupMessage } from '../src/http/backups';
 
 const issuer = 'https://auth.example.test';
 const jwksUrl = `${issuer}/api/auth/jwks`;
@@ -248,6 +249,22 @@ describe('Keiko session API', () => {
     });
   });
 
+  it('rejects oversized backup and MCP bodies without relying on Content-Length', async () => {
+    const backup = await call('/v1/backups', 'large-backup-body', {
+      method: 'POST',
+      body: ' '.repeat(64 * 1024 + 1),
+    }, { scope: 'backups:write' });
+    expect(backup.status).toBe(413);
+    expect(await backup.json()).toMatchObject({ error: { code: 'payload_too_large' } });
+
+    const mcp = await call('/mcp', 'large-mcp-body', {
+      method: 'POST',
+      body: ' '.repeat(1024 * 1024 + 1),
+    }, { scope: 'sessions:read' });
+    expect(mcp.status).toBe(413);
+    expect(await mcp.json()).toMatchObject({ error: { code: 'payload_too_large' } });
+  });
+
   it('previews restores, requires confirmation, and preserves newer D1 records', async () => {
     const userId = 'restore-user';
     const id = 'restore-session';
@@ -266,6 +283,22 @@ describe('Keiko session API', () => {
       `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
        VALUES (?, ?, 'completed', ?, ?)`
     ).bind(jobId, userId, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:01.000Z').run();
+    const snapshotPayload = JSON.stringify([{
+      id,
+      session_date: snapshotSession.date,
+      category: snapshotSession.category,
+      effort: snapshotSession.effort,
+      payload: JSON.stringify(snapshotSession),
+      revision: 1,
+      updated_at: '2026-01-01T00:00:00.000Z',
+    }]);
+    const snapshotDigest = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(snapshotPayload)
+    );
+    const snapshotChecksum = Array.from(new Uint8Array(snapshotDigest), (value) =>
+      value.toString(16).padStart(2, '0')
+    ).join('');
     await env.DB.prepare(
       `INSERT INTO backup_snapshots
        (id, user_id, job_id, created_at, session_count, checksum, payload)
@@ -276,16 +309,8 @@ describe('Keiko session API', () => {
       jobId,
       '2026-01-01T00:00:01.000Z',
       1,
-      'test-checksum',
-      JSON.stringify([{
-        id,
-        session_date: snapshotSession.date,
-        category: snapshotSession.category,
-        effort: snapshotSession.effort,
-        payload: JSON.stringify(snapshotSession),
-        revision: 1,
-        updated_at: '2026-01-01T00:00:00.000Z',
-      }])
+      snapshotChecksum,
+      snapshotPayload
     ).run();
 
     const preview = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
@@ -306,6 +331,213 @@ describe('Keiko session API', () => {
     expect(await record.json()).toMatchObject({
       data: { session: { notes: 'newer D1 content' } },
     });
+  });
+
+  it('rejects corrupted or tampered snapshots before preview or restore', async () => {
+    const userId = `invalid-snapshot-${crypto.randomUUID()}`;
+    const snapshotId = `snapshot-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    const invalidPayload = JSON.stringify([{
+      id: 'invalid-session',
+      session_date: '2026-10-16',
+      category: 'Technical',
+      effort: 3,
+      payload: JSON.stringify({
+        id: 'invalid-session', date: '2026-10-16', effort: 3,
+        category: 'Technical', techniques: 'not-an-array',
+      }),
+      revision: 1,
+      updated_at: '2026-10-16T12:00:00.000Z',
+    }]);
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(invalidPayload));
+    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
+       VALUES (?, ?, 'completed', ?, ?)`
+    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:01.000Z').run();
+    await env.DB.prepare(
+      `INSERT INTO backup_snapshots
+       (id, user_id, job_id, created_at, session_count, checksum, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, invalidPayload).run();
+
+    const preview = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
+      scope: 'backups:restore',
+    });
+    expect(preview.status).toBe(500);
+    const restore = await call(`/v1/backups/${snapshotId}/restore`, userId, {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true }),
+    }, { scope: 'backups:restore' });
+    expect(restore.status).toBe(500);
+    expect(await env.DB.prepare('SELECT id FROM sessions WHERE user_id = ?').bind(userId).all()).toMatchObject({
+      results: [],
+    });
+  });
+
+  it('rejects a snapshot with a checksum that does not match its payload', async () => {
+    const userId = `checksum-snapshot-${crypto.randomUUID()}`;
+    const snapshotId = `snapshot-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    const payload = '[]';
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
+       VALUES (?, ?, 'completed', ?, ?)`
+    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:01.000Z').run();
+    await env.DB.prepare(
+      `INSERT INTO backup_snapshots
+       (id, user_id, job_id, created_at, session_count, checksum, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 0, '0'.repeat(64), payload).run();
+
+    const response = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
+      scope: 'backups:restore',
+    });
+    expect(response.status).toBe(500);
+  });
+
+  it('rejects snapshots when a row identity disagrees with its nested session', async () => {
+    const userId = `metadata-snapshot-${crypto.randomUUID()}`;
+    const snapshotId = `snapshot-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    const session = { ...testSession, id: 'nested-session-id' };
+    const payload = JSON.stringify([{
+      id: 'row-session-id',
+      session_date: session.date,
+      category: session.category,
+      effort: session.effort,
+      payload: JSON.stringify(session),
+      revision: 1,
+      updated_at: '2026-10-16T12:00:00.000Z',
+    }]);
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
+       VALUES (?, ?, 'completed', ?, ?)`
+    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:01.000Z').run();
+    await env.DB.prepare(
+      `INSERT INTO backup_snapshots
+       (id, user_id, job_id, created_at, session_count, checksum, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
+
+    const response = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
+      scope: 'backups:restore',
+    });
+    expect(response.status).toBe(500);
+  });
+
+  it('validates a saved snapshot before retrying its GitHub backup job', async () => {
+    const userId = `retry-snapshot-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    const snapshotId = `snapshot-${crypto.randomUUID()}`;
+    const payload = '[]';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
+       VALUES (?, ?, 'queued', ?)`
+    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z').run();
+    await env.DB.prepare(
+      `INSERT INTO backup_snapshots
+       (id, user_id, job_id, created_at, session_count, checksum, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
+
+    const retry = vi.fn();
+    const ack = vi.fn();
+    await processBackupMessage({
+      body: { jobId, userId },
+      attempts: 1,
+      retry,
+      ack,
+    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
+
+    expect(retry).toHaveBeenCalledOnce();
+    expect(ack).not.toHaveBeenCalled();
+    expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(jobId).first()).toMatchObject({
+      status: 'queued',
+    });
+  });
+
+  it('creates and completes a valid snapshot for a queued backup', async () => {
+    const userId = `valid-backup-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
+       VALUES (?, ?, 'queued', ?)`
+    ).bind(jobId, userId, new Date().toISOString()).run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+    await processBackupMessage({
+      body: { jobId, userId },
+      attempts: 1,
+      retry,
+      ack,
+    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
+
+    expect(ack).toHaveBeenCalledOnce();
+    expect(retry).not.toHaveBeenCalled();
+    expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(jobId).first()).toMatchObject({
+      status: 'completed',
+    });
+    expect(await env.DB.prepare('SELECT session_count FROM backup_snapshots WHERE job_id = ?').bind(jobId).first()).toMatchObject({
+      session_count: 0,
+    });
+  });
+
+  it('deduplicates scheduled backup jobs for the same schedule occurrence', async () => {
+    const userId = `scheduled-backup-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`
+    ).bind(userId, 99001, 'owner', 'repo', 99001, new Date().toISOString()).run();
+    const send = vi.fn(async (_message: unknown) => {});
+    const scheduledEnv = Object.assign(Object.create(env), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    const scheduledTime = Date.parse('2026-10-17T03:00:00.000Z');
+    const controller = { cron: '0 3 * * *', scheduledTime } as ScheduledController;
+    await worker.scheduled!(controller, scheduledEnv);
+    await worker.scheduled!(controller, scheduledEnv);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    const jobs = await env.DB.prepare(
+      'SELECT id FROM backup_jobs WHERE user_id = ? AND requested_at = ?'
+    ).bind(userId, new Date(scheduledTime).toISOString()).all();
+    expect(jobs.results).toHaveLength(1);
+  });
+
+  it('retries scheduled queue dispatch after a failed send without creating a second job', async () => {
+    const userId = `scheduled-retry-${crypto.randomUUID()}`;
+    await env.DB.prepare('DELETE FROM github_installations').run();
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`
+    ).bind(userId, 99002, 'owner', 'repo', 99002, new Date().toISOString()).run();
+    const send = vi.fn()
+      .mockRejectedValueOnce(new Error('queue unavailable'))
+      .mockResolvedValueOnce(undefined);
+    const scheduledEnv = Object.assign(Object.create(env), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    const scheduledTime = Date.parse('2026-10-17T04:00:00.000Z');
+    const controller = { cron: '0 4 * * *', scheduledTime } as ScheduledController;
+    await worker.scheduled!(controller, scheduledEnv);
+    await worker.scheduled!(controller, scheduledEnv);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    const jobs = await env.DB.prepare(
+      `SELECT id, status FROM backup_jobs
+       WHERE user_id = ? AND requested_at = ?`
+    ).bind(userId, new Date(scheduledTime).toISOString()).all();
+    expect(jobs.results).toHaveLength(1);
+    expect(jobs.results[0]).toMatchObject({ status: 'queued' });
+    expect(send.mock.calls[0]?.[0]).toMatchObject({ jobId: jobs.results[0]?.id });
+    expect(send.mock.calls[1]?.[0]).toMatchObject({ jobId: jobs.results[0]?.id });
   });
 
   it('exposes read-only MCP tools backed by the same user-scoped session service', async () => {
