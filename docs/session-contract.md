@@ -35,3 +35,31 @@ Every stored record has a server-managed integer revision. Single-record reads
 and create/update responses include a strong ETag such as `"1"`; list records
 include the revision number. `PUT` and `DELETE` require the same revision in
 `If-Match`. Missing headers return 428 and stale revisions return 412.
+
+## Analytics and MCP
+
+`GET /v1/analytics/summary` requires `sessions:read` and returns per-account
+session totals, effort average, all/30-day/90-day category and effort
+distributions, recent effort, and scoped backup status. MatMetrics retains its
+training-plan-specific insights and chart presentation.
+
+The stateless `/mcp` JSON-RPC endpoint requires the same `sessions:read` scope
+for initialization, tool discovery, and tool calls. Its deterministic,
+read-only tools are `list_sessions`, `get_session`, and
+`get_training_summary`; each calls the same `SessionService` used by REST.
+Pagination uses the REST opaque cursor. No write tool is published.
+
+## Backups
+
+Backup endpoints use `backups:read`, `backups:write`, or `backups:restore`.
+`POST /v1/backups` queues an on-demand D1 snapshot. An optional GitHub App
+target must be a selected-repository installation granting access to exactly
+one repository. Restore preview records activity; applying a restore requires
+`{"confirm":true}` and preserves newer D1 records. Restore merges snapshot
+records and does not delete records absent from a snapshot.
+
+## Versioning
+
+REST resources are versioned under `/v1`. Breaking payload, scope, pagination,
+or revision changes require a new API version. Additive fields and tools stay
+backward compatible and are reflected in `openapi.yaml` and this contract.

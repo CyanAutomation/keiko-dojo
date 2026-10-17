@@ -23,9 +23,9 @@ npm run migrate:local
 The local Worker reads the public Better Auth JWKS URL, issuer, and Keiko
 audience from `wrangler.jsonc`. It only accepts EdDSA tokens whose subject and
 `appUserId` match, whose `scope` contains the required Keiko scope, and whose
-issued lifetime is at most five minutes. The current MatMetrics token is still
-issued for `matmetrics-api` without Keiko scopes; it is intentionally rejected
-until the MatMetrics issuer is configured for the Keiko access-token contract.
+issued lifetime is at most five minutes. MatMetrics retains its existing
+`matmetrics-api` token and exchanges its Better Auth session cookie
+server-to-server for a Keiko-only token for allowlisted accounts.
 
 ## Deployments
 
@@ -47,8 +47,17 @@ administrative REST API is not part of the runtime.
 
 ## API
 
-The versioned REST contract is in [`openapi.yaml`](openapi.yaml). Every session
-operation derives its account key from the verified token. Client-supplied
-GitHub `owner` and `repo` values do not select or authorize data.
+The versioned REST contract is in [`openapi.yaml`](openapi.yaml). Every
+session, analytics, backup, and MCP operation derives its account key from the
+verified token. Client-supplied GitHub `owner` and `repo` values do not select
+or authorize data. MCP is stateless at `/mcp` and exposes only
+`list_sessions`, `get_session`, and `get_training_summary` with
+`sessions:read`.
+
+The backup API uses D1 snapshots and Cloudflare Queues. A user can connect one
+GitHub App installation limited to one selected repository. Configure its
+private key only as a Wrangler secret; Keiko creates short-lived
+repository-scoped installation tokens for backup writes. See
+[`docs/operations.md`](docs/operations.md) for setup, recovery, and cutover.
 
 Architecture decisions are recorded in [`docs/decisions/`](docs/decisions/).

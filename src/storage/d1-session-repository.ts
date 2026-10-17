@@ -4,6 +4,7 @@ import {
   type JudoSession,
   type SessionRecord,
 } from '../domain/session';
+import type { AnalyticsSummary } from '../application/session-service';
 import {
   InvalidSessionCursorError,
   SessionAlreadyExistsError,
@@ -76,6 +77,69 @@ function rowToRecord(row: SessionRow): SessionRecord {
 
 export class D1SessionRepository implements SessionRepository {
   constructor(private readonly db: D1Database) {}
+
+  async analytics(userId: string): Promise<AnalyticsSummary> {
+    const totals = await this.db.prepare(
+      `SELECT COUNT(*) AS total,
+              COALESCE(AVG(effort), 0) AS average_effort
+       FROM sessions WHERE user_id = ?`
+    ).bind(userId).first<{ total: number; average_effort: number }>();
+
+    const categoryRows = await this.db.prepare(
+      `SELECT 'all' AS period, category AS name, COUNT(*) AS count
+         FROM sessions WHERE user_id = ? GROUP BY category
+       UNION ALL
+       SELECT 'last30Days' AS period, category AS name, COUNT(*) AS count
+         FROM sessions WHERE user_id = ? AND session_date >= date('now', '-30 days') GROUP BY category
+       UNION ALL
+       SELECT 'last90Days' AS period, category AS name, COUNT(*) AS count
+         FROM sessions WHERE user_id = ? AND session_date >= date('now', '-90 days') GROUP BY category`
+    ).bind(userId, userId, userId).all<{ period: string; name: string; count: number }>();
+
+    const effortRows = await this.db.prepare(
+      `SELECT 'all' AS period, effort AS name, COUNT(*) AS count
+         FROM sessions WHERE user_id = ? GROUP BY effort
+       UNION ALL
+       SELECT 'last30Days' AS period, effort AS name, COUNT(*) AS count
+         FROM sessions WHERE user_id = ? AND session_date >= date('now', '-30 days') GROUP BY effort
+       UNION ALL
+       SELECT 'last90Days' AS period, effort AS name, COUNT(*) AS count
+         FROM sessions WHERE user_id = ? AND session_date >= date('now', '-90 days') GROUP BY effort`
+    ).bind(userId, userId, userId).all<{ period: string; name: number; count: number }>();
+
+    const recent = await this.db.prepare(
+      `SELECT session_date AS date, effort FROM sessions
+       WHERE user_id = ? ORDER BY session_date DESC, id DESC LIMIT 10`
+    ).bind(userId).all<{ date: string; effort: number }>();
+
+    const backup = await this.db.prepare(
+      `SELECT EXISTS(
+         SELECT 1 FROM github_installations WHERE user_id = ? AND revoked_at IS NULL
+       ) AS configured,
+       (SELECT MAX(completed_at) FROM backup_jobs WHERE user_id = ? AND status = 'completed') AS last_backup_at`
+    ).bind(userId, userId).first<{ configured: number; last_backup_at: string | null }>();
+
+    const periods = ['all', 'last30Days', 'last90Days'] as const;
+    const distributions = Object.fromEntries(periods.map((period) => [period, {
+      categories: categoryRows.results
+        .filter((row) => row.period === period)
+        .map(({ name, count }) => ({ name, count })),
+      effort: effortRows.results
+        .filter((row) => row.period === period)
+        .map(({ name, count }) => ({ name, count })),
+    }])) as AnalyticsSummary['distributions'];
+
+    return {
+      totalSessions: totals?.total ?? 0,
+      averageEffort: Math.round((totals?.average_effort ?? 0) * 100) / 100,
+      distributions,
+      recentEffort: recent.results,
+      backupStatus: {
+        configured: backup?.configured === 1,
+        lastBackupAt: backup?.last_backup_at ?? null,
+      },
+    };
+  }
 
   async list(userId: string, filters: SessionFilters): Promise<SessionPage> {
     const where = ['user_id = ?'];

@@ -6,9 +6,12 @@
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     "ENVIRONMENT": "local",
-    "AUTH_JWKS_URL": "https://matmetrics-teal.vercel.app/api/auth/jwks",
-    "AUTH_ISSUER": "https://matmetrics-teal.vercel.app",
-    "AUTH_AUDIENCE": "keiko-dojo-api"
+    "AUTH_JWKS_URL": "http://localhost:9002/api/auth/jwks",
+    "AUTH_ISSUER": "http://localhost:9002",
+    "AUTH_AUDIENCE": "keiko-dojo-api",
+    "GITHUB_APP_ID": "replace-with-github-app-id",
+    "GITHUB_APP_INSTALL_URL": "https://github.com/apps/replace-keiko-dojo/installations/new",
+    "MATMETRICS_FRONTEND_URL": "http://localhost:9002"
   },
   "d1_databases": [
     {
@@ -18,18 +21,46 @@
       "migrations_dir": "migrations"
     }
   ],
+  "ratelimits": [
+    { "name": "SESSION_READ_LIMITER", "namespace_id": "119001", "simple": { "limit": 300, "period": 60 } },
+    { "name": "SESSION_WRITE_LIMITER", "namespace_id": "119002", "simple": { "limit": 120, "period": 60 } },
+    { "name": "BACKUP_WRITE_LIMITER", "namespace_id": "119003", "simple": { "limit": 10, "period": 60 } }
+  ],
   "observability": {
     "enabled": true,
     "head_sampling_rate": 0.1
   },
+  "queues": {
+    "producers": [{ "binding": "BACKUP_QUEUE", "queue": "keiko-dojo-backups-local" }],
+    "consumers": [{
+      "queue": "keiko-dojo-backups-local",
+      "max_batch_size": 10,
+      "max_retries": 5,
+      "dead_letter_queue": "keiko-dojo-backups-local-dlq"
+    }]
+  },
+  "triggers": { "crons": ["0 2 * * *"] },
   "env": {
     "staging": {
       "name": "keiko-dojo-staging",
+      "queues": {
+        "producers": [{ "binding": "BACKUP_QUEUE", "queue": "keiko-dojo-backups-staging" }],
+        "consumers": [{
+          "queue": "keiko-dojo-backups-staging",
+          "max_batch_size": 10,
+          "max_retries": 5,
+          "dead_letter_queue": "keiko-dojo-backups-staging-dlq"
+        }]
+      },
+      "triggers": { "crons": ["0 3 * * *"] },
       "vars": {
         "ENVIRONMENT": "staging",
         "AUTH_JWKS_URL": "https://replace-with-staging-auth.example.com/api/auth/jwks",
         "AUTH_ISSUER": "https://replace-with-staging-auth.example.com",
-        "AUTH_AUDIENCE": "keiko-dojo-api"
+        "AUTH_AUDIENCE": "keiko-dojo-api",
+        "GITHUB_APP_ID": "replace-with-github-app-id",
+        "GITHUB_APP_INSTALL_URL": "https://github.com/apps/replace-keiko-dojo/installations/new",
+        "MATMETRICS_FRONTEND_URL": "https://replace-with-staging-matmetrics.example.com"
       },
       "d1_databases": [
         {
@@ -38,15 +69,33 @@
           "database_id": "00000000-0000-0000-0000-000000000001",
           "migrations_dir": "migrations"
         }
+      ],
+      "ratelimits": [
+        { "name": "SESSION_READ_LIMITER", "namespace_id": "119101", "simple": { "limit": 300, "period": 60 } },
+        { "name": "SESSION_WRITE_LIMITER", "namespace_id": "119102", "simple": { "limit": 120, "period": 60 } },
+        { "name": "BACKUP_WRITE_LIMITER", "namespace_id": "119103", "simple": { "limit": 10, "period": 60 } }
       ]
     },
     "production": {
       "name": "keiko-dojo",
+      "queues": {
+        "producers": [{ "binding": "BACKUP_QUEUE", "queue": "keiko-dojo-backups" }],
+        "consumers": [{
+          "queue": "keiko-dojo-backups",
+          "max_batch_size": 10,
+          "max_retries": 5,
+          "dead_letter_queue": "keiko-dojo-backups-dlq"
+        }]
+      },
+      "triggers": { "crons": ["0 2 * * *"] },
       "vars": {
         "ENVIRONMENT": "production",
         "AUTH_JWKS_URL": "https://replace-with-production-auth.example.com/api/auth/jwks",
         "AUTH_ISSUER": "https://replace-with-production-auth.example.com",
-        "AUTH_AUDIENCE": "keiko-dojo-api"
+        "AUTH_AUDIENCE": "keiko-dojo-api",
+        "GITHUB_APP_ID": "replace-with-github-app-id",
+        "GITHUB_APP_INSTALL_URL": "https://github.com/apps/replace-keiko-dojo/installations/new",
+        "MATMETRICS_FRONTEND_URL": "https://matmetrics-teal.vercel.app"
       },
       "d1_databases": [
         {
@@ -55,6 +104,11 @@
           "database_id": "00000000-0000-0000-0000-000000000002",
           "migrations_dir": "migrations"
         }
+      ],
+      "ratelimits": [
+        { "name": "SESSION_READ_LIMITER", "namespace_id": "119201", "simple": { "limit": 300, "period": 60 } },
+        { "name": "SESSION_WRITE_LIMITER", "namespace_id": "119202", "simple": { "limit": 120, "period": 60 } },
+        { "name": "BACKUP_WRITE_LIMITER", "namespace_id": "119203", "simple": { "limit": 10, "period": 60 } }
       ]
     }
   }
