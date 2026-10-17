@@ -94,6 +94,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '503':
           $ref: '#/components/responses/AuthUnavailable'
         default:
@@ -123,6 +125,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '409':
           description: The session ID already exists for this user.
           content:
@@ -165,6 +169,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
@@ -200,6 +206,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '404':
           $ref: '#/components/responses/NotFound'
         '412':
@@ -228,6 +236,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '404':
           $ref: '#/components/responses/NotFound'
         '412':
@@ -238,6 +248,194 @@ paths:
           $ref: '#/components/responses/AuthUnavailable'
         default:
           $ref: '#/components/responses/InternalError'
+  /v1/analytics/summary:
+    get:
+      summary: Read the caller's training summary
+      description: Requires sessions:read. Aggregates and backup status are scoped to the verified subject.
+      responses:
+        '200':
+          description: Session totals, distributions, recent effort, and backup status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/InternalError'
+  /v1/backups/status:
+    get:
+      summary: Read the caller's backup status
+      description: Requires backups:read. Returns only the caller's jobs and snapshots.
+      responses:
+        '200':
+          description: Latest job and recent snapshots.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/backups/github-installation:
+    get:
+      summary: Read the GitHub backup connection
+      description: Requires backups:read and returns only the caller's selected repository.
+      responses:
+        '200':
+          description: Connection status without installation tokens.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    post:
+      summary: Start GitHub App installation
+      description: Requires backups:write. Returns a one-time, user-bound installation URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '201':
+          description: One-time installation URL and expiration.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    delete:
+      summary: Disconnect GitHub backup access
+      description: Requires backups:write. Keiko stops minting installation tokens immediately.
+      responses:
+        '204':
+          description: Connection revoked within Keiko.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /v1/backups/github-installation/callback:
+    get:
+      security: []
+      summary: Complete GitHub App installation
+      description: GitHub redirect callback. Requires a valid one-time state created by the authenticated start endpoint.
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema: { type: string }
+        - in: query
+          name: installation_id
+          required: true
+          schema: { type: string, pattern: '^[1-9][0-9]*$' }
+      responses:
+        '302':
+          description: Redirect to the configured MatMetrics origin with a generic result.
+  /v1/backups:
+    post:
+      summary: Request an on-demand backup
+      description: Requires backups:write. D1 writes do not wait for backup completion.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '202':
+          description: Backup job was queued.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Backup queue is unavailable.
+  /v1/backups/{snapshotId}/restore-preview:
+    get:
+      summary: Preview a restore
+      description: Requires backups:restore. Reports records that will be protected as newer than the snapshot.
+      parameters:
+        - in: path
+          name: snapshotId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Restore preview.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/backups/{snapshotId}/restore:
+    post:
+      summary: Apply a merge-preserving restore
+      description: Requires backups:restore and an explicit confirm=true body. Newer D1 records are preserved.
+      parameters:
+        - in: path
+          name: snapshotId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm:
+                  const: true
+              additionalProperties: false
+      responses:
+        '200':
+          description: Restore applied and recorded in restore activity.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /mcp:
+    post:
+      summary: Stateless MCP endpoint
+      description: >-
+        Accepts MCP JSON-RPC requests for initialize, tools/list, and tools/call.
+        Every operation requires a Bearer token with sessions:read. Exposes
+        list_sessions, get_session, and get_training_summary only.
+      responses:
+        '200':
+          description: MCP JSON-RPC response.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
 components:
   securitySchemes:
     bearerAuth:
@@ -357,6 +555,49 @@ components:
               type: [string, 'null']
             hasMore:
               type: boolean
+    AnalyticsSummary:
+      type: object
+      required: [totalSessions, averageEffort, distributions, recentEffort, backupStatus]
+      properties:
+        totalSessions:
+          type: integer
+        averageEffort:
+          type: number
+        distributions:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              categories:
+                type: array
+                items:
+                  type: object
+                  required: [name, count]
+                  properties:
+                    name: { type: string }
+                    count: { type: integer }
+              effort:
+                type: array
+                items:
+                  type: object
+                  required: [name, count]
+                  properties:
+                    name: { type: integer, minimum: 1, maximum: 5 }
+                    count: { type: integer }
+        recentEffort:
+          type: array
+          items:
+            type: object
+            required: [date, effort]
+            properties:
+              date: { type: string, format: date }
+              effort: { type: integer, minimum: 1, maximum: 5 }
+        backupStatus:
+          type: object
+          required: [configured, lastBackupAt]
+          properties:
+            configured: { type: boolean }
+            lastBackupAt: { type: [string, 'null'], format: date-time }
     ErrorResponse:
       type: object
       required: [error, requestId]
@@ -396,6 +637,16 @@ components:
             $ref: '#/components/schemas/ErrorResponse'
     AuthUnavailable:
       description: Identity provider or configuration is temporarily unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimited:
+      description: Per-user operation limit exceeded. Retry after the indicated delay.
+      headers:
+        Retry-After:
+          schema:
+            type: string
       content:
         application/json:
           schema:

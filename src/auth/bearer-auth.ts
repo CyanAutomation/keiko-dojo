@@ -6,9 +6,14 @@ import {
   type RemoteJWKSetOptions,
 } from 'jose';
 
-export type RequiredScope = 'sessions:read' | 'sessions:write';
+export type RequiredScope =
+  | 'sessions:read'
+  | 'sessions:write'
+  | 'backups:read'
+  | 'backups:write'
+  | 'backups:restore';
 export type AuthenticatedUser = { userId: string };
-export type AuthFailureKind = 'unauthorized' | 'forbidden' | 'unavailable';
+export type AuthFailureKind = 'unauthorized' | 'forbidden' | 'unavailable' | 'rate_limited';
 
 export class AuthFailure extends Error {
   constructor(readonly kind: AuthFailureKind, message: string) {
@@ -95,7 +100,7 @@ function validatePayload(
 
 export async function authenticateRequest(
   request: Request,
-  env: Pick<Env, 'AUTH_JWKS_URL' | 'AUTH_ISSUER' | 'AUTH_AUDIENCE'>,
+  env: Pick<Env, 'AUTH_JWKS_URL' | 'AUTH_ISSUER' | 'AUTH_AUDIENCE' | 'SESSION_READ_LIMITER' | 'SESSION_WRITE_LIMITER' | 'BACKUP_WRITE_LIMITER' | 'ENVIRONMENT'>,
   requiredScope: RequiredScope
 ): Promise<AuthenticatedUser> {
   const authorization = request.headers.get('authorization');
@@ -124,5 +129,22 @@ export async function authenticateRequest(
     throw new AuthFailure('unauthorized', 'Invalid access token');
   }
 
-  return validatePayload(payload, requiredScope);
+  const principal = validatePayload(payload, requiredScope);
+  const environment = env.ENVIRONMENT as string;
+  if (environment === 'local' || environment === 'test') return principal;
+  const limiter = requiredScope === 'sessions:read' || requiredScope === 'backups:read'
+    ? env.SESSION_READ_LIMITER
+    : requiredScope === 'sessions:write'
+      ? env.SESSION_WRITE_LIMITER
+      : env.BACKUP_WRITE_LIMITER;
+  try {
+    const result = await limiter.limit({ key: principal.userId });
+    if (!result.success) {
+      throw new AuthFailure('rate_limited', 'Too many requests');
+    }
+  } catch (error) {
+    if (error instanceof AuthFailure) throw error;
+    throw new AuthFailure('unavailable', 'Rate limiting is unavailable');
+  }
+  return principal;
 }

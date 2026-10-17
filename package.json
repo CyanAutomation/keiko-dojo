@@ -13,6 +13,7 @@
     "deploy": "wrangler deploy",
     "deploy:staging": "wrangler deploy --env staging",
     "deploy:production": "wrangler deploy --env production",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types",
     "cf-typegen:check": "wrangler types --check",
@@ -25,8 +26,10 @@
     "jose": "6.2.12"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.4",
     "@types/node": "^24.19.2",
     "typescript": "5.9.3",
+    "vitest": "^4.1.12",
     "wrangler": "4.151.1"
   }
 }
