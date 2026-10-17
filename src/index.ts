@@ -151,6 +151,37 @@ const worker = {
     const scheduleKey = `${controller.cron}:${requestedAt}`;
     const dispatchAttemptedAt = new Date().toISOString();
     const staleDispatchCutoff = new Date(Date.now() - 60_000).toISOString();
+
+    // Recover scheduled jobs left queued by an interrupted invocation even
+    // when their schedule key belongs to an earlier cron occurrence.
+    const staleJobs = await env.DB.prepare(
+      `SELECT jobs.id, jobs.user_id FROM backup_jobs AS jobs
+       INNER JOIN github_installations AS installations ON installations.user_id = jobs.user_id
+       WHERE installations.revoked_at IS NULL AND jobs.schedule_key IS NOT NULL AND (
+         (jobs.status = 'queued' AND jobs.dispatch_attempted_at <= ?) OR
+         (jobs.status = 'failed' AND jobs.error_code = 'queue_unavailable'
+          AND jobs.dispatch_attempted_at <= ?)
+       )`
+    ).bind(staleDispatchCutoff, staleDispatchCutoff).all<{ id: string; user_id: string }>();
+    for (const { id: jobId, user_id: userId } of staleJobs.results) {
+      const recovered = await env.DB.prepare(
+        `UPDATE backup_jobs SET status = 'queued', error_code = NULL, dispatch_attempted_at = ?
+         WHERE id = ? AND user_id = ? AND (
+           (status = 'queued' AND dispatch_attempted_at <= ?) OR
+           (status = 'failed' AND error_code = 'queue_unavailable' AND dispatch_attempted_at <= ?)
+         )`
+      ).bind(dispatchAttemptedAt, jobId, userId, staleDispatchCutoff, staleDispatchCutoff).run();
+      if (recovered.meta.changes !== 1) continue;
+      try {
+        await env.BACKUP_QUEUE.send({ jobId, userId });
+      } catch {
+        await env.DB.prepare(
+          `UPDATE backup_jobs SET status = 'failed', error_code = 'queue_unavailable'
+           WHERE id = ? AND user_id = ? AND status = 'queued'`
+        ).bind(jobId, userId).run();
+      }
+    }
+
     for (const { user_id: userId } of installations.results) {
       const id = crypto.randomUUID();
       const inserted = await env.DB.prepare(

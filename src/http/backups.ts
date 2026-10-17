@@ -432,10 +432,26 @@ export async function processBackupMessage(
       });
       if (!validatedRows) throw new Error('Session snapshot is invalid');
       snapshotRows = validatedRows;
-      await env.DB.prepare(
-        `INSERT INTO backup_snapshots (id, user_id, job_id, created_at, session_count, checksum, payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).bind(snapshotId, userId, jobId, createdAt, snapshotRows.length, checksum, payload).run();
+      try {
+        await env.DB.prepare(
+          `INSERT INTO backup_snapshots
+           (id, user_id, job_id, job_snapshot_key, created_at, session_count, checksum, payload)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(snapshotId, userId, jobId, jobId, createdAt, snapshotRows.length, checksum, payload).run();
+      } catch (insertError) {
+        // Queue delivery is at least once. A competing delivery may have
+        // inserted this job's snapshot after our initial lookup.
+        const racedSnapshot = await env.DB.prepare(
+          `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots
+           WHERE job_snapshot_key = ? AND user_id = ?`
+        ).bind(jobId, userId).first<SnapshotRow>();
+        if (!racedSnapshot) throw insertError;
+        const racedRows = await validatedSnapshotRows(racedSnapshot);
+        if (!racedRows) throw new Error('Backup snapshot is invalid');
+        snapshotId = racedSnapshot.id;
+        createdAt = racedSnapshot.created_at;
+        snapshotRows = racedRows;
+      }
     }
     const installation = await env.DB.prepare(
       `SELECT user_id, installation_id, repository_owner, repository_name, repository_id
@@ -456,8 +472,16 @@ export async function processBackupMessage(
     ).bind(completedAt, jobId, userId).run();
     message.ack();
   } catch {
+    const current = await env.DB.prepare(
+      'SELECT status FROM backup_jobs WHERE id = ? AND user_id = ?'
+    ).bind(jobId, userId).first<{ status: string }>();
+    if (current?.status === 'completed') {
+      message.ack();
+      return;
+    }
     await env.DB.prepare(
-      `UPDATE backup_jobs SET status = ?, error_code = 'backup_failed' WHERE id = ? AND user_id = ?`
+      `UPDATE backup_jobs SET status = ?, error_code = 'backup_failed'
+       WHERE id = ? AND user_id = ? AND status != 'completed'`
     ).bind(message.attempts >= 5 ? 'failed' : 'queued', jobId, userId).run();
     message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
   }
