@@ -109,10 +109,20 @@ decisions for:
    Keiko-owned Worker data API in front of D1, adding another service hop.
    Keep Keiko's Worker and D1 database separate from MatMetrics' existing
    `matmetrics-data` Worker and database so Keiko owns its schema and deploys.
-2. **Identity:** retain Better Auth initially, but issue or exchange tokens with
-   a Keiko-specific audience and explicit scopes. Keiko validates signature,
-   issuer, audience, expiry, and subject. Never trust an `X-User-Id` supplied
-   without a verified signature.
+2. **Identity:** retain Better Auth initially and use short-lived access tokens
+   with a Keiko-specific audience and explicit scopes. Prefer having the
+   identity provider issue these tokens directly with a maximum five-minute
+   lifetime. If Keiko adds a token exchange endpoint (`POST /oauth/token`), it
+   must be server-side: verify the upstream signature, issuer, audience, `nbf`,
+   and `exp`, then check the upstream session's active/revoked state through a
+   Better Auth session lookup or token-introspection mechanism before issuing a
+   Keiko token. An exchanged token expires at the earlier of the
+   upstream expiry or five minutes after issuance. Keiko validates signature,
+   issuer, audience, `nbf`, `exp`, subject, and scopes on every request. Define
+   whether revocation is checked online on each request or has a bounded delay
+   no longer than the five-minute token lifetime. Never treat a valid signature
+   alone as proof that the source session is still active, and never trust an
+   `X-User-Id` supplied without a verified signature.
 3. **D1 tenancy and schema:** use a D1 database per environment, with every
    user-owned record scoped by the verified stable user ID. Define indexes,
    record revisions, migrations, and recovery procedures before production
@@ -122,6 +132,11 @@ decisions for:
    references server-side and support revocation.
 5. **API contract:** publish OpenAPI from Keiko and freeze the initial session
    shape, error format, pagination, and concurrency behavior.
+6. **AI data handling:** before building or enabling any Keiko endpoint that
+   sends user data to an external AI provider, document and review its field
+   allowlist, purpose, provider retention/training policy, user consent, and
+   logging behavior. This gate applies to development and staging as well as
+   production.
 
 For the first contract, preserve the MatMetrics session fields and categories
 (`id`, `date`, `description`, `techniques`, `effort`, `category`, `notes`,
@@ -221,10 +236,13 @@ behavior:
 3. Technique catalog and recommendation rules, if those rules should apply to
    all Keiko clients.
 4. JEV assessments, description transforms, and AI technique suggestions
-   behind provider adapters. Keep the MatMetrics UI responsible for collecting
-   consent and showing provider handoffs. Define which session fields may be
-   sent to each provider, retention, limits, and failure behavior before
-   enabling these endpoints for other clients.
+   behind provider adapters only after the AI data-handling decision in Phase 0
+   is approved. Before any provider call is built or enabled in any
+   environment, document each endpoint's field allowlist and purpose, provider
+   retention/training policy, user-facing consent, limits, sanitized logging,
+   and failure behavior. Keep the MatMetrics UI responsible for obtaining
+   consent and showing provider handoffs. No provider call may be enabled in
+   staging while this gate is incomplete.
 5. GitHub sync, health checks, and Log Doctor operations after repository
    authorization and job ownership are centralized.
 
@@ -262,7 +280,9 @@ repository:
    local/staging/production D1 bindings.
 2. Add the canonical session contract, OpenAPI document, validation, and first
    D1 schema migration.
-3. Add token verification and user-scope authorization before exposing data.
+3. Add token verification and user-scope authorization before exposing data,
+   including expiry, audience, scope, revocation behavior, and the five-minute
+   Keiko token lifetime cap.
 4. Add user-scoped `GET /v1/sessions` against local D1, then session mutations
    with per-user ownership and record revisions.
 5. Add CI checks for contract parity, migrations, and Worker type safety.
@@ -286,6 +306,9 @@ or AI-provider work begins.
   tested rollback path.
 - A user's GitHub backup can be enabled, observed, revoked, and restored
   without making ordinary session operations depend on GitHub availability.
+- No live AI provider call is enabled in any environment until its field
+  allowlist, retention/training terms, consent, logging, and failure rules are
+  documented and approved.
 - MCP and REST use the same service methods, authorization checks, and record
   versions.
 - Health, request IDs, safe structured errors, rate limits, and backup/restore
