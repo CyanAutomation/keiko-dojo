@@ -1,0 +1,118 @@
+[
+  {
+    "name": "valid",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["Uchi mata"],
+      "duration": 90,
+      "videoUrl": "https://1.1.1.1/v"
+    },
+    "error": ""
+  },
+  {
+    "name": "bad date format",
+    "session": {
+      "id": "session-1",
+      "date": "2026/03/18",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["Uchi mata"]
+    },
+    "error": "Invalid date: expected YYYY-MM-DD format"
+  },
+  {
+    "name": "bad date real",
+    "session": {
+      "id": "session-1",
+      "date": "2026-02-30",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["Uchi mata"]
+    },
+    "error": "Invalid date: must be a real calendar date"
+  },
+  {
+    "name": "bad effort",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 8,
+      "category": "Technical",
+      "techniques": ["Uchi mata"]
+    },
+    "error": "Invalid effort level (must be an integer 1-5)"
+  },
+  {
+    "name": "bad category",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 3,
+      "category": "Foo",
+      "techniques": ["Uchi mata"]
+    },
+    "error": "Invalid category"
+  },
+  {
+    "name": "empty technique",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["   "]
+    },
+    "error": "Invalid techniques[0]: value cannot be empty"
+  },
+  {
+    "name": "negative duration",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["Uchi mata"],
+      "duration": -1
+    },
+    "error": "Invalid duration: expected a non-negative integer"
+  },
+  {
+    "name": "bad protocol",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["Uchi mata"],
+      "videoUrl": "ftp://example.com/video"
+    },
+    "error": "Invalid videoUrl: protocol must be http or https"
+  },
+  {
+    "name": "private video host",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["Uchi mata"],
+      "videoUrl": "https://127.0.0.1/video"
+    },
+    "error": "Invalid videoUrl: private or internal network addresses are not allowed"
+  },
+  {
+    "name": "whitespace video allowed",
+    "session": {
+      "id": "session-1",
+      "date": "2026-03-18",
+      "effort": 3,
+      "category": "Technical",
+      "techniques": ["Uchi mata"],
+      "videoUrl": "   "
+    },
+    "error": ""
+  }
+]

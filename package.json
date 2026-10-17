@@ -1,0 +1,32 @@
+{
+  "name": "keiko-dojo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.6.2",
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=11 <12"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env production",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types",
+    "cf-typegen:check": "wrangler types --check",
+    "migrate:local": "wrangler d1 migrations apply keiko-dojo-local --local",
+    "migrate:staging": "wrangler d1 migrations apply keiko-dojo-staging --remote --env staging",
+    "migrate:production": "wrangler d1 migrations apply keiko-dojo --remote --env production",
+    "check:migrations": "wrangler d1 migrations list keiko-dojo-local --local"
+  },
+  "dependencies": {
+    "jose": "6.2.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "5.9.3",
+    "wrangler": "4.151.1"
+  }
+}
