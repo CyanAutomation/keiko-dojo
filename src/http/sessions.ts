@@ -97,6 +97,9 @@ function bodyFailureResponse(status: 400 | 413 | 415, requestId: string): Respon
 }
 
 function authFailureResponse(error: AuthFailure, requestId: string): Response {
+  if (error.kind === 'rate_limited') {
+    return jsonError(requestId, 429, 'rate_limited', error.message, { 'Retry-After': '60' });
+  }
   if (error.kind === 'forbidden') {
     return jsonError(requestId, 403, 'insufficient_scope', error.message);
   }

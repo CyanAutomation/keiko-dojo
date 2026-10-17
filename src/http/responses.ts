@@ -4,6 +4,7 @@ export type ApiErrorCode =
   | 'authentication_required'
   | 'insufficient_scope'
   | 'authentication_unavailable'
+  | 'rate_limited'
   | 'not_found'
   | 'session_conflict'
   | 'revision_conflict'

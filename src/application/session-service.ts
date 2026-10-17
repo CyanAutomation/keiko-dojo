@@ -18,7 +18,25 @@ export type SessionPage = {
   nextCursor: string | null;
 };
 
+export type AnalyticsDistribution = {
+  categories: Array<{ name: string; count: number }>;
+  effort: Array<{ name: number; count: number }>;
+};
+
+export type AnalyticsSummary = {
+  totalSessions: number;
+  averageEffort: number;
+  distributions: {
+    all: AnalyticsDistribution;
+    last30Days: AnalyticsDistribution;
+    last90Days: AnalyticsDistribution;
+  };
+  recentEffort: Array<{ date: string; effort: number }>;
+  backupStatus: { configured: boolean; lastBackupAt: string | null };
+};
+
 export interface SessionRepository {
+  analytics(userId: string): Promise<AnalyticsSummary>;
   list(userId: string, filters: SessionFilters): Promise<SessionPage>;
   get(userId: string, id: string): Promise<SessionRecord | null>;
   create(userId: string, session: JudoSession): Promise<SessionRecord>;
@@ -73,6 +91,10 @@ export class SessionService {
 
   list(userId: string, filters: SessionFilters): Promise<SessionPage> {
     return this.repository.list(userId, filters);
+  }
+
+  analytics(userId: string): Promise<AnalyticsSummary> {
+    return this.repository.analytics(userId);
   }
 
   get(userId: string, id: string): Promise<SessionRecord | null> {

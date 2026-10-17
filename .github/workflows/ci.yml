@@ -15,6 +15,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - run: npm test
       - run: npm run cf-typegen:check
       - run: npm run typecheck
       - run: npm run check:migrations
