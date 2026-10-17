@@ -1,0 +1,61 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "keiko-dojo-local",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ENVIRONMENT": "local",
+    "AUTH_JWKS_URL": "https://matmetrics-teal.vercel.app/api/auth/jwks",
+    "AUTH_ISSUER": "https://matmetrics-teal.vercel.app",
+    "AUTH_AUDIENCE": "keiko-dojo-api"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "keiko-dojo-local",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "env": {
+    "staging": {
+      "name": "keiko-dojo-staging",
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "AUTH_JWKS_URL": "https://replace-with-staging-auth.example.com/api/auth/jwks",
+        "AUTH_ISSUER": "https://replace-with-staging-auth.example.com",
+        "AUTH_AUDIENCE": "keiko-dojo-api"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "keiko-dojo-staging",
+          "database_id": "00000000-0000-0000-0000-000000000001",
+          "migrations_dir": "migrations"
+        }
+      ]
+    },
+    "production": {
+      "name": "keiko-dojo",
+      "vars": {
+        "ENVIRONMENT": "production",
+        "AUTH_JWKS_URL": "https://replace-with-production-auth.example.com/api/auth/jwks",
+        "AUTH_ISSUER": "https://replace-with-production-auth.example.com",
+        "AUTH_AUDIENCE": "keiko-dojo-api"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "keiko-dojo",
+          "database_id": "00000000-0000-0000-0000-000000000002",
+          "migrations_dir": "migrations"
+        }
+      ]
+    }
+  }
+}
