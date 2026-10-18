@@ -13,6 +13,7 @@ import {
   SessionService,
 } from '../application/session-service';
 import type { SessionRecord } from '../domain/session';
+import { authFailureResponse } from './auth-errors';
 import { jsonError, jsonResponse } from './responses';
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -94,30 +95,6 @@ function bodyFailureResponse(status: 400 | 413 | 415, requestId: string): Respon
     );
   }
   return jsonError(requestId, 400, 'bad_request', 'Invalid request body');
-}
-
-function authFailureResponse(error: AuthFailure, requestId: string): Response {
-  if (error.kind === 'rate_limited') {
-    return jsonError(requestId, 429, 'rate_limited', error.message, { 'Retry-After': '60' });
-  }
-  if (error.kind === 'forbidden') {
-    return jsonError(requestId, 403, 'insufficient_scope', error.message);
-  }
-  if (error.kind === 'unavailable') {
-    return jsonError(
-      requestId,
-      503,
-      'authentication_unavailable',
-      'Authentication service unavailable'
-    );
-  }
-  return jsonError(
-    requestId,
-    401,
-    'authentication_required',
-    error.message,
-    { 'WWW-Authenticate': 'Bearer' }
-  );
 }
 
 function isValidDate(value: string): boolean {
@@ -216,6 +193,159 @@ function recordResponse(record: SessionRecord, status = 200): Response {
   );
 }
 
+async function listSessions(
+  url: URL,
+  userId: string,
+  service: SessionService,
+  requestId: string
+): Promise<Response> {
+  const filters = readListFilters(url);
+  if (!filters) return jsonError(requestId, 400, 'bad_request', 'Invalid list filters');
+  try {
+    const page = await service.list(userId, filters);
+    return jsonResponse({
+      data: page.records,
+      pagination: {
+        nextCursor: page.nextCursor,
+        hasMore: page.nextCursor !== null,
+      },
+    });
+  } catch (error) {
+    if (error instanceof InvalidSessionCursorError) {
+      return jsonError(requestId, 400, 'bad_request', error.message);
+    }
+    throw error;
+  }
+}
+
+async function createSession(
+  request: Request,
+  userId: string,
+  service: SessionService,
+  requestId: string
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  if (!body.ok) return bodyFailureResponse(body.status, requestId);
+  try {
+    return recordResponse(await service.create(userId, body.value), 201);
+  } catch (error) {
+    if (error instanceof SessionAlreadyExistsError) {
+      return jsonError(requestId, 409, 'session_conflict', 'Session ID already exists');
+    }
+    if (error instanceof InvalidSessionError) {
+      return jsonError(requestId, 400, error.code, error.message);
+    }
+    throw error;
+  }
+}
+
+async function handleCollectionRequest(
+  request: Request,
+  url: URL,
+  userId: string,
+  service: SessionService,
+  requestId: string
+): Promise<Response> {
+  return request.method.toUpperCase() === 'GET'
+    ? listSessions(url, userId, service, requestId)
+    : createSession(request, userId, service, requestId);
+}
+
+async function getSession(
+  userId: string,
+  id: string,
+  service: SessionService,
+  requestId: string
+): Promise<Response> {
+  const record = await service.get(userId, id);
+  return record
+    ? recordResponse(record)
+    : jsonError(requestId, 404, 'not_found', 'Session not found');
+}
+
+async function updateSession(
+  request: Request,
+  userId: string,
+  id: string,
+  service: SessionService,
+  revision: number,
+  requestId: string
+): Promise<Response> {
+  const body = await readJsonObject(request);
+  if (!body.ok) return bodyFailureResponse(body.status, requestId);
+  try {
+    return recordResponse(await service.update(userId, id, body.value, revision));
+  } catch (error) {
+    if (error instanceof InvalidSessionError) {
+      return jsonError(requestId, 400, error.code, error.message);
+    }
+    if (error instanceof SessionNotFoundError) {
+      return jsonError(requestId, 404, 'not_found', 'Session not found');
+    }
+    if (error instanceof SessionRevisionConflictError) {
+      return jsonError(
+        requestId,
+        412,
+        'revision_conflict',
+        'Session has changed; retrieve the latest revision and retry'
+      );
+    }
+    throw error;
+  }
+}
+
+async function deleteSession(
+  userId: string,
+  id: string,
+  service: SessionService,
+  revision: number,
+  requestId: string
+): Promise<Response> {
+  try {
+    await service.delete(userId, id, revision);
+    return new Response(null, {
+      status: 204,
+      headers: { 'Cache-Control': 'no-store' },
+    });
+  } catch (error) {
+    if (error instanceof SessionNotFoundError) {
+      return jsonError(requestId, 404, 'not_found', 'Session not found');
+    }
+    if (error instanceof SessionRevisionConflictError) {
+      return jsonError(
+        requestId,
+        412,
+        'revision_conflict',
+        'Session has changed; retrieve the latest revision and retry'
+      );
+    }
+    throw error;
+  }
+}
+
+async function handleItemRequest(
+  request: Request,
+  url: URL,
+  userId: string,
+  service: SessionService,
+  requestId: string
+): Promise<Response> {
+  const parsedId = sessionIdFromPath(url.pathname);
+  if (!parsedId.ok) {
+    return jsonError(requestId, 400, 'bad_request', parsedId.error);
+  }
+  if (request.method.toUpperCase() === 'GET') {
+    return getSession(userId, parsedId.id, service, requestId);
+  }
+  const expectedRevision = parseExpectedRevision(request);
+  if (!expectedRevision.ok) {
+    return revisionFailureResponse(requestId, expectedRevision.status);
+  }
+  return request.method.toUpperCase() === 'PUT'
+    ? updateSession(request, userId, parsedId.id, service, expectedRevision.revision, requestId)
+    : deleteSession(userId, parsedId.id, service, expectedRevision.revision, requestId);
+}
+
 export async function handleSessionsRequest(
   request: Request,
   service: SessionService,
@@ -223,145 +353,28 @@ export async function handleSessionsRequest(
   requestId: string
 ): Promise<Response> {
   const url = new URL(request.url);
-  const collectionPath = '/v1/sessions';
-  const isCollection = url.pathname === collectionPath;
-  const isItem = url.pathname.startsWith(`${collectionPath}/`);
+  const isCollection = url.pathname === '/v1/sessions';
+  const isItem = url.pathname.startsWith('/v1/sessions/');
   if (!isCollection && !isItem) {
     return jsonError(requestId, 404, 'not_found', 'Route not found');
   }
 
   const method = request.method.toUpperCase();
-  const isRead = method === 'GET';
-  const isWrite = method === 'POST' || method === 'PUT' || method === 'DELETE';
-  if ((isCollection && !isRead && method !== 'POST') || (isItem && !isRead && !['PUT', 'DELETE'].includes(method))) {
+  const allowed = isCollection ? ['GET', 'POST'] : ['GET', 'PUT', 'DELETE'];
+  if (!allowed.includes(method)) {
     return jsonError(requestId, 405, 'method_not_allowed', 'Method not allowed', {
       Allow: isCollection ? 'GET, POST' : 'GET, PUT, DELETE',
     });
   }
 
-  let userId: string;
   try {
-    const principal = await authenticateRequest(
-      request,
-      env,
-      isWrite ? 'sessions:write' : 'sessions:read'
-    );
-    userId = principal.userId;
+    const scope = method === 'GET' ? 'sessions:read' : 'sessions:write';
+    const { userId } = await authenticateRequest(request, env, scope);
+    return isCollection
+      ? handleCollectionRequest(request, url, userId, service, requestId)
+      : handleItemRequest(request, url, userId, service, requestId);
   } catch (error) {
     if (error instanceof AuthFailure) return authFailureResponse(error, requestId);
     throw error;
   }
-
-  if (isCollection && method === 'GET') {
-    const filters = readListFilters(url);
-    if (!filters) {
-      return jsonError(requestId, 400, 'bad_request', 'Invalid list filters');
-    }
-    try {
-      const page = await service.list(userId, filters);
-      return jsonResponse({
-        data: page.records,
-        pagination: {
-          nextCursor: page.nextCursor,
-          hasMore: page.nextCursor !== null,
-        },
-      });
-    } catch (error) {
-      if (error instanceof InvalidSessionCursorError) {
-        return jsonError(requestId, 400, 'bad_request', error.message);
-      }
-      throw error;
-    }
-  }
-
-  if (isCollection && method === 'POST') {
-    const body = await readJsonObject(request);
-    if (!body.ok) return bodyFailureResponse(body.status, requestId);
-    try {
-      return recordResponse(await service.create(userId, body.value), 201);
-    } catch (error) {
-      if (error instanceof SessionAlreadyExistsError) {
-        return jsonError(
-          requestId,
-          409,
-          'session_conflict',
-          'Session ID already exists'
-        );
-      }
-      if (error instanceof InvalidSessionError) {
-        return jsonError(requestId, 400, error.code, error.message);
-      }
-      throw error;
-    }
-  }
-
-  const parsedId = sessionIdFromPath(url.pathname);
-  if (!parsedId.ok) {
-    return jsonError(requestId, 400, 'bad_request', parsedId.error);
-  }
-  const id = parsedId.id;
-
-  if (method === 'GET') {
-    const record = await service.get(userId, id);
-    if (!record) {
-      return jsonError(requestId, 404, 'not_found', 'Session not found');
-    }
-    return recordResponse(record);
-  }
-
-  const expectedRevision = parseExpectedRevision(request);
-  if (!expectedRevision.ok) {
-    return revisionFailureResponse(requestId, expectedRevision.status);
-  }
-
-  if (method === 'PUT') {
-    const body = await readJsonObject(request);
-    if (!body.ok) return bodyFailureResponse(body.status, requestId);
-    try {
-      return recordResponse(
-        await service.update(userId, id, body.value, expectedRevision.revision)
-      );
-    } catch (error) {
-      if (error instanceof InvalidSessionError) {
-        return jsonError(requestId, 400, error.code, error.message);
-      }
-      if (error instanceof SessionNotFoundError) {
-        return jsonError(requestId, 404, 'not_found', 'Session not found');
-      }
-      if (error instanceof SessionRevisionConflictError) {
-        return jsonError(
-          requestId,
-          412,
-          'revision_conflict',
-          'Session has changed; retrieve the latest revision and retry'
-        );
-      }
-      throw error;
-    }
-  }
-
-  if (method === 'DELETE') {
-    try {
-      await service.delete(userId, id, expectedRevision.revision);
-      return new Response(null, {
-        status: 204,
-        headers: { 'Cache-Control': 'no-store' },
-      });
-    } catch (error) {
-      if (error instanceof SessionNotFoundError) {
-        return jsonError(requestId, 404, 'not_found', 'Session not found');
-      }
-      if (error instanceof SessionRevisionConflictError) {
-        return jsonError(
-          requestId,
-          412,
-          'revision_conflict',
-          'Session has changed; retrieve the latest revision and retry'
-        );
-      }
-      throw error;
-    }
-  }
-
-  return jsonError(requestId, 405, 'method_not_allowed', 'Method not allowed');
 }

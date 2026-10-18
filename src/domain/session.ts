@@ -1,6 +1,6 @@
 import { isBlockedNetworkHostname } from './network-safety';
 
-export const SESSION_CATEGORIES = [
+const SESSION_CATEGORIES = [
   'Technical',
   'Randori',
   'Shiai',
