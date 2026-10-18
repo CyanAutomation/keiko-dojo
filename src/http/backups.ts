@@ -6,6 +6,7 @@ import {
   type BackupSnapshotRow,
   type SnapshotSession,
 } from '../domain/backup-snapshot';
+import { configuredGitHubInstallUrl, isGitHubAppConfigured } from '../integrations/github-app-config';
 import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../integrations/github-app';
 import { authFailureResponse } from './auth-errors';
 import { readJsonBodyLimited } from './request-body';
@@ -63,14 +64,11 @@ async function beginGitHubInstallation(request: Request, env: Env, requestId: st
   if (!parsed.ok) return bodyError(requestId, parsed, 'Invalid installation request');
   const body = parsed.value;
   if (Object.keys(body).length !== 0) return jsonError(requestId, 400, 'bad_request', 'Invalid installation request');
-  const installUrlText = env.GITHUB_APP_INSTALL_URL;
-  let installUrl: URL;
-  try { installUrl = new URL(installUrlText); } catch { return jsonError(requestId, 503, 'internal_error', 'GitHub App is not configured'); }
-  if (
-    installUrl.origin !== 'https://github.com' ||
-    !/^\/apps\/[A-Za-z0-9-]+\/installations\/new$/.test(installUrl.pathname) ||
-    installUrl.search || installUrl.hash || !env.GITHUB_APP_ID
-  ) return jsonError(requestId, 503, 'internal_error', 'GitHub App is not configured');
+  const privateKey = (env as Env & { GITHUB_APP_PRIVATE_KEY?: string }).GITHUB_APP_PRIVATE_KEY;
+  const installUrl = configuredGitHubInstallUrl(env.GITHUB_APP_INSTALL_URL);
+  if (!isGitHubAppConfigured(env.GITHUB_APP_ID, env.GITHUB_APP_INSTALL_URL, privateKey) || !installUrl) {
+    return jsonError(requestId, 503, 'internal_error', 'GitHub App is not configured');
+  }
   const state = crypto.randomUUID() + crypto.randomUUID();
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 10 * 60 * 1000);

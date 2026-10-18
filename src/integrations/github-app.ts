@@ -1,6 +1,7 @@
 import { importPKCS8, SignJWT } from 'jose';
 import type { SnapshotSession } from '../domain/backup-snapshot';
 import { isSessionCategory } from '../domain/session';
+import { configuredGitHubAppId } from './github-app-config';
 
 type GitHubAppEnvironment = Env & {
   GITHUB_APP_PRIVATE_KEY?: string;
@@ -21,7 +22,8 @@ function required(value: string | undefined): string {
 }
 
 async function appJwt(env: GitHubAppEnvironment): Promise<string> {
-  const appId = required(env.GITHUB_APP_ID);
+  const appId = configuredGitHubAppId(env.GITHUB_APP_ID);
+  if (!appId) throw new Error('GitHub App is not configured');
   const pem = required(env.GITHUB_APP_PRIVATE_KEY).replace(/\\n/g, '\n');
   const key = await importPKCS8(pem, 'RS256');
   const now = Math.floor(Date.now() / 1000);
