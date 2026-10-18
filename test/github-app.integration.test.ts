@@ -4,7 +4,7 @@ import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../src/integrations/github-app';
-import type { SnapshotSession } from '../src/http/backups';
+import type { SnapshotSession } from '../src/domain/backup-snapshot';
 
 const appEnv = env as unknown as Env & { GITHUB_APP_PRIVATE_KEY?: string };
 const originalFetch = globalThis.fetch;
@@ -117,6 +117,56 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('uses one timestamp to validate and consume an OAuth state near expiry', async () => {
+    const priorFetch = globalThis.fetch;
+    const previousFrontendOrigin = appEnv.MATMETRICS_FRONTEND_URL;
+    const state = crypto.randomUUID() + crypto.randomUUID();
+    const userId = `expiry-race-${crypto.randomUUID()}`;
+    const stateHash = Array.from(new Uint8Array(await crypto.subtle.digest(
+      'SHA-256', new TextEncoder().encode(state)
+    ))).map((value) => value.toString(16).padStart(2, '0')).join('');
+    const selectTime = '2026-10-18T10:00:00.000Z';
+    const updateTime = '2026-10-18T10:00:01.000Z';
+    await env.DB.prepare(
+      `INSERT INTO github_installation_states (state_hash, user_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?)`
+    ).bind(stateHash, userId, selectTime, '2026-10-18T10:00:00.500Z').run();
+
+    Reflect.set(appEnv, 'MATMETRICS_FRONTEND_URL', 'https://matmetrics.example.test');
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/app/installations/731')) {
+        return Response.json({ id: 731, repository_selection: 'selected' });
+      }
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'read-install-token' });
+      }
+      if (url.endsWith('/installation/repositories?per_page=100')) {
+        return Response.json({ total_count: 1, repositories: [{
+          id: 88, name: 'judo-notes', full_name: 'maki/judo-notes', owner: { login: 'maki' },
+        }] });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+    const isoTimestamp = vi.spyOn(Date.prototype, 'toISOString')
+      .mockImplementationOnce(() => selectTime)
+      .mockImplementationOnce(() => updateTime);
+
+    try {
+      const callbackUrl = new URL('/v1/backups/github-installation/callback', 'https://keiko.example.test');
+      callbackUrl.searchParams.set('state', state);
+      callbackUrl.searchParams.set('installation_id', '731');
+      const callback = await worker.fetch(new Request(callbackUrl), env);
+
+      expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/settings?githubBackup=connected');
+      expect(isoTimestamp).toHaveBeenCalledTimes(1);
+    } finally {
+      isoTimestamp.mockRestore();
+      vi.stubGlobal('fetch', priorFetch);
+      Reflect.set(appEnv, 'MATMETRICS_FRONTEND_URL', previousFrontendOrigin);
+    }
+  });
+
   it('requires selected access to exactly one repository and scopes write tokens to it', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -222,6 +272,96 @@ describe('GitHub App selected-repository backup adapter', () => {
     expect(secondMarkdown).toContain('- Randori drills \\# injected heading');
     expect(secondMarkdown).toContain('Warm\\-up\n\\-\\-\\-\n\\# Injected heading\n&lt;script&gt;alert\\(1\\)&lt;/script&gt;');
     expect(secondMarkdown).toContain('\\[link\\]\\(https://evil\\.test\\)\n\\- injected list\n\\`\\`\\`html');
+  });
+
+  it('rejects malformed stored session payloads before writing repository contents', async () => {
+    const priorFetch = globalThis.fetch;
+    const tokenUrl = 'https://api.github.com/app/installations/731/access_tokens';
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      calls.push({ url, method: init?.method ?? 'GET' });
+      if (url === tokenUrl && init?.method === 'POST') {
+        return Response.json({ token: 'scoped-write-token' });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+    const invalidSession: SnapshotSession = {
+      id: 'broken-session',
+      session_date: '2026-10-17',
+      category: 'Technical',
+      effort: 3,
+      payload: '{invalid-json',
+      revision: 1,
+      updated_at: '2026-10-17T00:00:00.000Z',
+    };
+
+    try {
+      await expect(writeGitHubBackup(
+        appEnv,
+        {
+          user_id: 'user-1',
+          installation_id: 731,
+          repository_owner: 'maki',
+          repository_name: 'judo-notes',
+          repository_id: 88,
+        },
+        'snapshot-1',
+        '2026-10-17T00:00:00.000Z',
+        [invalidSession]
+      )).rejects.toThrow('Stored session payload is invalid');
+      expect(calls).toEqual([{ url: tokenUrl, method: 'POST' }]);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('rejects empty techniques before requesting repository contents', async () => {
+    const priorFetch = globalThis.fetch;
+    const tokenUrl = 'https://api.github.com/app/installations/731/access_tokens';
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      calls.push({ url, method: init?.method ?? 'GET' });
+      if (url === tokenUrl && init?.method === 'POST') {
+        return Response.json({ token: 'scoped-write-token' });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+    const invalidSession: SnapshotSession = {
+      id: 'empty-technique-session',
+      session_date: '2026-10-17',
+      category: 'Technical',
+      effort: 3,
+      payload: JSON.stringify({
+        id: 'empty-technique-session',
+        date: '2026-10-17',
+        category: 'Technical',
+        effort: 3,
+        techniques: ['   '],
+      }),
+      revision: 1,
+      updated_at: '2026-10-17T00:00:00.000Z',
+    };
+
+    try {
+      await expect(writeGitHubBackup(
+        appEnv,
+        {
+          user_id: 'user-1',
+          installation_id: 731,
+          repository_owner: 'maki',
+          repository_name: 'judo-notes',
+          repository_id: 88,
+        },
+        'snapshot-1',
+        '2026-10-17T00:00:00.000Z',
+        [invalidSession]
+      )).rejects.toThrow('Stored session payload is invalid');
+      expect(calls).toEqual([{ url: tokenUrl, method: 'POST' }]);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
   });
 
   it('rejects GitHub App installations with all-repository access or more than one selected repository', async () => {
