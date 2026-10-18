@@ -188,7 +188,9 @@ function hasValidTechniques(
   session: Record<string, unknown>
 ): session is Record<string, unknown> & Pick<MarkdownSession, 'techniques'> {
   return Array.isArray(session.techniques) &&
-    session.techniques.every((technique) => typeof technique === 'string');
+    session.techniques.every((technique) =>
+      typeof technique === 'string' && technique.trim().length > 0
+    );
 }
 
 function isValidDescription(value: unknown): boolean {

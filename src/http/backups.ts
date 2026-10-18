@@ -92,17 +92,13 @@ async function completeGitHubInstallation(request: Request, env: Env): Promise<R
   const installationId = Number(installationIdText);
   if (!Number.isSafeInteger(installationId)) return githubResultRedirect(env, 'failed');
   const stateHash = await hashState(state);
-  const pending = await env.DB.prepare(
-    `SELECT user_id FROM github_installation_states
-     WHERE state_hash = ? AND consumed_at IS NULL AND expires_at > ?`
-  ).bind(stateHash, new Date().toISOString()).first<{ user_id: string }>();
-  if (!pending) return githubResultRedirect(env, 'failed');
   const consumedAt = new Date().toISOString();
-  const consumed = await env.DB.prepare(
+  const pending = await env.DB.prepare(
     `UPDATE github_installation_states SET consumed_at = ?
-     WHERE state_hash = ? AND consumed_at IS NULL AND expires_at > ?`
-  ).bind(consumedAt, stateHash, consumedAt).run();
-  if (consumed.meta.changes !== 1) return githubResultRedirect(env, 'failed');
+     WHERE state_hash = ? AND consumed_at IS NULL AND expires_at > ?
+     RETURNING user_id`
+  ).bind(consumedAt, stateHash, consumedAt).first<{ user_id: string }>();
+  if (!pending) return githubResultRedirect(env, 'failed');
 
   try {
     const repository = await verifySelectedRepositoryInstallation(env, installationId);
