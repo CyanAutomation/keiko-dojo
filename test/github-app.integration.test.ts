@@ -6,35 +6,115 @@ import worker from '../src/index';
 import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../src/integrations/github-app';
 import type { SnapshotSession } from '../src/domain/backup-snapshot';
 
-const appEnv = env as unknown as Env & { GITHUB_APP_PRIVATE_KEY?: string };
 const originalFetch = globalThis.fetch;
-let previousKey: string | undefined;
+let appEnv: Env & { GITHUB_APP_PRIVATE_KEY?: string };
 let authPrivateKey: CryptoKey;
 let authPublicJwk: JWK;
 const authKeyId = 'github-installation-test-key';
 
 beforeAll(async () => {
-  previousKey = appEnv.GITHUB_APP_PRIVATE_KEY;
   const keys = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  appEnv.GITHUB_APP_PRIVATE_KEY = keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
-  Reflect.set(appEnv, 'GITHUB_APP_ID', '12345');
+  appEnv = Object.create(env) as Env & { GITHUB_APP_PRIVATE_KEY?: string };
+  Object.defineProperties(appEnv, {
+    GITHUB_APP_PRIVATE_KEY: {
+      configurable: true,
+      enumerable: true,
+      value: keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      writable: true,
+    },
+    GITHUB_APP_ID: { configurable: true, enumerable: true, value: '12345', writable: true },
+    GITHUB_APP_INSTALL_URL: {
+      configurable: true,
+      enumerable: true,
+      value: 'https://github.com/apps/keiko-dojo/installations/new',
+      writable: true,
+    },
+  });
   const authKeys = await generateKeyPair('EdDSA', { crv: 'Ed25519' });
   authPrivateKey = authKeys.privateKey;
   authPublicJwk = { ...(await exportJWK(authKeys.publicKey)), alg: 'EdDSA', kid: authKeyId, use: 'sig' };
 });
 
 afterAll(() => {
-  appEnv.GITHUB_APP_PRIVATE_KEY = previousKey;
   vi.stubGlobal('fetch', originalFetch);
 });
 
 describe('GitHub App selected-repository backup adapter', () => {
+  it.each([
+    ['placeholder app ID', 'replace-with-github-app-id', 'https://github.com/apps/keiko-dojo/installations/new', 'test-private-key'],
+    ['placeholder install URL', '12345', 'https://github.com/apps/replace-keiko-dojo/installations/new', 'test-private-key'],
+    ['missing private key', '12345', 'https://github.com/apps/keiko-dojo/installations/new', ''],
+  ])('reports the GitHub integration as unconfigured for a %s', async (_label, appId, installUrl, privateKey) => {
+    const userId = `unconfigured-github-${crypto.randomUUID()}`;
+    const allowRateLimit = { limit: async (_input: { key: string }) => ({ success: true }) };
+    const testEnv = Object.assign(Object.create(appEnv), {
+      GITHUB_APP_ID: appId,
+      GITHUB_APP_INSTALL_URL: installUrl,
+      GITHUB_APP_PRIVATE_KEY: privateKey,
+      SESSION_READ_LIMITER: allowRateLimit,
+      SESSION_WRITE_LIMITER: allowRateLimit,
+      BACKUP_WRITE_LIMITER: allowRateLimit,
+    }) as Env;
+    const priorFetch = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === 'https://auth.example.test/api/auth/jwks') {
+        return Response.json({ keys: [authPublicJwk] });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+
+    try {
+      const token = await new SignJWT({ appUserId: userId, scope: 'backups:write' })
+        .setProtectedHeader({ alg: 'EdDSA', kid: authKeyId })
+        .setSubject(userId)
+        .setIssuer('https://auth.example.test')
+        .setAudience('keiko-dojo-api')
+        .setIssuedAt()
+        .setExpirationTime('5m')
+        .sign(authPrivateKey);
+      const response = await worker.fetch(new Request('https://keiko.example.test/v1/backups/github-installation', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: '{}',
+      }), testEnv);
+
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({
+        error: { code: 'internal_error', message: 'GitHub App is not configured' },
+      });
+      const states = await env.DB.prepare(
+        'SELECT state_hash FROM github_installation_states WHERE user_id = ?'
+      ).bind(userId).all();
+      expect(states.results).toHaveLength(0);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('rejects a placeholder App ID before making GitHub API requests', async () => {
+    const previousAppId = appEnv.GITHUB_APP_ID;
+    const priorFetch = globalThis.fetch;
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    Reflect.set(appEnv, 'GITHUB_APP_ID', 'replace-with-github-app-id');
+
+    try {
+      await expect(verifySelectedRepositoryInstallation(appEnv, 731))
+        .rejects.toThrow('GitHub App is not configured');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      Reflect.set(appEnv, 'GITHUB_APP_ID', previousAppId);
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
   it('binds a selected-repository callback to its one-time initiating account state', async () => {
     const priorFetch = globalThis.fetch;
     const previousFrontendOrigin = appEnv.MATMETRICS_FRONTEND_URL;
     Reflect.set(appEnv, 'MATMETRICS_FRONTEND_URL', 'https://matmetrics.example.test');
     const allowRateLimit = { limit: async (_input: { key: string }) => ({ success: true }) };
-    const testEnv = Object.assign(Object.create(env), {
+    const testEnv = Object.assign(Object.create(appEnv), {
       SESSION_READ_LIMITER: allowRateLimit,
       SESSION_WRITE_LIMITER: allowRateLimit,
       BACKUP_WRITE_LIMITER: allowRateLimit,
@@ -156,7 +236,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       const callbackUrl = new URL('/v1/backups/github-installation/callback', 'https://keiko.example.test');
       callbackUrl.searchParams.set('state', state);
       callbackUrl.searchParams.set('installation_id', '731');
-      const callback = await worker.fetch(new Request(callbackUrl), env);
+      const callback = await worker.fetch(new Request(callbackUrl), appEnv);
 
       expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/settings?githubBackup=connected');
       expect(isoTimestamp).toHaveBeenCalledTimes(1);

@@ -47,7 +47,9 @@ is no production Worker deployment or account cutover.
   Wrangler config. Store the App's private key with
   `wrangler secret put GITHUB_APP_PRIVATE_KEY --env staging` and the matching
   production command. The private key is required for GitHub App JWTs; no
-  long-lived installation token or extra webhook secret is used.
+  long-lived installation token or extra webhook secret is used. The
+  installation endpoint returns `503` until the App ID, install URL, and
+  private key are configured; placeholder IDs and install URLs are rejected.
 - Apply migrations before deployment. Keep MatMetrics' `matmetrics-data`
   database separate from Keiko's D1.
 
