@@ -1,20 +1,37 @@
 # Operations and production gates
 
-Keiko's local test configuration is self-contained. Staging and production
-remain disabled until their D1, Queue, auth, MatMetrics, and GitHub App
-resources have been provisioned and recovery has been exercised.
+Keiko's local test configuration is self-contained. Separate staging and
+production D1 databases, backup queues, and dead-letter queues are provisioned.
+The staging Worker is deployed at
+[`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-staging.scheimann.workers.dev)
+and its health/readiness endpoints have been smoke-checked. End-to-end account
+validation is incomplete. Production D1 remains empty and unmigrated, and there
+is no production Worker deployment or account cutover.
 
 ## Environment setup
 
-- Create a separate Keiko D1 database for staging and production and replace
-  the placeholder IDs in `wrangler.jsonc`.
-- Create the matching backup queues and dead-letter queues. The Worker uses
+- The staging and production D1 IDs and matching backup queues/dead-letter
+  queues are recorded in `wrangler.jsonc`. Keep production D1 unmigrated until
+  staging and recovery validation pass. The Worker uses
   up to five retries and sends messages that exceed the retry limit to the
   configured dead-letter queue. Inspect and redrive dead-letter messages only
   after resolving the failure cause.
-- Set each environment's Better Auth JWKS URL and issuer to the matching
-  MatMetrics Auth Worker. Keep `AUTH_AUDIENCE` exactly `keiko-dojo-api`.
-- Set `MATMETRICS_FRONTEND_URL` to that environment's exact MatMetrics origin.
+- Staging uses the existing MatMetrics Auth Worker's verified JWKS endpoint and
+  the issuer `https://matmetrics-teal.vercel.app`. Keep `AUTH_AUDIENCE` exactly
+  `keiko-dojo-api`. No separate MatMetrics origin or Vercel Preview deployment
+  is needed for the single-account pilot: the current production origin is
+  already the exact origin configured for Keiko and the Auth Worker.
+- After the staging import is reviewed, set the Vercel Production variables
+  `KEIKO_API_BASE_URL` to the staging Keiko Worker,
+  `MATMETRICS_AUTH_FRONTEND_ORIGIN` to `https://matmetrics-teal.vercel.app`,
+  and `KEIKO_SESSION_CUTOVER_USER_IDS` to only the existing account's Better
+  Auth user ID. These variables are currently absent from the Vercel project.
+  This routes that account's live MatMetrics session API calls to staging; do
+  not enable the allowlist before importing and reviewing its data. Redeploy
+  MatMetrics Production after saving the variables. The current
+  Vercel project has no custom-environment capacity, but this pilot does not
+  require one. Keiko's staging `MATMETRICS_FRONTEND_URL` remains the exact
+  production MatMetrics origin for CSRF and callback checks.
 - Keep the unique rate-limit namespaces declared for each environment in
   `wrangler.jsonc`. Keiko enforces per-user limits of 300 reads/minute, 120
   session writes/minute, and 10 backup/restore writes/minute. If the namespace
@@ -30,7 +47,9 @@ resources have been provisioned and recovery has been exercised.
   Wrangler config. Store the App's private key with
   `wrangler secret put GITHUB_APP_PRIVATE_KEY --env staging` and the matching
   production command. The private key is required for GitHub App JWTs; no
-  long-lived installation token or extra webhook secret is used.
+  long-lived installation token or extra webhook secret is used. The
+  installation endpoint returns `503` until the App ID, install URL, and
+  private key are configured; placeholder IDs and install URLs are rejected.
 - Apply migrations before deployment. Keep MatMetrics' `matmetrics-data`
   database separate from Keiko's D1.
 
@@ -81,20 +100,34 @@ resources have been provisioned and recovery has been exercised.
 
 ## Cutover procedure
 
-1. Deploy and validate staging with two test users, including mismatched
-   bearer/cookie identities, rejected origins, import parity, analytics,
+1. Deploy and validate staging with the sole existing MatMetrics account,
+   including mismatched bearer/cookie identities, rejected origins, analytics,
    backup recovery, queue retry/DLQ behavior, restore protection, and MCP/REST
-   scope parity.
-2. Run `scripts/import-keiko-sessions.ts` in dry-run mode for a pilot account.
-   Review parse failures, duplicate IDs, payload mismatches, and existing
-   records. Run with `--apply` only after review.
-3. Compare the complete Keiko session list and analytics against the source.
-   Only then add the verified Better Auth user ID to the MatMetrics
-   `KEIKO_SESSION_CUTOVER_USER_IDS` server-side allowlist.
-4. Do not dual-write. If rolling back, export current D1 first, reconcile new
-   writes against Markdown, then remove the account from the allowlist.
-5. Expand the pilot only after recovery validation and sanitized logs show no
-   unexpected authorization, queue, or GitHub errors.
+   scope parity. Keiko's automated integration tests use synthetic identities
+   to verify tenant isolation; a second live account is not required.
+2. From the MatMetrics repository root, export the current account data, run
+   `npm run test:keiko:import`, then run
+   `node --import tsx scripts/import-keiko-sessions.ts` in dry-run mode with
+   the staging API configured. Review parse failures, duplicate IDs, payload
+   mismatches, and existing records. Run with `--apply` only after review. The
+   importer source lives in [CyanAutomation/matmetrics](https://github.com/CyanAutomation/matmetrics/blob/main/scripts/import-keiko-sessions.ts).
+3. Compare the complete staging session list and analytics against the source,
+   exercise rollback, and keep the original Markdown copy. After the reviewed
+   staging import, set the Vercel production API base to the staging Worker and
+   allowlist only the existing user for this controlled staging pilot. Switch
+   the API base to Keiko production only after production migration and cutover
+   checks pass. Keep the cutover allowlist limited to that one ID.
+4. After all staging/recovery checks pass, apply migrations to production D1
+   and deploy Keiko. Export the existing account data, repeat the importer
+   dry-run/review/apply against production, compare session and analytics
+   parity, then switch the Vercel Production `KEIKO_API_BASE_URL` to the
+   production Worker for the already-allowlisted ID. Keep the allowlist limited
+   to that one verified Better Auth user ID.
+5. Do not dual-write. If rolling back, export current Keiko D1 first, reconcile
+   new writes against Markdown, then remove the account from the allowlist.
+   Keep the rollout at this account until recovery validation and sanitized
+   logs show no unexpected authorization, queue, or GitHub errors. Reassess
+   broader rollout when another MatMetrics account is onboarded.
 
 ## Monitoring
 
@@ -106,6 +139,7 @@ credentials are not logged.
 ## Remaining service moves
 
 MatMetrics continues to own training-plan insights and AI features. GitHub
-sync, health, and Log Doctor operations have not yet moved behind Keiko and
-must be migrated before Keiko is the shared backend for those services. Do not
-send session data to an AI provider until the data-use policy is approved.
+sync, health, and Log Doctor operations have not yet moved behind Keiko; move
+them after the single-account production session cutover is stable if Keiko is
+to become the shared backend for those services. Do not send session data to
+an AI provider until the data-use policy is approved.

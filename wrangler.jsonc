@@ -55,18 +55,18 @@
       "triggers": { "crons": ["0 3 * * *"] },
       "vars": {
         "ENVIRONMENT": "staging",
-        "AUTH_JWKS_URL": "https://replace-with-staging-auth.example.com/api/auth/jwks",
-        "AUTH_ISSUER": "https://replace-with-staging-auth.example.com",
+        "AUTH_JWKS_URL": "https://matmetrics-auth-production.scheimann.workers.dev/api/auth/jwks",
+        "AUTH_ISSUER": "https://matmetrics-teal.vercel.app",
         "AUTH_AUDIENCE": "keiko-dojo-api",
         "GITHUB_APP_ID": "replace-with-github-app-id",
         "GITHUB_APP_INSTALL_URL": "https://github.com/apps/replace-keiko-dojo/installations/new",
-        "MATMETRICS_FRONTEND_URL": "https://replace-with-staging-matmetrics.example.com"
+        "MATMETRICS_FRONTEND_URL": "https://matmetrics-teal.vercel.app"
       },
       "d1_databases": [
         {
           "binding": "DB",
           "database_name": "keiko-dojo-staging",
-          "database_id": "00000000-0000-0000-0000-000000000001",
+          "database_id": "7002a569-f450-4050-bb2a-b4cba208bf59",
           "migrations_dir": "migrations"
         }
       ],
@@ -90,8 +90,8 @@
       "triggers": { "crons": ["0 2 * * *"] },
       "vars": {
         "ENVIRONMENT": "production",
-        "AUTH_JWKS_URL": "https://replace-with-production-auth.example.com/api/auth/jwks",
-        "AUTH_ISSUER": "https://replace-with-production-auth.example.com",
+        "AUTH_JWKS_URL": "https://matmetrics-auth-production.scheimann.workers.dev/api/auth/jwks",
+        "AUTH_ISSUER": "https://matmetrics-teal.vercel.app",
         "AUTH_AUDIENCE": "keiko-dojo-api",
         "GITHUB_APP_ID": "replace-with-github-app-id",
         "GITHUB_APP_INSTALL_URL": "https://github.com/apps/replace-keiko-dojo/installations/new",
@@ -101,7 +101,7 @@
         {
           "binding": "DB",
           "database_name": "keiko-dojo",
-          "database_id": "00000000-0000-0000-0000-000000000002",
+          "database_id": "750315f8-ef51-4d6e-86ea-41b076ec9de8",
           "migrations_dir": "migrations"
         }
       ],
