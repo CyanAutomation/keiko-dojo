@@ -1,5 +1,6 @@
 import { importPKCS8, SignJWT } from 'jose';
-import type { SnapshotSession } from '../http/backups';
+import type { SnapshotSession } from '../domain/backup-snapshot';
+import { isSessionCategory } from '../domain/session';
 
 type GitHubAppEnvironment = Env & {
   GITHUB_APP_PRIVATE_KEY?: string;
@@ -138,36 +139,95 @@ type MarkdownSession = {
   videoUrl?: string;
 };
 
-function markdownSession(row: SnapshotSession): MarkdownSession {
+function decodeSessionPayload(row: SnapshotSession): Record<string, unknown> {
   let value: unknown;
   try { value = JSON.parse(row.payload); } catch { throw new Error('Stored session payload is invalid'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Stored session payload is invalid');
   }
-  const session = value as Record<string, unknown>;
-  const date = session.date;
-  const id = session.id;
-  const effort = session.effort;
-  const category = session.category;
-  const techniques = session.techniques;
-  if (
-    typeof id !== 'string' || id !== row.id || !/^[A-Za-z0-9_-]{1,100}$/.test(id) ||
-    typeof date !== 'string' || date !== row.session_date || !validSessionDate(date) ||
-    typeof effort !== 'number' || !Number.isInteger(effort) || effort < 1 || effort > 5 || effort !== row.effort ||
-    typeof category !== 'string' || category !== row.category ||
-    !['Technical', 'Randori', 'Shiai', 'Cardio', 'S&C'].includes(category) ||
-    !Array.isArray(techniques) || !techniques.every((technique) => typeof technique === 'string') ||
-    (session.description !== undefined && typeof session.description !== 'string') ||
-    (session.notes !== undefined && typeof session.notes !== 'string') ||
-    (session.duration !== undefined && (!Number.isInteger(session.duration) || Number(session.duration) < 0)) ||
-    (session.videoUrl !== undefined && typeof session.videoUrl !== 'string')
-  ) throw new Error('Stored session payload is invalid');
+  return value as Record<string, unknown>;
+}
+
+function hasValidSessionId(session: Record<string, unknown>, row: SnapshotSession): boolean {
+  return typeof session.id === 'string' &&
+    session.id === row.id &&
+    /^[A-Za-z0-9_-]{1,100}$/.test(session.id);
+}
+
+function hasValidSessionDate(session: Record<string, unknown>, row: SnapshotSession): boolean {
+  return typeof session.date === 'string' &&
+    session.date === row.session_date &&
+    validSessionDate(session.date);
+}
+
+function hasValidSessionEffort(session: Record<string, unknown>, row: SnapshotSession): boolean {
+  return typeof session.effort === 'number' &&
+    Number.isInteger(session.effort) &&
+    session.effort >= 1 &&
+    session.effort <= 5 &&
+    session.effort === row.effort;
+}
+
+function hasValidSessionCategory(session: Record<string, unknown>, row: SnapshotSession): boolean {
+  return typeof session.category === 'string' &&
+    session.category === row.category &&
+    isSessionCategory(session.category);
+}
+
+function matchesSnapshotIdentity(
+  session: Record<string, unknown>,
+  row: SnapshotSession
+): session is Record<string, unknown> & Pick<MarkdownSession, 'id' | 'date' | 'effort' | 'category'> {
+  return hasValidSessionId(session, row) &&
+    hasValidSessionDate(session, row) &&
+    hasValidSessionEffort(session, row) &&
+    hasValidSessionCategory(session, row);
+}
+
+function hasValidTechniques(
+  session: Record<string, unknown>
+): session is Record<string, unknown> & Pick<MarkdownSession, 'techniques'> {
+  return Array.isArray(session.techniques) &&
+    session.techniques.every((technique) => typeof technique === 'string');
+}
+
+function isValidDescription(value: unknown): boolean {
+  return value === undefined || typeof value === 'string';
+}
+
+function isValidDuration(value: unknown): boolean {
+  return value === undefined || (
+    typeof value === 'number' && Number.isInteger(value) && value >= 0
+  );
+}
+
+function hasValidOptionalFields(session: Record<string, unknown>): boolean {
+  return isValidDescription(session.description) &&
+    isValidDescription(session.notes) &&
+    isValidDuration(session.duration) &&
+    isValidDescription(session.videoUrl);
+}
+
+function isValidMarkdownSession(
+  session: Record<string, unknown>,
+  row: SnapshotSession
+): session is Record<string, unknown> & MarkdownSession {
+  return matchesSnapshotIdentity(session, row) &&
+    hasValidTechniques(session) &&
+    hasValidOptionalFields(session);
+}
+
+function markdownSession(row: SnapshotSession): MarkdownSession {
+  const session = decodeSessionPayload(row);
+  if (!isValidMarkdownSession(session, row)) {
+    throw new Error('Stored session payload is invalid');
+  }
   return {
-    id,
-    date,
-    effort,
-    category,
-    techniques,
+    id: session.id,
+    date: session.date,
+    effort: session.effort,
+    category: session.category,
+    techniques: session.techniques,
     ...(typeof session.description === 'string' ? { description: session.description } : {}),
     ...(typeof session.notes === 'string' ? { notes: session.notes } : {}),
     ...(typeof session.duration === 'number' ? { duration: session.duration } : {}),

@@ -66,7 +66,7 @@ export function isBlockedNetworkHostname(hostname: string): boolean {
   return false;
 }
 
-export function normalizeNetworkHostname(hostname: string): string {
+function normalizeNetworkHostname(hostname: string): string {
   const lowered = hostname.trim().toLowerCase().replace(/\.+$/, '');
   if (lowered.startsWith('[') && lowered.endsWith(']')) {
     return lowered.slice(1, -1);

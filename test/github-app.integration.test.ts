@@ -4,7 +4,7 @@ import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../src/integrations/github-app';
-import type { SnapshotSession } from '../src/http/backups';
+import type { SnapshotSession } from '../src/domain/backup-snapshot';
 
 const appEnv = env as unknown as Env & { GITHUB_APP_PRIVATE_KEY?: string };
 const originalFetch = globalThis.fetch;
@@ -222,6 +222,44 @@ describe('GitHub App selected-repository backup adapter', () => {
     expect(secondMarkdown).toContain('- Randori drills \\# injected heading');
     expect(secondMarkdown).toContain('Warm\\-up\n\\-\\-\\-\n\\# Injected heading\n&lt;script&gt;alert\\(1\\)&lt;/script&gt;');
     expect(secondMarkdown).toContain('\\[link\\]\\(https://evil\\.test\\)\n\\- injected list\n\\`\\`\\`html');
+  });
+
+  it('rejects malformed stored session payloads before writing repository contents', async () => {
+    const priorFetch = globalThis.fetch;
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      calls.push(url);
+      return Response.json({ token: 'scoped-write-token' });
+    });
+    const invalidSession: SnapshotSession = {
+      id: 'broken-session',
+      session_date: '2026-10-17',
+      category: 'Technical',
+      effort: 3,
+      payload: '{invalid-json',
+      revision: 1,
+      updated_at: '2026-10-17T00:00:00.000Z',
+    };
+
+    try {
+      await expect(writeGitHubBackup(
+        appEnv,
+        {
+          user_id: 'user-1',
+          installation_id: 731,
+          repository_owner: 'maki',
+          repository_name: 'judo-notes',
+          repository_id: 88,
+        },
+        'snapshot-1',
+        '2026-10-17T00:00:00.000Z',
+        [invalidSession]
+      )).rejects.toThrow('Stored session payload is invalid');
+      expect(calls).toHaveLength(1);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
   });
 
   it('rejects GitHub App installations with all-repository access or more than one selected repository', async () => {

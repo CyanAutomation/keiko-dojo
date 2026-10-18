@@ -1,28 +1,17 @@
 import { authenticateRequest, AuthFailure } from '../auth/bearer-auth';
-import { isEffortLevel, isJsonObject, isSessionCategory, validateSessionPayload } from '../domain/session';
+import { isJsonObject } from '../domain/session';
+import {
+  snapshotChecksum,
+  validatedSnapshotRows,
+  type BackupSnapshotRow,
+  type SnapshotSession,
+} from '../domain/backup-snapshot';
 import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../integrations/github-app';
+import { authFailureResponse } from './auth-errors';
 import { readJsonBodyLimited } from './request-body';
 import { jsonError, jsonResponse } from './responses';
 
 type BackupMessage = { jobId: string; userId: string };
-export type SnapshotSession = {
-  id: string;
-  session_date: string;
-  category: string;
-  effort: number;
-  payload: string;
-  revision: number;
-  updated_at: string;
-};
-
-function authError(error: AuthFailure, requestId: string): Response {
-  if (error.kind === 'rate_limited') {
-    return jsonError(requestId, 429, 'rate_limited', error.message, { 'Retry-After': '60' });
-  }
-  const status = error.kind === 'forbidden' ? 403 : error.kind === 'unavailable' ? 503 : 401;
-  const code = error.kind === 'forbidden' ? 'insufficient_scope' : error.kind === 'unavailable' ? 'authentication_unavailable' : 'authentication_required';
-  return jsonError(requestId, status, code, error.message);
-}
 
 type BodyObjectResult =
   | { ok: true; value: Record<string, unknown> }
@@ -44,16 +33,6 @@ function bodyError(requestId: string, result: Extract<BodyObjectResult, { ok: fa
 
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
-}
-
-function isCanonicalTimestamp(value: string): boolean {
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return false;
-  try {
-    return new Date(timestamp).toISOString() === value;
-  } catch {
-    return false;
-  }
 }
 
 async function hashState(value: string): Promise<string> {
@@ -203,25 +182,59 @@ async function requestBackup(request: Request, env: Env, requestId: string): Pro
   return jsonResponse({ id, status: 'queued', requestedAt }, 202);
 }
 
+type SnapshotLookup =
+  | { ok: true; snapshot: BackupSnapshotRow; rows: SnapshotSession[] }
+  | { ok: false; reason: 'not_found' | 'invalid' };
+
+async function loadSnapshot(
+  userId: string,
+  snapshotId: string,
+  env: Env
+): Promise<SnapshotLookup> {
+  const snapshot = await env.DB.prepare(
+    `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots WHERE id = ? AND user_id = ?`
+  ).bind(snapshotId, userId).first<BackupSnapshotRow>();
+  if (!snapshot) return { ok: false, reason: 'not_found' };
+  const rows = await validatedSnapshotRows(snapshot);
+  return rows
+    ? { ok: true, snapshot, rows }
+    : { ok: false, reason: 'invalid' };
+}
+
+function snapshotLookupFailure(reason: 'not_found' | 'invalid', requestId: string): Response {
+  return reason === 'not_found'
+    ? jsonError(requestId, 404, 'not_found', 'Backup not found')
+    : jsonError(requestId, 500, 'internal_error', 'Backup snapshot is invalid');
+}
+
+function countPreservedSessions(
+  current: Array<{ id: string; updated_at: string }>,
+  snapshotRows: SnapshotSession[],
+  createdAt: string
+): number {
+  const snapshotIds = new Set(snapshotRows.map((row) => row.id));
+  return current.filter((row) =>
+    row.updated_at > createdAt || !snapshotIds.has(row.id)
+  ).length;
+}
+
 async function previewRestore(
   userId: string,
   snapshotId: string,
   env: Env,
   requestId: string
 ): Promise<Response> {
-  const snapshot = await env.DB.prepare(
-    `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots WHERE id = ? AND user_id = ?`
-  ).bind(snapshotId, userId).first<SnapshotRow>();
-  if (!snapshot) return jsonError(requestId, 404, 'not_found', 'Backup not found');
-  const snapshotRows = await validatedSnapshotRows(snapshot);
-  if (!snapshotRows) return jsonError(requestId, 500, 'internal_error', 'Backup snapshot is invalid');
+  const loaded = await loadSnapshot(userId, snapshotId, env);
+  if (!loaded.ok) return snapshotLookupFailure(loaded.reason, requestId);
+  const { snapshot, rows: snapshotRows } = loaded;
   const rows = await env.DB.prepare(
     'SELECT id, updated_at FROM sessions WHERE user_id = ?'
   ).bind(userId).all<{ id: string; updated_at: string }>();
-  const snapshotIds = new Set(snapshotRows.map((row) => row.id));
-  const preservedNewerCount = rows.results.filter((row) =>
-    row.updated_at > snapshot.created_at || !snapshotIds.has(row.id)
-  ).length;
+  const preservedNewerCount = countPreservedSessions(
+    rows.results,
+    snapshotRows,
+    snapshot.created_at
+  );
   await env.DB.prepare(
     `INSERT INTO restore_activity (id, user_id, snapshot_id, action, created_at, preserved_newer_count)
      VALUES (?, ?, ?, 'previewed', ?, ?)`
@@ -249,19 +262,17 @@ async function restore(
   if (Object.keys(body).length !== 1 || body.confirm !== true) {
     return jsonError(requestId, 400, 'bad_request', 'Explicit restore confirmation is required');
   }
-  const snapshot = await env.DB.prepare(
-    `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots WHERE id = ? AND user_id = ?`
-  ).bind(snapshotId, userId).first<SnapshotRow>();
-  if (!snapshot) return jsonError(requestId, 404, 'not_found', 'Backup not found');
-  const snapshotRows = await validatedSnapshotRows(snapshot);
-  if (!snapshotRows) return jsonError(requestId, 500, 'internal_error', 'Backup snapshot is invalid');
+  const loaded = await loadSnapshot(userId, snapshotId, env);
+  if (!loaded.ok) return snapshotLookupFailure(loaded.reason, requestId);
+  const { snapshot, rows: snapshotRows } = loaded;
   const current = await env.DB.prepare(
     'SELECT id, updated_at FROM sessions WHERE user_id = ?'
   ).bind(userId).all<{ id: string; updated_at: string }>();
-  const snapshotIds = new Set(snapshotRows.map((row) => row.id));
-  const preservedNewerCount = current.results.filter((row) =>
-    row.updated_at > snapshot.created_at || !snapshotIds.has(row.id)
-  ).length;
+  const preservedNewerCount = countPreservedSessions(
+    current.results,
+    snapshotRows,
+    snapshot.created_at
+  );
   const statements = snapshotRows.map((row) => env.DB.prepare(
     `INSERT INTO sessions (user_id, id, session_date, category, effort, payload, revision, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -321,74 +332,9 @@ export async function handleBackupRequest(
     }
     return jsonError(requestId, 405, 'method_not_allowed', 'Method not allowed');
   } catch (error) {
-    if (error instanceof AuthFailure) return authError(error, requestId);
+    if (error instanceof AuthFailure) return authFailureResponse(error, requestId);
     throw error;
   }
-}
-
-type SnapshotRow = {
-  id: string;
-  created_at: string;
-  session_count: number;
-  checksum: string;
-  payload: string;
-};
-
-async function validatedSnapshotRows(snapshot: SnapshotRow): Promise<SnapshotSession[] | null> {
-  if (
-    !snapshot.id ||
-    !isCanonicalTimestamp(snapshot.created_at) ||
-    !Number.isInteger(snapshot.session_count) || snapshot.session_count < 0 ||
-    !/^[a-f0-9]{64}$/.test(snapshot.checksum)
-  ) return null;
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(snapshot.payload));
-  if (hex(new Uint8Array(digest)) !== snapshot.checksum) return null;
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(snapshot.payload) as unknown;
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(decoded) || decoded.length !== snapshot.session_count) return null;
-  const seen = new Set<string>();
-  const rows: SnapshotSession[] = [];
-  for (const value of decoded) {
-    if (
-      !isJsonObject(value) ||
-      typeof value.id !== 'string' ||
-      typeof value.session_date !== 'string' ||
-      typeof value.category !== 'string' ||
-      !isSessionCategory(value.category) ||
-      !isEffortLevel(value.effort) ||
-      typeof value.payload !== 'string' ||
-      !Number.isInteger(value.revision) || (value.revision as number) < 1 ||
-      typeof value.updated_at !== 'string' ||
-      !isCanonicalTimestamp(value.updated_at) ||
-      seen.has(value.id)
-    ) return null;
-    let payload: unknown;
-    try {
-      payload = JSON.parse(value.payload) as unknown;
-    } catch {
-      return null;
-    }
-    if (!isJsonObject(payload)) return null;
-    const validation = validateSessionPayload(payload, {
-      routeId: value.id,
-      generateIdWhenMissing: false,
-    });
-    if (
-      !validation.ok ||
-      payload.id !== value.id ||
-      validation.session.id !== value.id ||
-      validation.session.date !== value.session_date ||
-      validation.session.category !== value.category ||
-      validation.session.effort !== value.effort
-    ) return null;
-    seen.add(value.id);
-    rows.push(value as unknown as SnapshotSession);
-  }
-  return rows;
 }
 
 export async function processBackupMessage(
@@ -413,7 +359,7 @@ export async function processBackupMessage(
     ).bind(userId).all<SnapshotSession>();
     const existing = await env.DB.prepare(
       `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots WHERE job_id = ? AND user_id = ?`
-    ).bind(jobId, userId).first<SnapshotRow>();
+    ).bind(jobId, userId).first<BackupSnapshotRow>();
     let snapshotId = existing?.id;
     let createdAt = existing?.created_at;
     let snapshotRows = rows.results;
@@ -425,8 +371,7 @@ export async function processBackupMessage(
       createdAt = new Date().toISOString();
       snapshotId = crypto.randomUUID();
       const payload = JSON.stringify(snapshotRows);
-      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
-      const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
+      const checksum = await snapshotChecksum(payload);
       const validatedRows = await validatedSnapshotRows({
         id: snapshotId, created_at: createdAt, session_count: snapshotRows.length, checksum, payload,
       });
@@ -444,7 +389,7 @@ export async function processBackupMessage(
         const racedSnapshot = await env.DB.prepare(
           `SELECT id, created_at, session_count, checksum, payload FROM backup_snapshots
            WHERE job_snapshot_key = ? AND user_id = ?`
-        ).bind(jobId, userId).first<SnapshotRow>();
+        ).bind(jobId, userId).first<BackupSnapshotRow>();
         if (!racedSnapshot) throw insertError;
         const racedRows = await validatedSnapshotRows(racedSnapshot);
         if (!racedRows) throw new Error('Backup snapshot is invalid');

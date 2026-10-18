@@ -1,5 +1,6 @@
 import { authenticateRequest, AuthFailure } from '../auth/bearer-auth';
 import { SessionService } from '../application/session-service';
+import { authFailureResponse } from './auth-errors';
 import { readJsonBodyLimited } from './request-body';
 import { jsonError } from './responses';
 
@@ -75,13 +76,134 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
-function authError(error: AuthFailure, requestId: string): Response {
-  if (error.kind === 'rate_limited') {
-    return jsonError(requestId, 429, 'rate_limited', error.message, { 'Retry-After': '60' });
+async function parseJsonRpcRequest(
+  request: Request,
+  requestId: string
+): Promise<JsonRpcRequest | Response> {
+  const parsed = await readJsonBodyLimited(request, 1024 * 1024);
+  if (!parsed.ok && parsed.reason === 'too_large') {
+    return jsonError(requestId, 413, 'payload_too_large', 'Request body exceeds the 1 MiB limit');
   }
-  const status = error.kind === 'forbidden' ? 403 : error.kind === 'unavailable' ? 503 : 401;
-  const code = error.kind === 'forbidden' ? 'insufficient_scope' : error.kind === 'unavailable' ? 'authentication_unavailable' : 'authentication_required';
-  return jsonError(requestId, status, code, error.message);
+  if (!parsed.ok) {
+    return rpcError(null, -32700, 'Parse error');
+  }
+  if (!isObject(parsed.value)) return rpcError(null, -32600, 'Invalid request');
+  const body = parsed.value as JsonRpcRequest;
+  if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
+    return rpcError(body.id, -32600, 'Invalid request');
+  }
+  return body;
+}
+
+async function authenticateMcpUser(
+  request: Request,
+  env: Env,
+  requestId: string
+): Promise<string | Response> {
+  try {
+    const principal = await authenticateRequest(request, env, 'sessions:read');
+    return principal.userId;
+  } catch (error) {
+    if (error instanceof AuthFailure) return authFailureResponse(error, requestId);
+    throw error;
+  }
+}
+
+function initialize(body: JsonRpcRequest): Response {
+  const params = isObject(body.params) ? body.params : {};
+  const requestedVersion = typeof params.protocolVersion === 'string'
+    ? params.protocolVersion
+    : MCP_VERSION;
+  const supported = new Set([MCP_VERSION, '2025-06-18', '2025-03-26']);
+  if (!supported.has(requestedVersion)) {
+    return rpcError(body.id, -32602, 'Unsupported protocol version');
+  }
+  return rpc(body.id, {
+    protocolVersion: requestedVersion,
+    capabilities: { tools: { listChanged: false } },
+    serverInfo: { name: 'keiko-dojo', version: '1.0.0' },
+    instructions: 'All tools are read-only and scoped to the authenticated user.',
+  });
+}
+
+function handleProtocolMethod(body: JsonRpcRequest): Response | null {
+  if (body.method === 'initialize') return initialize(body);
+  if (body.method === 'ping') return rpc(body.id, {});
+  if (body.method === 'tools/list') return rpc(body.id, { tools: TOOLS });
+  return null;
+}
+
+async function listSessionsTool(
+  id: unknown,
+  args: Record<string, unknown>,
+  userId: string,
+  service: SessionService
+): Promise<Response> {
+  const limit = args.limit === undefined ? 50 : args.limit;
+  if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return rpc(id, toolResult({ error: 'Invalid limit' }, true));
+  }
+  const page = await service.list(userId, {
+    from: typeof args.from === 'string' ? args.from : undefined,
+    to: typeof args.to === 'string' ? args.to : undefined,
+    category: typeof args.category === 'string' ? args.category : undefined,
+    effort: typeof args.effort === 'number' ? args.effort : undefined,
+    cursor: typeof args.cursor === 'string' ? args.cursor : undefined,
+    limit,
+  });
+  return rpc(id, toolResult({ data: page.records, nextCursor: page.nextCursor }));
+}
+
+async function getSessionTool(
+  id: unknown,
+  args: Record<string, unknown>,
+  userId: string,
+  service: SessionService
+): Promise<Response> {
+  if (typeof args.id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(args.id)) {
+    return rpc(id, toolResult({ error: 'Invalid session ID' }, true));
+  }
+  const record = await service.get(userId, args.id);
+  return rpc(id, record
+    ? toolResult(record)
+    : toolResult({ error: 'Session not found' }, true));
+}
+
+async function callTool(
+  body: JsonRpcRequest,
+  userId: string,
+  service: SessionService
+): Promise<Response> {
+  const params = isObject(body.params) ? body.params : null;
+  if (!params || typeof params.name !== 'string') {
+    return rpcError(body.id, -32602, 'Invalid tool arguments');
+  }
+  const args = isObject(params.arguments) ? params.arguments : {};
+  try {
+    if (params.name === 'list_sessions') {
+      return await listSessionsTool(body.id, args, userId, service);
+    }
+    if (params.name === 'get_session') {
+      return await getSessionTool(body.id, args, userId, service);
+    }
+    if (params.name === 'get_training_summary') {
+      return rpc(body.id, toolResult(await service.analytics(userId)));
+    }
+    return rpcError(body.id, -32602, 'Unknown tool');
+  } catch {
+    return rpc(body.id, toolResult({ error: 'Tool execution failed' }, true));
+  }
+}
+
+async function handleAuthenticatedRequest(
+  body: JsonRpcRequest,
+  userId: string,
+  service: SessionService
+): Promise<Response> {
+  const protocolResponse = handleProtocolMethod(body);
+  if (protocolResponse) return protocolResponse;
+  if (body.method === 'tools/call') return callTool(body, userId, service);
+  return rpcError(body.id, -32601, 'Method not found');
 }
 
 export async function handleMcpRequest(
@@ -97,88 +219,18 @@ export async function handleMcpRequest(
   if (origin && origin !== new URL(request.url).origin) {
     return jsonError(requestId, 403, 'authentication_required', 'Request origin could not be verified');
   }
-  let body: JsonRpcRequest;
-  const parsed = await readJsonBodyLimited(request, 1024 * 1024);
-  if (!parsed.ok && parsed.reason === 'too_large') {
-    return jsonError(requestId, 413, 'payload_too_large', 'Request body exceeds the 1 MiB limit');
-  }
-  if (!parsed.ok) {
-    return rpcError(null, -32700, 'Parse error');
-  }
-  if (!isObject(parsed.value)) return rpcError(null, -32600, 'Invalid request');
-  body = parsed.value as JsonRpcRequest;
-  if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
-    return rpcError(body.id, -32600, 'Invalid request');
-  }
-
+  const body = await parseJsonRpcRequest(request, requestId);
+  if (body instanceof Response) return body;
   if (body.method === 'notifications/initialized') {
-    try {
-      await authenticateRequest(request, env, 'sessions:read');
-      return new Response(null, { status: 202, headers: { 'Cache-Control': 'no-store' } });
-    } catch (error) {
-      if (error instanceof AuthFailure) return authError(error, requestId);
-      throw error;
-    }
+    const auth = await authenticateMcpUser(request, env, requestId);
+    return auth instanceof Response
+      ? auth
+      : new Response(null, { status: 202, headers: { 'Cache-Control': 'no-store' } });
   }
   if (body.id === undefined || body.id === null || typeof body.id === 'object') {
     return rpcError(null, -32600, 'Request ID is required');
   }
-
-  let userId: string;
-  try {
-    ({ userId } = await authenticateRequest(request, env, 'sessions:read'));
-  } catch (error) {
-    if (error instanceof AuthFailure) return authError(error, requestId);
-    throw error;
-  }
-
-  if (body.method === 'initialize') {
-    const params = isObject(body.params) ? body.params : {};
-    const requestedVersion = typeof params.protocolVersion === 'string' ? params.protocolVersion : MCP_VERSION;
-    const supported = new Set([MCP_VERSION, '2025-06-18', '2025-03-26']);
-    if (!supported.has(requestedVersion)) return rpcError(body.id, -32602, 'Unsupported protocol version');
-    return rpc(body.id, {
-      protocolVersion: requestedVersion,
-      capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'keiko-dojo', version: '1.0.0' },
-      instructions: 'All tools are read-only and scoped to the authenticated user.',
-    });
-  }
-  if (body.method === 'ping') return rpc(body.id, {});
-  if (body.method === 'tools/list') return rpc(body.id, { tools: TOOLS });
-  if (body.method !== 'tools/call') return rpcError(body.id, -32601, 'Method not found');
-
-  const params = isObject(body.params) ? body.params : null;
-  if (!params || typeof params.name !== 'string') return rpcError(body.id, -32602, 'Invalid tool arguments');
-  const args = isObject(params.arguments) ? params.arguments : {};
-  try {
-    if (params.name === 'list_sessions') {
-      const limit = args.limit === undefined ? 50 : args.limit;
-      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 100) {
-        return rpc(body.id, toolResult({ error: 'Invalid limit' }, true));
-      }
-      const page = await service.list(userId, {
-        from: typeof args.from === 'string' ? args.from : undefined,
-        to: typeof args.to === 'string' ? args.to : undefined,
-        category: typeof args.category === 'string' ? args.category : undefined,
-        effort: typeof args.effort === 'number' ? args.effort : undefined,
-        cursor: typeof args.cursor === 'string' ? args.cursor : undefined,
-        limit,
-      });
-      return rpc(body.id, toolResult({ data: page.records, nextCursor: page.nextCursor }));
-    }
-    if (params.name === 'get_session') {
-      if (typeof args.id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(args.id)) {
-        return rpc(body.id, toolResult({ error: 'Invalid session ID' }, true));
-      }
-      const record = await service.get(userId, args.id);
-      return rpc(body.id, record ? toolResult(record) : toolResult({ error: 'Session not found' }, true));
-    }
-    if (params.name === 'get_training_summary') {
-      return rpc(body.id, toolResult(await service.analytics(userId)));
-    }
-    return rpcError(body.id, -32602, 'Unknown tool');
-  } catch {
-    return rpc(body.id, toolResult({ error: 'Tool execution failed' }, true));
-  }
+  const auth = await authenticateMcpUser(request, env, requestId);
+  if (auth instanceof Response) return auth;
+  return handleAuthenticatedRequest(body, auth, service);
 }
