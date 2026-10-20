@@ -20,7 +20,7 @@
     "migrate:local": "wrangler d1 migrations apply keiko-dojo-local --local",
     "migrate:staging": "wrangler d1 migrations apply keiko-dojo-staging --remote --env staging",
     "migrate:production": "wrangler d1 migrations apply keiko-dojo --remote --env production",
-    "check:migrations": "wrangler d1 migrations list keiko-dojo-local --local"
+    "check:migrations": "wrangler d1 migrations apply keiko-dojo-local --local --persist-to .wrangler/migrations-check && wrangler d1 migrations list keiko-dojo-local --local --persist-to .wrangler/migrations-check"
   },
   "dependencies": {
     "jose": "6.2.12"
