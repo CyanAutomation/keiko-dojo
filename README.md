@@ -1,5 +1,7 @@
 # Keiko Dojo
 
+[![CI](https://github.com/CyanAutomation/keiko-dojo/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/CyanAutomation/keiko-dojo/actions/workflows/ci.yml)
+
 Keiko Dojo is the shared API and domain service for MatMetrics and related
 training applications. The first implementation provides authenticated,
 user-scoped Judo session CRUD on Cloudflare Workers and D1.
