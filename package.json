@@ -23,7 +23,7 @@
     "check:migrations": "wrangler d1 migrations apply keiko-dojo-local --local --persist-to .wrangler/migrations-check && wrangler d1 migrations list keiko-dojo-local --local --persist-to .wrangler/migrations-check"
   },
   "dependencies": {
-    "jose": "6.2.12"
+    "jose": "6.2.13"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.4",
