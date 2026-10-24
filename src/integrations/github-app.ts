@@ -1,4 +1,5 @@
 import { importPKCS8, SignJWT } from 'jose';
+import { createPrivateKey } from 'node:crypto';
 import type { SnapshotSession } from '../domain/backup-snapshot';
 import { isSessionCategory } from '../domain/session';
 import { configuredGitHubAppId } from './github-app-config';
@@ -15,6 +16,58 @@ type GitHubInstallation = {
   repository_id: number;
 };
 
+export class GitHubInstallationVerificationError extends Error {
+  constructor(
+    readonly phase: string,
+    readonly status?: number,
+    message = 'GitHub installation verification failed',
+    readonly causeName?: string,
+    readonly causeCode?: string,
+    readonly reason?: 'redirect_rejected' | 'cache_option' | 'network_error' | 'invalid_url' | 'other',
+    readonly redirectOrigin?: string,
+    readonly redirectPath?: string,
+    readonly apiErrorCategory?: string
+  ) {
+    super(message);
+  }
+}
+
+class GitHubAppApiError extends Error {
+  constructor(readonly status: number, readonly category: string) {
+    super('GitHub App API request failed');
+  }
+}
+
+class GitHubRedirectError extends Error {
+  constructor(readonly status: number, readonly origin: string, readonly pathname: string) {
+    super('GitHub App API redirect rejected');
+  }
+}
+
+function safeTransportDetails(error: unknown): {
+  causeName?: string;
+  causeCode?: string;
+  reason: 'redirect_rejected' | 'cache_option' | 'network_error' | 'invalid_url' | 'other';
+} {
+  const message = error instanceof Error ? error.message.toLowerCase() : '';
+  const cause = error && typeof error === 'object' && 'cause' in error ? error.cause : null;
+  const code = cause && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string' &&
+    /^[A-Z0-9_]{1,64}$/.test(cause.code) ? cause.code : undefined;
+  return {
+    ...(error instanceof Error ? { causeName: error.name } : {}),
+    ...(code ? { causeCode: code } : {}),
+    reason: message.includes('redirect')
+      ? 'redirect_rejected'
+      : message.includes('cache')
+        ? 'cache_option'
+        : message.includes('network') || message.includes('fetch failed')
+          ? 'network_error'
+          : message.includes('url')
+            ? 'invalid_url'
+            : 'other',
+  };
+}
+
 function required(value: string | undefined): string {
   const normalized = value?.trim();
   if (!normalized) throw new Error('GitHub App is not configured');
@@ -25,7 +78,8 @@ async function appJwt(env: GitHubAppEnvironment): Promise<string> {
   const appId = configuredGitHubAppId(env.GITHUB_APP_ID);
   if (!appId) throw new Error('GitHub App is not configured');
   const pem = required(env.GITHUB_APP_PRIVATE_KEY).replace(/\\n/g, '\n');
-  const key = await importPKCS8(pem, 'RS256');
+  const pkcs8 = createPrivateKey(pem).export({ type: 'pkcs8', format: 'pem' }).toString();
+  const key = await importPKCS8(pkcs8, 'RS256');
   const now = Math.floor(Date.now() / 1000);
   return new SignJWT({})
     .setProtectedHeader({ alg: 'RS256' })
@@ -41,7 +95,7 @@ async function githubFetch(
   method = 'GET',
   body?: unknown
 ): Promise<Response> {
-  return fetch(url, {
+  const response = await fetch(url, {
     method,
     headers: {
       accept: 'application/vnd.github+json',
@@ -50,14 +104,49 @@ async function githubFetch(
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    redirect: 'error',
+    redirect: 'manual',
     cache: 'no-store',
     signal: AbortSignal.timeout(15000),
   });
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const location = response.headers.get('location');
+    if (location) {
+      const target = new URL(location, url);
+      throw new GitHubRedirectError(response.status, target.origin, target.pathname);
+    }
+    throw new GitHubRedirectError(response.status, new URL(url).origin, new URL(url).pathname);
+  }
+  return response;
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
-  if (!response.ok) throw new Error('GitHub App API request failed');
+  if (!response.ok) {
+    let message = '';
+    try {
+      const body: unknown = await response.clone().json();
+      if (body && typeof body === 'object' && 'message' in body && typeof body.message === 'string') {
+        message = body.message.trim().toLowerCase();
+      }
+    } catch {
+      // The status remains useful when GitHub does not return a JSON error.
+    }
+    const category = message === 'bad credentials'
+      ? 'bad_credentials'
+      : message.includes('not accessible by integration')
+        ? 'integration_access_denied'
+        : message.includes('not found')
+          ? 'not_found'
+          : message.includes('rate limit')
+            ? 'rate_limited'
+            : message.includes('requires authentication')
+              ? 'authentication_required'
+              : message.includes('validation failed')
+                ? 'validation_failed'
+                : message.includes('forbidden') || response.status === 403
+                  ? 'forbidden'
+                  : 'other';
+    throw new GitHubAppApiError(response.status, category);
+  }
   return response.json() as Promise<T>;
 }
 
@@ -65,46 +154,79 @@ export async function verifySelectedRepositoryInstallation(
   env: GitHubAppEnvironment,
   installationId: number
 ): Promise<Pick<GitHubInstallation, 'installation_id' | 'repository_owner' | 'repository_name' | 'repository_id'>> {
-  const jwt = await appJwt(env);
-  const installation = await responseJson<{
-    id: number;
-    repository_selection: string;
-  }>(await githubFetch(
-    `https://api.github.com/app/installations/${installationId}`,
-    jwt
-  ));
-  if (installation.id !== installationId || installation.repository_selection !== 'selected') {
-    throw new Error('GitHub App must be installed with selected repository access');
-  }
+  let phase = 'app_jwt';
+  try {
+    const jwt = await appJwt(env);
+    phase = 'installation_lookup_request';
+    const installationResponse = await githubFetch(
+      `https://api.github.com/app/installations/${installationId}`,
+      jwt
+    );
+    phase = 'installation_lookup_response';
+    const installation = await responseJson<{
+      id: number;
+      repository_selection: string;
+    }>(installationResponse);
+    if (installation.id !== installationId || installation.repository_selection !== 'selected') {
+      phase = 'installation_scope';
+      throw new Error('GitHub App must be installed with selected repository access');
+    }
 
-  const readToken = await responseJson<{ token: string }>(await githubFetch(
-    `https://api.github.com/app/installations/${installationId}/access_tokens`,
-    jwt,
-    'POST',
-    { permissions: { contents: 'read' } }
-  ));
-  const repositoryPage = await responseJson<{
-    total_count: number;
-    repositories: Array<{ id: number; name: string; full_name: string; owner: { login: string } }>;
-  }>(await githubFetch(
-    'https://api.github.com/installation/repositories?per_page=100',
-    readToken.token
-  ));
-  if (repositoryPage.total_count !== 1 || repositoryPage.repositories.length !== 1) {
-    throw new Error('GitHub App installation must be limited to one repository');
+    phase = 'installation_token_request';
+    const tokenResponse = await githubFetch(
+      `https://api.github.com/app/installations/${installationId}/access_tokens`,
+      jwt,
+      'POST',
+      { permissions: { contents: 'read' } }
+    );
+    phase = 'installation_token_response';
+    const readToken = await responseJson<{ token: string }>(tokenResponse);
+    phase = 'repository_list_request';
+    const repositoryResponse = await githubFetch(
+      'https://api.github.com/installation/repositories?per_page=100',
+      readToken.token
+    );
+    phase = 'repository_list_response';
+    const repositoryPage = await responseJson<{
+      total_count: number;
+      repositories: Array<{ id: number; name: string; full_name: string; owner: { login: string } }>;
+    }>(repositoryResponse);
+    if (repositoryPage.total_count !== 1 || repositoryPage.repositories.length !== 1) {
+      phase = 'repository_scope';
+      throw new Error('GitHub App installation must be limited to one repository');
+    }
+    const repository = repositoryPage.repositories[0]!;
+    if (
+      !Number.isSafeInteger(repository.id) ||
+      !/^[A-Za-z0-9_.-]{1,100}$/.test(repository.name) ||
+      !/^[A-Za-z0-9_-]{1,100}$/.test(repository.owner.login)
+    ) {
+      phase = 'repository_validation';
+      throw new Error('GitHub returned an invalid repository');
+    }
+    return {
+      installation_id: installationId,
+      repository_owner: repository.owner.login,
+      repository_name: repository.name,
+      repository_id: repository.id,
+    };
+  } catch (error) {
+    if (error instanceof GitHubInstallationVerificationError) throw error;
+    const details = safeTransportDetails(error);
+    throw new GitHubInstallationVerificationError(
+      phase,
+      error instanceof GitHubAppApiError || error instanceof GitHubRedirectError ? error.status : undefined,
+      error instanceof Error && error.message === 'GitHub App is not configured'
+        ? error.message
+        : undefined,
+      details.causeName,
+      details.causeCode,
+      details.reason,
+      error instanceof GitHubRedirectError ? error.origin : undefined,
+      error instanceof GitHubRedirectError ? error.pathname : undefined,
+      error instanceof GitHubAppApiError ? error.category : undefined
+    );
   }
-  const repository = repositoryPage.repositories[0]!;
-  if (
-    !Number.isSafeInteger(repository.id) ||
-    !/^[A-Za-z0-9_.-]{1,100}$/.test(repository.name) ||
-    !/^[A-Za-z0-9_-]{1,100}$/.test(repository.owner.login)
-  ) throw new Error('GitHub returned an invalid repository');
-  return {
-    installation_id: installationId,
-    repository_owner: repository.owner.login,
-    repository_name: repository.name,
-    repository_id: repository.id,
-  };
 }
 
 async function scopedContentsToken(

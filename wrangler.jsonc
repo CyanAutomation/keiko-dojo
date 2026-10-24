@@ -55,11 +55,11 @@
       "triggers": { "crons": ["0 3 * * *"] },
       "vars": {
         "ENVIRONMENT": "staging",
-        "AUTH_JWKS_URL": "https://matmetrics-auth-production.scheimann.workers.dev/api/auth/jwks",
+        "AUTH_JWKS_URL": "https://matmetrics-teal.vercel.app/api/auth/jwks",
         "AUTH_ISSUER": "https://matmetrics-teal.vercel.app",
         "AUTH_AUDIENCE": "keiko-dojo-api",
-        "GITHUB_APP_ID": "replace-with-github-app-id",
-        "GITHUB_APP_INSTALL_URL": "https://github.com/apps/replace-keiko-dojo/installations/new",
+        "GITHUB_APP_ID": "5456778",
+        "GITHUB_APP_INSTALL_URL": "https://github.com/apps/keiko-dojo-staging/installations/new",
         "MATMETRICS_FRONTEND_URL": "https://matmetrics-teal.vercel.app"
       },
       "d1_databases": [
