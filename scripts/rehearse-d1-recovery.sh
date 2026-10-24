@@ -51,7 +51,8 @@ if npx wrangler d1 execute keiko-dojo-local \
   --file "$export_path" >"$restore_log" 2>&1; then
   echo "Isolated local restore completed successfully"
 else
-  echo "The isolated local restore failed; rerun the Wrangler restore command for diagnostics" >&2
+  cat "$restore_log" >&2
+  echo "The isolated local restore failed; see the log above for diagnostics" >&2
   exit 1
 fi
 
