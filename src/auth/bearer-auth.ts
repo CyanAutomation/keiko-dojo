@@ -1,5 +1,6 @@
 import {
   createRemoteJWKSet,
+  customFetch,
   errors,
   jwtVerify,
   type JWTPayload,
@@ -25,6 +26,13 @@ export class AuthFailure extends Error {
 let cachedJwksUrl = '';
 let cachedJwks: ReturnType<typeof createRemoteJWKSet> | null = null;
 
+class JwksFetchFailure extends Error {
+  constructor() {
+    super('Remote JWKS fetch failed');
+    this.name = 'JwksFetchFailure';
+  }
+}
+
 function readRequiredConfig(value: string | undefined): string {
   const normalized = value?.trim();
   if (!normalized) {
@@ -49,7 +57,16 @@ function remoteJwks(urlText: string) {
     throw new AuthFailure('unavailable', 'Authentication is unavailable');
   }
 
-  const options: RemoteJWKSetOptions = { timeoutDuration: 5000 };
+  const options: RemoteJWKSetOptions = {
+    timeoutDuration: 5000,
+    [customFetch]: async (url, requestOptions) => {
+      try {
+        return await fetch(url, requestOptions);
+      } catch {
+        throw new JwksFetchFailure();
+      }
+    },
+  };
   cachedJwks = createRemoteJWKSet(url, options);
   cachedJwksUrl = urlText;
   return cachedJwks;
@@ -59,7 +76,8 @@ function isJwksUnavailable(error: unknown): boolean {
   return (
     error instanceof errors.JWKSTimeout ||
     error instanceof errors.JWKSInvalid ||
-    error instanceof TypeError
+    (error instanceof errors.JOSEError && error.code === 'ERR_JOSE_GENERIC') ||
+    error instanceof JwksFetchFailure
   );
 }
 
@@ -119,6 +137,7 @@ export async function authenticateRequest(
       issuer,
       audience,
       maxTokenAge: '5m',
+      clockTolerance: 5,
     });
     payload = verified.payload;
   } catch (error) {

@@ -1,6 +1,6 @@
 # Keiko Dojo implementation and rollout plan
 
-**Status:** Code foundation and isolated Cloudflare staging/production resources are provisioned. The staging Worker is deployed and health-checked; end-to-end account validation and the single-account cutover remain gated.
+**Status (verified 2026-10-24):** The isolated Cloudflare staging/production resources are provisioned. Staging health/readiness return HTTP 200 and all five D1 migrations are applied. Staging contains 37 imported sessions; the complete list and analytics match the MatMetrics source (zero missing IDs or payload mismatches). A queued D1 snapshot completed and a previewed, explicitly confirmed restore of all 37 sessions succeeded with analytics unchanged. REST/MCP analytics parity and read/write scope denials were verified. The staging GitHub App is installed only on `CyanAutomation/matmetrics` and its private key is configured, but Keiko's installation callback receives HTTP 403 from GitHub, so GitHub repository sync/recovery remains unverified. The configured backup queue and DLQ are present; successful queue delivery and terminal retry handling are verified, but a live poison-message DLQ handoff was not exercised. Production D1 has no Keiko application tables, and no production Worker is deployed.
 
 ## Current implementation
 
@@ -64,34 +64,42 @@ switched automatically by the importer.
 
 ## Remaining rollout work
 
-1. **Provision environments.** Use the local D1 emulator. The separate staging
-   and production D1 databases, backup queues, and dead-letter queues are
-   provisioned. The D1 IDs and verified existing Better Auth JWKS/issuer are
-   configured in `wrangler.jsonc`. Production D1 remains empty and unmigrated.
-   Do not use Vercel Preview deployments for this rollout. No separate
-   MatMetrics staging origin is needed for the one-account pilot: keep the
-   current production origin and route only that user's session API calls to
-   staging through MatMetrics' server-side cutover allowlist. After the staging
-   import is reviewed, set the Vercel production variables to the staging Keiko
-   URL, the exact current frontend origin, and only the existing account's ID;
-   redeploy MatMetrics Production so the values take effect.
-   The current Vercel project has no custom-environment capacity, which does
-   not block this approach. Set `GITHUB_APP_PRIVATE_KEY` with Wrangler
-   secrets. The app must have Contents read/write permission and a configured
-   callback at `/v1/backups/github-installation/callback`.
-2. **Validate staging.** Apply migrations, deploy the staging Worker, and
-   validate the Auth Worker/JWKS path with the sole existing MatMetrics
-   account. Use synthetic identities in Keiko's automated integration tests
-   for cross-tenant isolation; do not require or create a second live account.
-   Also verify import and rollback, analytics parity, GitHub backup recovery,
-   queue retries/DLQ, restore safeguards, and MCP/REST scope parity. Do not add
-   the production user ID to Keiko production before this passes.
-3. **Pilot the existing account in staging.** From the MatMetrics repository,
-   export the account's current data, run the importer dry-run against staging,
-   review mismatches and parse failures, apply only reviewed missing records,
-   and compare Keiko's complete session list and analytics with the Markdown
-   source. Exercise rollback in staging. Keep the Markdown copy and avoid dual
-   writes. The Vercel Production cutover allowlist may include this ID only
+1. **Finalize staging pilot configuration.** The separate staging and
+   production D1 databases, backup queues, and dead-letter queues are
+   provisioned. The staging D1 IDs and verified existing Better Auth
+   JWKS/issuer are configured in `wrangler.jsonc`; migrations `0001` through
+   `0005` are applied and staging contains the imported 37-session account.
+   The three staging rate-limit namespace IDs are deployed and unique across the current account
+   Worker scripts. The `Keiko Dojo Staging` GitHub App is registered for the
+   CyanAutomation account with Contents read/write, required Metadata
+   read-only, no webhook, and the staging setup callback. It is installed only
+   on `CyanAutomation/matmetrics`; `GITHUB_APP_PRIVATE_KEY` is set as a staging
+   Wrangler secret. Its App ID and install URL are set in `wrangler.jsonc`.
+   The callback currently receives HTTP 403 from GitHub during installation
+   lookup; investigate and resolve the error, then complete the stateful
+   repository connection. Configure production App values and secret only at the
+   production deployment gate. Do not use Vercel
+   Preview deployments for this rollout. No separate MatMetrics staging origin
+   is needed: keep the current production origin. The required Vercel
+   Production cutover variables are absent; add them only after the staging
+   import is reviewed, pointing `KEIKO_API_BASE_URL` at staging and allowing
+   only the existing account. Redeploy MatMetrics Production so those values
+   take effect.
+2. **Finish staging validation.** The staging Worker is deployed and its
+   `/healthz` and `/readyz` endpoints return HTTP 200. The sole existing
+   MatMetrics account has been imported and its sessions and analytics match
+   the source. A D1 snapshot, restore preview, confirmed restore, successful
+   queue delivery, terminal retry handling, restore confirmation safeguard,
+   and MCP/REST scope parity have been checked. Resolve the GitHub installation
+   callback's HTTP 403 and verify repository backup/recovery; decide whether to
+   run a controlled live DLQ handoff check. Synthetic identities in automated
+   integration tests cover cross-tenant isolation; do not require or create a
+   second live account. Do not add the production user ID to Keiko production
+   before all staging gates pass.
+3. **Pilot the existing account in staging.** The existing account's 37
+   sessions were imported from MatMetrics, and the complete session list and
+   analytics were compared with zero missing IDs or payload mismatches. Keep
+   the Markdown copy and avoid dual writes. The Vercel Production cutover allowlist may include this ID only
    while its `KEIKO_API_BASE_URL` points to staging; do not route the user to
    Keiko production until staging and recovery checks pass.
 4. **Production cutover.** Only after staging and recovery checks pass, apply
