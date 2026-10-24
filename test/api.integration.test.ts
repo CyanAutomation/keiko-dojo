@@ -92,6 +92,9 @@ beforeAll(async () => {
     if (url.href === `${issuer}/jwks-failure`) {
       return new Response('not found', { status: 404 });
     }
+    if (url.href === `${issuer}/jwks-network-failure`) {
+      throw new TypeError('fetch failed');
+    }
     throw new Error(`Unexpected fetch: ${url.href}`);
   });
 });
@@ -733,6 +736,47 @@ describe('Keiko session API', () => {
       error: {
         code: 'authentication_unavailable',
         message: 'Authentication service unavailable',
+      },
+    });
+  });
+
+  it('reports JWKS transport failures as authentication unavailable', async () => {
+    const unavailableEnv = Object.assign(Object.create(testEnv), {
+      AUTH_JWKS_URL: `${issuer}/jwks-network-failure`,
+    }) as Env;
+    const response = await call(
+      '/v1/sessions?limit=1',
+      'user-a',
+      {},
+      { scope: 'sessions:read' },
+      unavailableEnv
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: {
+        code: 'authentication_unavailable',
+        message: 'Authentication service unavailable',
+      },
+    });
+  });
+
+  it.each([
+    ['malformed compact token', 'not-a-jwt'],
+    ['unsupported algorithm', 'eyJhbGciOiJIUzI1NiJ9.e30.AA'],
+  ])('reports %s as an invalid access token', async (_description, token) => {
+    const response = await worker.fetch(
+      new Request('https://keiko.example.test/v1/sessions?limit=1', {
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      testEnv
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({
+      error: {
+        code: 'authentication_required',
+        message: 'Invalid access token',
       },
     });
   });
