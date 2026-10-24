@@ -355,7 +355,9 @@ export async function processBackupMessage(
   const job = await env.DB.prepare(
     'SELECT status FROM backup_jobs WHERE id = ? AND user_id = ?'
   ).bind(jobId, userId).first<{ status: string }>();
-  if (!job || job.status === 'completed' || job.status === 'failed') {
+  // Keep retrying failed jobs until the Queue consumer exhausts max_retries
+  // and forwards the poison message to its dead-letter queue.
+  if (!job || job.status === 'completed') {
     message.ack();
     return;
   }
