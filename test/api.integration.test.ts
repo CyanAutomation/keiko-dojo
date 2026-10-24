@@ -520,6 +520,39 @@ describe('Keiko session API', () => {
     ).bind(jobId).first()).toMatchObject({ status: 'failed', error_code: 'backup_failed' });
   });
 
+  it('keeps retrying a failed job on its final delivery so Cloudflare can transfer it to the DLQ', async () => {
+    const userId = `terminal-redelivery-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    const snapshotId = `snapshot-${crypto.randomUUID()}`;
+    const payload = '[]';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at, error_code)
+       VALUES (?, ?, 'failed', ?, 'backup_failed')`
+    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z').run();
+    await env.DB.prepare(
+      `INSERT INTO backup_snapshots
+       (id, user_id, job_id, created_at, session_count, checksum, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
+
+    const retry = vi.fn();
+    const ack = vi.fn();
+    await processBackupMessage({
+      body: { jobId, userId },
+      attempts: 6,
+      retry,
+      ack,
+    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
+
+    expect(retry).toHaveBeenCalledOnce();
+    expect(ack).not.toHaveBeenCalled();
+    expect(await env.DB.prepare(
+      'SELECT status, error_code FROM backup_jobs WHERE id = ?'
+    ).bind(jobId).first()).toMatchObject({ status: 'failed', error_code: 'backup_failed' });
+  });
+
   it('creates and completes a valid snapshot for a queued backup', async () => {
     const userId = `valid-backup-${crypto.randomUUID()}`;
     const jobId = `job-${crypto.randomUUID()}`;
@@ -584,6 +617,7 @@ describe('Keiko session API', () => {
     ).bind(userId, 99001, 'owner', 'repo', 99001, new Date().toISOString()).run();
     const send = vi.fn(async (_message: unknown) => {});
     const scheduledEnv = Object.assign(Object.create(env), {
+      SCHEDULED_BACKUPS_ENABLED: 'true',
       BACKUP_QUEUE: { send },
     }) as Env;
     const scheduledTime = Date.parse('2026-10-17T03:00:00.000Z');
@@ -598,6 +632,30 @@ describe('Keiko session API', () => {
     expect(jobs.results).toHaveLength(1);
   });
 
+  it('does not dispatch scheduled backups when the environment kill switch is disabled', async () => {
+    const userId = `scheduled-disabled-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)`
+    ).bind(userId, 99004, 'owner', 'repo', 99004, new Date().toISOString()).run();
+    const send = vi.fn(async (_message: unknown) => {});
+    const scheduledEnv = Object.assign(Object.create(env), {
+      SCHEDULED_BACKUPS_ENABLED: 'false',
+      BACKUP_QUEUE: { send },
+    }) as Env;
+
+    await worker.scheduled!(
+      { cron: '0 3 * * *', scheduledTime: Date.now() } as ScheduledController,
+      scheduledEnv
+    );
+
+    expect(send).not.toHaveBeenCalled();
+    expect(await env.DB.prepare(
+      'SELECT id FROM backup_jobs WHERE user_id = ?'
+    ).bind(userId).all()).toMatchObject({ results: [] });
+  });
+
   it('retries scheduled queue dispatch after a failed send without creating a second job', async () => {
     const userId = `scheduled-retry-${crypto.randomUUID()}`;
     await env.DB.prepare('DELETE FROM github_installations').run();
@@ -610,6 +668,7 @@ describe('Keiko session API', () => {
       .mockRejectedValueOnce(new Error('queue unavailable'))
       .mockResolvedValueOnce(undefined);
     const scheduledEnv = Object.assign(Object.create(env), {
+      SCHEDULED_BACKUPS_ENABLED: 'true',
       BACKUP_QUEUE: { send },
     }) as Env;
     const scheduledTime = Date.parse('2026-10-17T04:00:00.000Z');
@@ -651,6 +710,7 @@ describe('Keiko session API', () => {
     ).run();
     const send = vi.fn(async (_message: unknown) => {});
     const scheduledEnv = Object.assign(Object.create(env), {
+      SCHEDULED_BACKUPS_ENABLED: 'true',
       BACKUP_QUEUE: { send },
     }) as Env;
 

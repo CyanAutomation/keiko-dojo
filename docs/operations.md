@@ -8,12 +8,14 @@ As of 2026-10-24, all five migrations are applied to staging and
 zero missing IDs or payload mismatches. A queued D1 snapshot and confirmed
 restore both completed, preserving the same analytics. REST/MCP analytics
 parity and scope denials were verified. The deployed queue and DLQ exist, and
-successful delivery plus terminal retry handling were checked; a live poison
-message handoff to the DLQ was not exercised. The GitHub App installation
-callback currently gets HTTP 403 from GitHub, so repository backup/recovery is
-still unverified. Production D1 has no Keiko application tables, and no
-production Worker deployment or account cutover exists. The staging Worker is
-deployed at [`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-staging.scheimann.workers.dev).
+successful delivery plus terminal retry handling were checked. A controlled
+failed job reached the configured DLQ after the retry limit; its message and
+synthetic D1 rows were removed, leaving staging clean. The GitHub App
+installation callback currently gets HTTP 403 from GitHub, so repository
+backup/recovery is still unverified. Production D1 has no Keiko application
+tables, and no production Worker deployment or account cutover exists. The
+staging Worker is deployed at
+[`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-staging.scheimann.workers.dev).
 
 ## Environment setup
 
@@ -23,11 +25,11 @@ deployed at [`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-stag
   up to five retries and sends messages that exceed the retry limit to the
   configured dead-letter queue. Inspect and redrive dead-letter messages only
   after resolving the failure cause.
-- Staging uses `https://matmetrics-teal.vercel.app/api/auth/jwks`, the public
-  MatMetrics auth proxy backed by the existing Auth Worker, with issuer
-  `https://matmetrics-teal.vercel.app`. Set `AUTH_JWKS_URL` to that proxy;
+- Staging and production both use `https://matmetrics-teal.vercel.app/api/auth/jwks`,
+  the public MatMetrics auth proxy backed by the existing Auth Worker, with
+  issuer `https://matmetrics-teal.vercel.app`. Use that proxy for `AUTH_JWKS_URL`;
   a worker-to-worker request to the Auth Worker's `workers.dev` URL returned
-  HTTP 404 from Keiko staging. Keep `AUTH_AUDIENCE` exactly
+  HTTP 404 from Keiko staging, while the public proxy returned HTTP 200. Keep `AUTH_AUDIENCE` exactly
   `keiko-dojo-api`. No separate MatMetrics origin or Vercel Preview deployment
   is needed for the single-account pilot: the current production origin is
   already the exact origin configured for Keiko and the Auth Worker.
@@ -50,6 +52,11 @@ deployed at [`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-stag
   simulator skip rate-limit bindings. Deployed counters are per Cloudflare
   location and eventually consistent, so treat them as abuse controls rather
   than strict global quotas; monitor 429 responses in Workers Observability.
+- `SCHEDULED_BACKUPS_ENABLED` is a fail-closed cron switch: only the literal
+  value `true` starts scheduled work. Local and staging are configured `true`;
+  production is configured `false` until production cutover. When production
+  begins writing backups to the selected repository, disable staging first so
+  the two Workers cannot write the same session paths on overlapping schedules.
 - The staging GitHub App `Keiko Dojo Staging` is registered for the
   CyanAutomation account with repository Contents read/write (and GitHub's
   required Metadata read-only permission), no webhook, and Setup URL
@@ -110,19 +117,46 @@ deployed at [`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-stag
 - Before bulk imports and migrations, export D1 into protected storage and
   rehearse restore into an isolated database. The API's merge restore is not a
   replacement for an operator-controlled full database recovery.
+- Run `npm run backup:rehearse -- staging /secure/path/keiko-staging.sql --confirm-export`
+  to export a complete remote D1 database, restore the SQL into a temporary
+  isolated local D1 database, and report row counts for all application tables.
+  Wrangler warns that the D1 database may be unavailable during export, so run
+  it in a maintenance window. The explicit `--confirm-export` argument
+  prevents an unattended run. The script leaves the export at the requested
+  path with mode `0600`; choose an encrypted, access-controlled storage
+  location with a retention policy. The temporary rehearsal database is
+  removed automatically. Use the `production` selector after production
+  migrations exist. Do not treat a `/tmp` export as a retained backup.
 - Keep the original Markdown repository through each account's rollback
-  window. Export current Keiko D1 data before switching an account back.
+  window. Keiko writes each session as a Markdown file in the same
+  `data/YYYY/MM/` layout, with a stable session ID in the filename and
+  frontmatter compatible with MatMetrics' Markdown reader. Before rollback,
+  pause writes and confirm Keiko's latest backup job completed. Remove the
+  user's ID from `KEIKO_SESSION_CUTOVER_USER_IDS` and redeploy MatMetrics so
+  its list API reads the legacy Markdown repository again. Run the MatMetrics
+  import script in dry-run mode while `KEIKO_API_BASE_URL` still points at
+  Keiko; it compares the Markdown source with Keiko and must show zero parse
+  failures, duplicate IDs, importable sessions, payload mismatches, and
+  `keikoOnly`. Do not pass `--apply` in this rollback check. Keep the user's
+  Auth Worker token issuance allowlist active through the comparison so the
+  importer can read Keiko. The `keikoOnly` count detects sessions present in
+  Keiko but absent from Markdown. Also compare the complete ID lists and
+  analytics from the Markdown-backed API and Keiko. If any files are
+  missing or payloads differ, keep writes paused and reconcile from a protected
+  D1 export before switching storage. The existing importer is a
+  comparison/import into Keiko, not a reverse importer, so do not use it to
+  restore Keiko data into D1.
 
 ## Cutover procedure
 
 1. Confirm the staging deployment and migration state. The sole existing
    MatMetrics account's session and analytics parity, D1 snapshot/restore,
    restore confirmation protection, successful queue delivery, terminal retry
-   handling, and MCP/REST scope parity have been verified. Resolve the GitHub
-   callback's HTTP 403 and validate repository backup/recovery. A live DLQ
-   handoff remains untested; run a controlled check if required by the rollout
-   gate. Keiko's automated integration tests use synthetic identities to
-   verify tenant isolation; a second live account is not required.
+   handling, live DLQ handoff and cleanup, and MCP/REST scope parity have been
+   verified. Resolve the GitHub callback's HTTP 403 and validate repository
+   backup/recovery before proceeding. Keiko's automated integration tests use
+   synthetic identities to verify tenant isolation; a second live account is
+   not required.
 2. From the MatMetrics repository root, export the current account data, run
    `npm run test:keiko:import`, then run
    `node --import tsx scripts/import-keiko-sessions.ts` in dry-run mode with
@@ -141,7 +175,11 @@ deployed at [`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-stag
    dry-run/review/apply against production, compare session and analytics
    parity, then switch the Vercel Production `KEIKO_API_BASE_URL` to the
    production Worker for the already-allowlisted ID. Keep the allowlist limited
-   to that one verified Better Auth user ID.
+   to that one verified Better Auth user ID. Production scheduled backups stay
+   disabled during the initial cutover. After a successful production backup
+   is verified, deploy staging with `SCHEDULED_BACKUPS_ENABLED=false` and
+   production with `SCHEDULED_BACKUPS_ENABLED=true` so only one Worker writes
+   to the selected Markdown repository.
 5. Do not dual-write. If rolling back, export current Keiko D1 first, reconcile
    new writes against Markdown, then remove the account from the allowlist.
    Keep the rollout at this account until recovery validation and sanitized
