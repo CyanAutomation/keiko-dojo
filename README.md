@@ -32,9 +32,13 @@ server-to-server for a Keiko-only token for allowlisted accounts.
 ## Deployments
 
 Wrangler environments `staging` and `production` have separate Worker names
-and D1 bindings. Replace their placeholder database IDs and identity-provider
-URLs with the resources for each environment before deploying. Apply migrations
-to the corresponding remote database before routing clients to that Worker:
+and D1 bindings. Their D1 IDs and Better Auth issuer/JWKS settings are
+configured. The staging GitHub App is installed only on MatMetrics with
+Contents read/write, and its private key is configured as a Worker secret.
+The stateful Keiko repository connection and recovery validation remain
+pending. Production GitHub App settings, migrations, and deployment remain
+gated on staging recovery validation. Apply migrations to the corresponding
+remote database before routing clients to that Worker:
 
 ```bash
 npm run migrate:staging

@@ -3,7 +3,11 @@ import { generateKeyPairSync } from 'node:crypto';
 import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
-import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../src/integrations/github-app';
+import {
+  GitHubInstallationVerificationError,
+  verifySelectedRepositoryInstallation,
+  writeGitHubBackup,
+} from '../src/integrations/github-app';
 import type { SnapshotSession } from '../src/domain/backup-snapshot';
 
 const originalFetch = globalThis.fetch;
@@ -247,6 +251,110 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('accepts GitHub-generated PKCS#1 RSA private keys', async () => {
+    const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const previousPrivateKey = appEnv.GITHUB_APP_PRIVATE_KEY;
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      calls.push(url);
+      if (url === 'https://api.github.com/app/installations/731') {
+        return Response.json({ id: 731, repository_selection: 'selected' });
+      }
+      if (url === 'https://api.github.com/app/installations/731/access_tokens') {
+        return Response.json({ token: 'read-only-install-token' });
+      }
+      if (url === 'https://api.github.com/installation/repositories?per_page=100') {
+        return Response.json({
+          total_count: 1,
+          repositories: [{ id: 88, name: 'judo-notes', full_name: 'maki/judo-notes', owner: { login: 'maki' } }],
+        });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+
+    Reflect.set(appEnv, 'GITHUB_APP_PRIVATE_KEY', privateKey);
+    try {
+      await expect(verifySelectedRepositoryInstallation(appEnv, 731)).resolves.toMatchObject({
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      });
+      expect(calls).toHaveLength(3);
+    } finally {
+      Reflect.set(appEnv, 'GITHUB_APP_PRIVATE_KEY', previousPrivateKey);
+    }
+  });
+
+  it('keeps a safe phase and HTTP status for GitHub installation failures', async () => {
+    vi.stubGlobal('fetch', async () => Response.json({ message: 'sensitive provider response' }, { status: 401 }));
+
+    await expect(verifySelectedRepositoryInstallation(appEnv, 731)).rejects.toMatchObject({
+      phase: 'installation_lookup_response',
+      status: 401,
+      apiErrorCategory: 'other',
+    } satisfies Partial<GitHubInstallationVerificationError>);
+  });
+
+  it('classifies a GitHub integration access denial without retaining its body', async () => {
+    vi.stubGlobal('fetch', async () => Response.json({
+      message: 'Resource not accessible by integration. Check the installation permissions.',
+      errors: [{ message: 'private provider detail' }],
+    }, { status: 403 }));
+
+    const failure = await verifySelectedRepositoryInstallation(appEnv, 731).catch((error: unknown) => error);
+    if (!(failure instanceof GitHubInstallationVerificationError)) {
+      throw new Error('Expected a safe GitHub installation verification failure');
+    }
+    expect(failure).toMatchObject({
+      phase: 'installation_lookup_response',
+      status: 403,
+      apiErrorCategory: 'integration_access_denied',
+    });
+    expect(failure.message).toBe('GitHub installation verification failed');
+  });
+
+  it('classifies GitHub transport failures without retaining their message', async () => {
+    vi.stubGlobal('fetch', async () => {
+      const cause = Object.assign(new Error('private network message'), { code: 'ECONNRESET' });
+      throw new TypeError('private transport detail', { cause });
+    });
+
+    const failure = await verifySelectedRepositoryInstallation(appEnv, 731).catch((error: unknown) => error);
+    if (!(failure instanceof GitHubInstallationVerificationError)) {
+      throw new Error('Expected a safe GitHub installation verification failure');
+    }
+    expect(failure).toMatchObject({
+      phase: 'installation_lookup_request',
+      causeName: 'TypeError',
+      causeCode: 'ECONNRESET',
+      reason: 'other',
+    });
+    expect(failure.message).toBe('GitHub installation verification failed');
+  });
+
+  it('records a rejected redirect without storing its query string', async () => {
+    vi.stubGlobal('fetch', async () => new Response(null, {
+      status: 302,
+      headers: { location: 'https://api.github.com/login?private=not-logged' },
+    }));
+
+    const failure = await verifySelectedRepositoryInstallation(appEnv, 731).catch((error: unknown) => error);
+    if (!(failure instanceof GitHubInstallationVerificationError)) {
+      throw new Error('Expected a safe GitHub installation verification failure');
+    }
+    expect(failure).toMatchObject({
+      phase: 'installation_lookup_request',
+      status: 302,
+      reason: 'redirect_rejected',
+      redirectOrigin: 'https://api.github.com',
+      redirectPath: '/login',
+    });
+    expect(failure.message).toBe('GitHub installation verification failed');
+  });
+
   it('requires selected access to exactly one repository and scopes write tokens to it', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -306,7 +414,7 @@ describe('GitHub App selected-repository backup adapter', () => {
     await writeGitHubBackup(appEnv, { user_id: 'user-1', ...installation }, 'snapshot-1', '2026-10-17T00:00:00.000Z', sessions);
 
     const readRequest = calls.find((call) => call.url.endsWith('/access_tokens'))!;
-    expect(readRequest.init?.redirect).toBe('error');
+    expect(readRequest.init?.redirect).toBe('manual');
     const uploads = calls.filter((call) => call.init?.method === 'PUT');
     expect(uploads).toHaveLength(2);
     expect(uploads.map((upload) => upload.url)).toEqual([
