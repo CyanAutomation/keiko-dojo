@@ -1,6 +1,6 @@
 # Keiko Dojo implementation and rollout plan
 
-**Status (verified 2026-10-24):** The isolated Cloudflare staging/production resources are provisioned. Staging health/readiness return HTTP 200 and all five D1 migrations are applied. Staging contains 37 imported sessions; the complete list and analytics match the MatMetrics source (zero missing IDs or payload mismatches). A queued D1 snapshot completed and a previewed, explicitly confirmed restore of all 37 sessions succeeded with analytics unchanged. REST/MCP analytics parity and read/write scope denials were verified. The staging GitHub App is installed only on `CyanAutomation/matmetrics` and its private key is configured, but Keiko's installation callback receives HTTP 403 from GitHub, so GitHub repository sync/recovery remains unverified. The configured backup queue and DLQ are present; successful queue delivery and terminal retry handling are verified, but a live poison-message DLQ handoff was not exercised. Production D1 has no Keiko application tables, and no production Worker is deployed.
+**Status (verified 2026-10-24):** The isolated Cloudflare staging/production resources are provisioned. Staging health/readiness return HTTP 200 and all five D1 migrations are applied. Staging contains 37 imported sessions; the complete list and analytics match the MatMetrics source (zero missing IDs or payload mismatches). A queued D1 snapshot completed and a previewed, explicitly confirmed restore of all 37 sessions succeeded with analytics unchanged. A full remote D1 SQL export restored into an isolated local database; all six application tables were queryable and the restored session count was 37. The temporary export was removed after rehearsal, so no durable operator-controlled export is retained. REST/MCP analytics parity and read/write scope denials were verified. The staging GitHub App is installed only on `CyanAutomation/matmetrics` and its private key is configured, but Keiko's installation callback receives HTTP 403 from GitHub, so GitHub repository sync/recovery remains unverified. The configured backup queue and DLQ are present; successful queue delivery and terminal retry handling are verified. A controlled failed job reached the DLQ after the configured retry limit; its message and synthetic D1 rows were removed, leaving staging clean. Production D1 has no Keiko application tables, and no production Worker is deployed.
 
 ## Current implementation
 
@@ -39,10 +39,10 @@ installation access tokens are short-lived, repository-scoped, and never
 stored. GitHub sync failures do not block normal D1 session writes.
 
 The MatMetrics importer is dry-run by default. It reports parse failures,
-duplicate IDs, already-present records, payload mismatches, and importable
-records. It imports only missing, unique records when invoked with `--apply`.
-The server-side user allowlist is a separate setting, so an account is not
-switched automatically by the importer.
+duplicate IDs, already-present records, payload mismatches, Keiko-only records,
+and importable records. It imports only missing, unique records when invoked
+with `--apply`. The server-side user allowlist is a separate setting, so an
+account is not switched automatically by the importer.
 
 ## Implemented work
 
@@ -52,6 +52,19 @@ switched automatically by the importer.
   Cloudflare Queue retries and dead-letter queue configuration, scheduled
   backups, restore safeguards, GitHub App selected-repository adapter, and
   per-session Markdown exports compatible with KeikoTracker.
+- Scheduled backups now require the explicit `SCHEDULED_BACKUPS_ENABLED=true`
+  flag. Local/staging are enabled in Wrangler configuration; production is
+  disabled until the account cutover is ready. Staging must be disabled before
+  production begins writing to the same GitHub repository.
+- Production JWKS configuration now matches the public MatMetrics JWKS proxy
+  that was verified from the deployed staging Worker.
+- Added `npm run backup:rehearse` to export remote D1 to a mode-0600 SQL file,
+  restore it into an isolated local database, and report table counts without
+  printing session data or Wrangler's temporary signed export URL. It requires
+  an explicit `--confirm-export` flag because Wrangler warns that D1 may be
+  unavailable while the export is running.
+- Documented the Markdown-backed rollback check and the need for an
+  operator-controlled encrypted D1 export outside the D1 database.
 - Read-only MCP tools `list_sessions`, `get_session`, and
   `get_training_summary`, all requiring `sessions:read` and using the REST
   application service.
@@ -90,16 +103,17 @@ switched automatically by the importer.
    MatMetrics account has been imported and its sessions and analytics match
    the source. A D1 snapshot, restore preview, confirmed restore, successful
    queue delivery, terminal retry handling, restore confirmation safeguard,
-   and MCP/REST scope parity have been checked. Resolve the GitHub installation
-   callback's HTTP 403 and verify repository backup/recovery; decide whether to
-   run a controlled live DLQ handoff check. Synthetic identities in automated
+   live DLQ handoff and cleanup, and MCP/REST scope parity have been checked.
+   Resolve the GitHub installation callback's HTTP 403 and verify repository
+   backup/recovery. Synthetic identities in automated
    integration tests cover cross-tenant isolation; do not require or create a
    second live account. Do not add the production user ID to Keiko production
    before all staging gates pass.
 3. **Pilot the existing account in staging.** The existing account's 37
    sessions were imported from MatMetrics, and the complete session list and
    analytics were compared with zero missing IDs or payload mismatches. Keep
-   the Markdown copy and avoid dual writes. The Vercel Production cutover allowlist may include this ID only
+   the Markdown copy and avoid dual writes. The Vercel Production cutover
+   allowlist may include this ID only
    while its `KEIKO_API_BASE_URL` points to staging; do not route the user to
    Keiko production until staging and recovery checks pass.
 4. **Production cutover.** Only after staging and recovery checks pass, apply
@@ -108,8 +122,12 @@ switched automatically by the importer.
    apply only reviewed missing records, compare full session and analytics
    parity, then switch the Vercel Production `KEIKO_API_BASE_URL` to the
    production Worker for that one already-allowlisted Better Auth user ID.
-   Monitor sanitized logs and metrics and keep the rollout at this account
-   until more accounts are onboarded.
+   Keep scheduled backups disabled in production during the initial cutover.
+   After verifying one production backup, disable the staging cron before
+   enabling the production cron to avoid two Workers writing the same GitHub
+   session paths. Store a protected D1 export outside Cloudflare before
+   migrations and imports. Monitor sanitized logs and metrics and keep the
+   rollout at this account until more accounts are onboarded.
 5. **Migrate remaining shared services.** After the single-account production
    session cutover is stable, move applicable GitHub sync, health, and Log
    Doctor operations behind Keiko's authenticated API and background jobs.

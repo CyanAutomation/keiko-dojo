@@ -149,6 +149,8 @@ const worker = {
     }
   },
   async scheduled(controller: ScheduledController, env: Env) {
+    if (env.SCHEDULED_BACKUPS_ENABLED !== 'true') return;
+
     const installations = await env.DB.prepare(
       'SELECT user_id FROM github_installations WHERE revoked_at IS NULL'
     ).all<{ user_id: string }>();
