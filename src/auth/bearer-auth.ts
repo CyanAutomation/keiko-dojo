@@ -59,6 +59,7 @@ function isJwksUnavailable(error: unknown): boolean {
   return (
     error instanceof errors.JWKSTimeout ||
     error instanceof errors.JWKSInvalid ||
+    (error instanceof errors.JOSEError && error.code === 'ERR_JOSE_GENERIC') ||
     error instanceof TypeError
   );
 }
@@ -119,6 +120,7 @@ export async function authenticateRequest(
       issuer,
       audience,
       maxTokenAge: '5m',
+      clockTolerance: 5,
     });
     payload = verified.payload;
   } catch (error) {

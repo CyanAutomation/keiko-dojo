@@ -7,7 +7,11 @@ import {
   type SnapshotSession,
 } from '../domain/backup-snapshot';
 import { configuredGitHubInstallUrl, isGitHubAppConfigured } from '../integrations/github-app-config';
-import { verifySelectedRepositoryInstallation, writeGitHubBackup } from '../integrations/github-app';
+import {
+  GitHubInstallationVerificationError,
+  verifySelectedRepositoryInstallation,
+  writeGitHubBackup,
+} from '../integrations/github-app';
 import { authFailureResponse } from './auth-errors';
 import { readJsonBodyLimited } from './request-body';
 import { jsonError, jsonResponse } from './responses';
@@ -114,7 +118,19 @@ async function completeGitHubInstallation(request: Request, env: Env): Promise<R
     ).bind(pending.user_id, repository.installation_id, repository.repository_owner,
       repository.repository_name, repository.repository_id, consumedAt).run();
     return githubResultRedirect(env, 'connected');
-  } catch {
+  } catch (error) {
+    if (error instanceof GitHubInstallationVerificationError) {
+      console.error('github_installation_verification_failed', {
+        phase: error.phase,
+        status: error.status ?? null,
+        causeName: error.causeName ?? null,
+        causeCode: error.causeCode ?? null,
+        reason: error.reason ?? null,
+        redirectOrigin: error.redirectOrigin ?? null,
+        redirectPath: error.redirectPath ?? null,
+        apiErrorCategory: error.apiErrorCategory ?? null,
+      });
+    }
     return githubResultRedirect(env, 'failed');
   }
 }

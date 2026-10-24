@@ -32,9 +32,17 @@ let originalFetch: typeof fetch;
 
 async function tokenFor(
   userId: string,
-  options: { aud?: string; scope?: string; expired?: boolean } = {}
+  options: {
+    aud?: string;
+    scope?: string;
+    expired?: boolean;
+    issuedAtOffsetSeconds?: number;
+  } = {}
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
+  const issuedAt = options.expired
+    ? now - 600
+    : now + (options.issuedAtOffsetSeconds ?? 0);
   return new SignJWT({
     appUserId: userId,
     scope: options.scope ?? 'sessions:read sessions:write',
@@ -43,8 +51,8 @@ async function tokenFor(
     .setSubject(userId)
     .setIssuer(issuer)
     .setAudience(options.aud ?? audience)
-    .setIssuedAt(options.expired ? now - 600 : now)
-    .setExpirationTime(options.expired ? now - 300 : now + 300)
+    .setIssuedAt(issuedAt)
+    .setExpirationTime(options.expired ? now - 300 : issuedAt + 300)
     .sign(privateKey);
 }
 
@@ -80,8 +88,11 @@ beforeAll(async () => {
   };
   vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
     const url = new URL(input instanceof Request ? input.url : input.toString());
-    if (url.href !== jwksUrl) throw new Error(`Unexpected fetch: ${url.href}`);
-    return Response.json({ keys: [publicJwk] });
+    if (url.href === jwksUrl) return Response.json({ keys: [publicJwk] });
+    if (url.href === `${issuer}/jwks-failure`) {
+      return new Response('not found', { status: 404 });
+    }
+    throw new Error(`Unexpected fetch: ${url.href}`);
   });
 });
 
@@ -103,6 +114,18 @@ describe('Keiko session API', () => {
 
     const expired = await call('/v1/sessions', 'user-a', {}, { expired: true });
     expect(expired.status).toBe(401);
+
+    const smallClockSkew = await call('/v1/sessions?limit=1', 'user-a', {}, {
+      scope: 'sessions:read',
+      issuedAtOffsetSeconds: 4,
+    });
+    expect(smallClockSkew.status).toBe(200);
+
+    const excessiveClockSkew = await call('/v1/sessions?limit=1', 'user-a', {}, {
+      scope: 'sessions:read',
+      issuedAtOffsetSeconds: 10,
+    });
+    expect(excessiveClockSkew.status).toBe(401);
   });
 
   it('applies configured rate limits after verification using the verified user key', async () => {
@@ -461,6 +484,39 @@ describe('Keiko session API', () => {
     });
   });
 
+  it('marks a terminal backup retry failed before Cloudflare transfers it to the DLQ', async () => {
+    const userId = `terminal-retry-${crypto.randomUUID()}`;
+    const jobId = `job-${crypto.randomUUID()}`;
+    const snapshotId = `snapshot-${crypto.randomUUID()}`;
+    const payload = '[]';
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
+    await env.DB.prepare(
+      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
+       VALUES (?, ?, 'queued', ?)`
+    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z').run();
+    await env.DB.prepare(
+      `INSERT INTO backup_snapshots
+       (id, user_id, job_id, created_at, session_count, checksum, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
+
+    const retry = vi.fn();
+    const ack = vi.fn();
+    await processBackupMessage({
+      body: { jobId, userId },
+      attempts: 5,
+      retry,
+      ack,
+    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
+
+    expect(retry).toHaveBeenCalledWith({ delaySeconds: 160 });
+    expect(ack).not.toHaveBeenCalled();
+    expect(await env.DB.prepare(
+      'SELECT status, error_code FROM backup_jobs WHERE id = ?'
+    ).bind(jobId).first()).toMatchObject({ status: 'failed', error_code: 'backup_failed' });
+  });
+
   it('creates and completes a valid snapshot for a queued backup', async () => {
     const userId = `valid-backup-${crypto.randomUUID()}`;
     const jobId = `job-${crypto.randomUUID()}`;
@@ -658,5 +714,26 @@ describe('Keiko session API', () => {
     );
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ status: 'ready' });
+  });
+
+  it('reports a non-200 JWKS response as authentication unavailable', async () => {
+    const unavailableEnv = Object.assign(Object.create(testEnv), {
+      AUTH_JWKS_URL: `${issuer}/jwks-failure`,
+    }) as Env;
+    const response = await call(
+      '/v1/sessions?limit=1',
+      'user-a',
+      {},
+      { scope: 'sessions:read' },
+      unavailableEnv
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: {
+        code: 'authentication_unavailable',
+        message: 'Authentication service unavailable',
+      },
+    });
   });
 });
