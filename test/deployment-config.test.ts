@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import configText from '../wrangler.jsonc?raw';
 import packageText from '../package.json?raw';
-import recoveryScript from '../scripts/rehearse-d1-recovery.sh?raw';
 
 const config = JSON.parse(configText) as {
   env?: Record<
@@ -33,10 +32,9 @@ describe('retired Staging environment', () => {
     });
   });
 
-  it('does not expose Staging deployment, migration, or recovery paths', () => {
+  it('does not expose retired Staging or D1 snapshot recovery commands', () => {
     expect(Object.keys(packageConfig.scripts)).not.toContain('deploy:staging');
     expect(Object.keys(packageConfig.scripts)).not.toContain('migrate:staging');
-    expect(recoveryScript).not.toContain('keiko-dojo-staging');
-    expect(recoveryScript).not.toMatch(/<staging\|production>/);
+    expect(Object.keys(packageConfig.scripts)).not.toContain('backup:rehearse');
   });
 });

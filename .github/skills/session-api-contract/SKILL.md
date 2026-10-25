@@ -2,7 +2,7 @@
 name: session-api-contract
 description: Change Keiko session behavior while keeping REST, storage, analytics, MCP, and published contracts aligned.
 tags: [keiko-dojo, api, sessions, contract, d1]
-relatedSkills: [identity-and-tenant-security, backup-and-restore]
+relatedSkills: [identity-and-tenant-security, github-markdown-sync]
 ---
 
 # Session API Contract

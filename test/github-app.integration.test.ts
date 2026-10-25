@@ -4,14 +4,15 @@ import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { processGitHubOperationMessage } from '../src/http/github-operations';
+import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
 import {
   checkSelectedGitHubRepository,
   GitHubInstallationVerificationError,
   listSelectedGitHubSessionMarkdown,
   verifySelectedRepositoryInstallation,
-  writeGitHubBackup,
+  syncGitHubSessionMarkdown,
 } from '../src/integrations/github-app';
-import type { SnapshotSession } from '../src/domain/backup-snapshot';
+import type { GitHubSessionRow } from '../src/integrations/github-app';
 
 const originalFetch = globalThis.fetch;
 let appEnv: Env & { GITHUB_APP_PRIVATE_KEY?: string };
@@ -292,13 +293,13 @@ describe('GitHub App selected-repository backup adapter', () => {
     });
 
     try {
-      await expect(writeGitHubBackup(appEnv, {
+      await expect(syncGitHubSessionMarkdown(appEnv, {
         user_id: 'safe-backup-diagnostic',
         installation_id: 731,
         repository_owner: 'maki',
         repository_name: 'judo-notes',
         repository_id: 88,
-      }, 'snapshot-diagnostic', '2026-10-24T00:00:00.000Z', [{
+      }, [{
         id: 'safe-diagnostic-session',
         session_date: '2026-10-24',
         category: 'Technical',
@@ -311,7 +312,7 @@ describe('GitHub App selected-repository backup adapter', () => {
         updated_at: '2026-10-24T00:00:00.000Z',
       }])).rejects.toThrow();
 
-      expect(errorLog).toHaveBeenCalledWith('github_backup_failed', {
+      expect(errorLog).toHaveBeenCalledWith('github_session_sync_failed', {
         phase: 'session_contents',
         causeName: 'GitHubAppApiError',
         causeCode: null,
@@ -371,13 +372,13 @@ describe('GitHub App selected-repository backup adapter', () => {
     });
 
     try {
-      await writeGitHubBackup(appEnv, {
+      await syncGitHubSessionMarkdown(appEnv, {
         user_id: 'unchanged-backup-user',
         installation_id: 731,
         repository_owner: 'maki',
         repository_name: 'judo-notes',
         repository_id: 88,
-      }, 'snapshot-unchanged', '2026-10-24T00:00:00.000Z', [{
+      }, [{
         id: 'unchanged-session',
         session_date: '2026-10-24',
         category: 'Technical',
@@ -397,6 +398,314 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('deletes a session Markdown file after the D1 session is deleted', async () => {
+    const priorFetch = globalThis.fetch;
+    const requests: Array<{ method: string; url: string; body?: unknown }> = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+      const body = init?.body ? JSON.parse(String(init.body)) as unknown : undefined;
+      requests.push({ method, url, body });
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      if (method === 'GET' && url.endsWith('/20261024-matmetrics-deleted-session.md')) {
+        return Response.json({ sha: 'deleted-session-sha' });
+      }
+      if (method === 'DELETE' && url.endsWith('/20261024-matmetrics-deleted-session.md')) {
+        return Response.json({ commit: { sha: 'delete-commit' } });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url} (${method})`);
+    });
+
+    try {
+      await syncGitHubSessionMarkdown(appEnv, {
+        user_id: 'deleted-session-user', installation_id: 731,
+        repository_owner: 'maki', repository_name: 'judo-notes', repository_id: 88,
+      }, [], ['data/2026/10/20261024-matmetrics-deleted-session.md']);
+      expect(requests.filter(({ method }) => method === 'DELETE')).toHaveLength(1);
+      expect(requests.at(-1)?.body).toMatchObject({ sha: 'deleted-session-sha' });
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('coalesces revisions and moves the managed Markdown path when a session date changes', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `incremental-session-sync-${crypto.randomUUID()}`;
+    const remoteFiles = new Map<string, string>();
+    const writtenPaths: string[] = [];
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 902, 'maki', 'judo-notes', 902, new Date().toISOString()).run();
+    const session = {
+      id: 'moving-session', date: '2026-10-24', effort: 3, category: 'Technical',
+      techniques: ['Uchi mata'], notes: 'initial',
+    };
+    const oldPath = 'data/2026/10/20261024-matmetrics-moving-session.md';
+    const newPath = 'data/2026/11/20261101-matmetrics-moving-session.md';
+    const readPath = (url: string) => decodeURIComponent(new URL(url).pathname.split('/contents/')[1] ?? '');
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+      if (url.endsWith('/app/installations/902/access_tokens')) {
+        return Response.json({ token: 'incremental-sync-token' });
+      }
+      if (url.includes('/contents/')) {
+        const path = readPath(url);
+        if (method === 'GET') {
+          const content = remoteFiles.get(path);
+          return content === undefined
+            ? new Response(null, { status: 404 })
+            : Response.json({ sha: `sha-${path}`, encoding: 'base64', content: encodeBase64Utf8(content) });
+        }
+        if (method === 'PUT') {
+          const payload = JSON.parse(String(init?.body)) as { content: string };
+          remoteFiles.set(path, Buffer.from(payload.content, 'base64').toString('utf8'));
+          writtenPaths.push(path);
+          return Response.json({ content: { sha: `sha-${path}` } });
+        }
+        if (method === 'DELETE') {
+          remoteFiles.delete(path);
+          return Response.json({ commit: { sha: 'delete-commit' } });
+        }
+      }
+      throw new Error(`Unexpected GitHub API request: ${url} (${method})`);
+    });
+
+    const runSync = async () => {
+      const ack = vi.fn();
+      const retry = vi.fn();
+      await processGitHubSessionSyncMessage({
+        body: { kind: 'github-session-sync', userId }, attempts: 1, ack, retry,
+      } as unknown as Message<{ kind: 'github-session-sync'; userId: string }>, appEnv);
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+    };
+
+    try {
+      await env.DB.prepare(
+        `INSERT INTO sessions
+         (user_id, id, session_date, category, effort, payload, revision, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      ).bind(userId, session.id, session.date, session.category, session.effort,
+        JSON.stringify(session), new Date().toISOString(), new Date().toISOString()).run();
+      const quickEdit = { ...session, notes: 'corrected quickly' };
+      await env.DB.prepare(
+        `UPDATE sessions SET payload = ?, revision = revision + 1, updated_at = ?
+         WHERE user_id = ? AND id = ?`
+      ).bind(JSON.stringify(quickEdit), new Date().toISOString(), userId, session.id).run();
+      await env.DB.prepare(
+        'UPDATE github_session_sync_state SET next_sync_at = ? WHERE user_id = ?'
+      ).bind(new Date(0).toISOString(), userId).run();
+      await runSync();
+      expect(remoteFiles.has(oldPath)).toBe(true);
+      expect(remoteFiles.get(oldPath)).toContain('corrected quickly');
+      expect(writtenPaths).toEqual([oldPath]);
+
+      const updated = { ...quickEdit, date: '2026-11-01', notes: 'latest edit' };
+      await env.DB.prepare(
+        `UPDATE sessions SET session_date = ?, payload = ?, revision = revision + 1, updated_at = ?
+         WHERE user_id = ? AND id = ?`
+      ).bind(updated.date, JSON.stringify(updated), new Date().toISOString(), userId, session.id).run();
+      await env.DB.prepare(
+        'UPDATE github_session_sync_state SET next_sync_at = ? WHERE user_id = ?'
+      ).bind(new Date(0).toISOString(), userId).run();
+      await runSync();
+
+      expect(remoteFiles.has(oldPath)).toBe(false);
+      expect(remoteFiles.get(newPath)).toContain('latest edit');
+      expect(writtenPaths).toEqual([oldPath, newPath]);
+      expect(await env.DB.prepare(
+        'SELECT path, revision FROM github_synced_session_files WHERE user_id = ? AND repository_id = ? AND session_id = ?'
+      ).bind(userId, 902, session.id).first()).toMatchObject({ path: newPath, revision: 3 });
+      expect(await env.DB.prepare(
+        'SELECT generation, completed_generation FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ generation: 3, completed_generation: 3 });
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+        env.DB.prepare('UPDATE github_installations SET revoked_at = ? WHERE user_id = ?')
+          .bind(new Date().toISOString(), userId),
+        env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+      ]);
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('initially reconciles current sessions and removes stale managed Markdown', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `initial-session-sync-${crypto.randomUUID()}`;
+    const currentPath = 'data/2026/10/20261025-matmetrics-current-session.md';
+    const stalePath = 'data/2026/09/20260901-matmetrics-deleted-session.md';
+    const requests: Array<{ method: string; url: string }> = [];
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 904, 'maki', 'judo-notes', 904, new Date().toISOString()).run();
+    const session = {
+      id: 'current-session', date: '2026-10-25', effort: 3, category: 'Technical',
+      techniques: ['Uchi mata'], notes: 'latest notes',
+    };
+    const staleMarkdown = '---\nid: "deleted-session"\n---\n';
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+      requests.push({ method, url });
+      if (url.endsWith('/app/installations/904/access_tokens')) {
+        const body = JSON.parse(String(init?.body)) as { permissions: { contents: string } };
+        return Response.json({ token: body.permissions.contents === 'read' ? 'read-token' : 'write-token' });
+      }
+      if (url === 'https://api.github.com/repos/maki/judo-notes') {
+        return Response.json({ default_branch: 'main' });
+      }
+      if (url.endsWith('/git/ref/heads/main')) {
+        return Response.json({ object: { sha: 'a'.repeat(40) } });
+      }
+      if (url.endsWith('/git/trees/' + 'a'.repeat(40) + '?recursive=1')) {
+        return Response.json({ tree: [{ type: 'blob', path: stalePath, sha: 'stale-blob-sha' }] });
+      }
+      if (url.includes('/contents/')) {
+        const path = decodeURIComponent(new URL(url).pathname.split('/contents/')[1] ?? '');
+        if (method === 'GET' && path === stalePath) {
+          return Response.json({ sha: 'stale-file-sha', encoding: 'base64', content: encodeBase64Utf8(staleMarkdown) });
+        }
+        if (method === 'GET' && path === currentPath) return new Response(null, { status: 404 });
+        if (method === 'PUT' && path === currentPath) return Response.json({ content: { sha: 'current-file-sha' } });
+        if (method === 'DELETE' && path === stalePath) return Response.json({ commit: { sha: 'delete-commit' } });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url} (${method})`);
+    });
+
+    try {
+      await env.DB.prepare(
+        `INSERT INTO sessions
+         (user_id, id, session_date, category, effort, payload, revision, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      ).bind(userId, session.id, session.date, session.category, session.effort,
+        JSON.stringify(session), new Date().toISOString(), new Date().toISOString()).run();
+      await env.DB.prepare(
+        `UPDATE github_session_sync_state SET full_sync_required = 1, next_sync_at = ?
+         WHERE user_id = ?`
+      ).bind(new Date(0).toISOString(), userId).run();
+
+      const ack = vi.fn();
+      const retry = vi.fn();
+      await processGitHubSessionSyncMessage({
+        body: { kind: 'github-session-sync', userId }, attempts: 1, ack, retry,
+      } as unknown as Message<{ kind: 'github-session-sync'; userId: string }>, appEnv);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(requests.some(({ method, url }) => method === 'PUT' && url.endsWith('/' + currentPath))).toBe(true);
+      expect(requests.some(({ method, url }) => method === 'DELETE' && url.endsWith('/' + stalePath))).toBe(true);
+      expect(await env.DB.prepare(
+        'SELECT session_id, path, revision FROM github_synced_session_files WHERE user_id = ? AND repository_id = ?'
+      ).bind(userId, 904).all()).toMatchObject({ results: [{ session_id: session.id, path: currentPath, revision: 1 }] });
+      expect(await env.DB.prepare(
+        'SELECT full_sync_required, generation, completed_generation FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ full_sync_required: 0, generation: 1, completed_generation: 1 });
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+        env.DB.prepare('UPDATE github_installations SET revoked_at = ? WHERE user_id = ?')
+          .bind(new Date().toISOString(), userId),
+        env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+      ]);
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('acknowledges a terminal session-sync failure instead of retrying the message', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `terminal-session-sync-${crypto.randomUUID()}`;
+    const operationId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const queueSend = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const syncEnv = Object.assign(Object.create(appEnv), {
+      BACKUP_QUEUE: { send: queueSend },
+    }) as Env;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 906, 'CyanAutomation', 'judo-notes', 906, now).run();
+    await env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at)
+       VALUES (?, ?, 1, 1, ?)`
+    ).bind(userId, 906, new Date(0).toISOString()).run();
+    await env.DB.prepare(
+      `INSERT INTO github_operation_jobs
+       (id, user_id, type, status, payload, created_at, updated_at)
+       VALUES (?, ?, 'github-sync-all', 'queued', '{}', ?, ?)`
+    ).bind(operationId, userId, now, now).run();
+    vi.stubGlobal('fetch', async () => { throw new Error('GitHub unavailable'); });
+    const ack = vi.fn();
+    const retry = vi.fn();
+
+    try {
+      await processGitHubSessionSyncMessage({
+        body: { kind: 'github-session-sync', userId, operationId },
+        attempts: 5,
+        ack,
+        retry,
+      } as unknown as Message<{ kind: 'github-session-sync'; userId: string; operationId: string }>, syncEnv);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(await env.DB.prepare(
+        'SELECT status, error_message FROM github_operation_jobs WHERE id = ?'
+      ).bind(operationId).first()).toMatchObject({ status: 'failed', error_message: 'github_sync_failed' });
+      expect(queueSend).not.toHaveBeenCalled();
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_operation_jobs WHERE id = ?').bind(operationId),
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+      ]);
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('acknowledges a terminal GitHub operation failure instead of retrying the message', async () => {
+    const userId = `terminal-operation-${crypto.randomUUID()}`;
+    const jobId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    await env.DB.prepare(
+      `INSERT INTO github_operation_jobs
+       (id, user_id, type, status, payload, created_at, updated_at)
+       VALUES (?, ?, 'github-health', 'queued', '{}', ?, ?)`
+    ).bind(jobId, userId, now, now).run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+
+    try {
+      await processGitHubOperationMessage({
+        body: { kind: 'github-operation', jobId, userId },
+        attempts: 5,
+        ack,
+        retry,
+      } as unknown as Message<{ kind: 'github-operation'; jobId: string; userId: string }>, appEnv);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(await env.DB.prepare(
+        'SELECT status FROM github_operation_jobs WHERE id = ?'
+      ).bind(jobId).first()).toMatchObject({ status: 'failed' });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE id = ?').bind(jobId).run();
+    }
+  });
+
   it('binds a selected-repository callback to its one-time initiating account state', async () => {
     const priorFetch = globalThis.fetch;
     const previousFrontendOrigin = appEnv.MATMETRICS_FRONTEND_URL;
@@ -406,6 +715,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       SESSION_READ_LIMITER: allowRateLimit,
       SESSION_WRITE_LIMITER: allowRateLimit,
       BACKUP_WRITE_LIMITER: allowRateLimit,
+      BACKUP_QUEUE: { send: vi.fn(async (_message: unknown, _options?: unknown) => {}) },
     }) as Env;
     vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
@@ -475,6 +785,16 @@ describe('GitHub App selected-repository backup adapter', () => {
         'SELECT consumed_at FROM github_installation_states WHERE state_hash = ?'
       ).bind(stateHash).first<{ consumed_at: string | null }>();
       expect(consumed?.consumed_at).toBeTruthy();
+      expect(testEnv.BACKUP_QUEUE.send).toHaveBeenCalledWith(
+        { kind: 'github-session-sync', userId: 'install-user' },
+        { delaySeconds: 60 }
+      );
+      expect(await env.DB.prepare(
+        `SELECT repository_id, generation, full_sync_required, wake_enqueued
+         FROM github_session_sync_state WHERE user_id = ?`
+      ).bind('install-user').first()).toMatchObject({
+        repository_id: 88, generation: 1, full_sync_required: 1, wake_enqueued: 1,
+      });
       const callCountAfterSuccess = githubCalls.length;
       const replay = await worker.fetch(new Request(callbackUrl), testEnv);
       expect(replay.headers.get('location')).toBe('https://matmetrics.example.test/?githubBackup=failed');
@@ -527,7 +847,10 @@ describe('GitHub App selected-repository backup adapter', () => {
       const callback = await worker.fetch(new Request(callbackUrl), appEnv);
 
       expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/?githubBackup=connected');
-      expect(isoTimestamp).toHaveBeenCalledTimes(1);
+      expect(isoTimestamp).toHaveBeenCalledTimes(3);
+      expect(await env.DB.prepare(
+        'SELECT consumed_at FROM github_installation_states WHERE state_hash = ?'
+      ).bind(stateHash).first()).toMatchObject({ consumed_at: selectTime });
     } finally {
       isoTimestamp.mockRestore();
       vi.stubGlobal('fetch', priorFetch);
@@ -674,7 +997,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       repository_name: 'judo-notes',
       repository_id: 88,
     });
-    const sessions: SnapshotSession[] = [
+    const sessions: GitHubSessionRow[] = [
       {
         id: 's-1', session_date: '2026-10-17', category: 'Technical', effort: 3,
         payload: JSON.stringify({
@@ -695,7 +1018,7 @@ describe('GitHub App selected-repository backup adapter', () => {
         revision: 2, updated_at: '2026-10-17T00:00:00.000Z',
       },
     ];
-    await writeGitHubBackup(appEnv, { user_id: 'user-1', ...installation }, 'snapshot-1', '2026-10-17T00:00:00.000Z', sessions);
+    await syncGitHubSessionMarkdown(appEnv, { user_id: 'user-1', ...installation }, sessions);
 
     const readRequest = calls.find((call) => call.url.endsWith('/access_tokens'))!;
     expect(readRequest.init?.redirect).toBe('manual');
@@ -739,7 +1062,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       'private training note',
       '',
     ].join('\n'));
-    expect(uploadBody.message).toContain('snapshot-1');
+    expect(uploadBody.message).toContain('Keiko Dojo backup session');
     expect(JSON.parse(String(uploads[1]?.init?.body))).toMatchObject({
       sha: 'existing-session-sha',
     });
@@ -774,7 +1097,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       }
       throw new Error(`Unexpected GitHub API request: ${url}`);
     });
-    const invalidSession: SnapshotSession = {
+    const invalidSession: GitHubSessionRow = {
       id: 'broken-session',
       session_date: '2026-10-17',
       category: 'Technical',
@@ -785,7 +1108,7 @@ describe('GitHub App selected-repository backup adapter', () => {
     };
 
     try {
-      await expect(writeGitHubBackup(
+      await expect(syncGitHubSessionMarkdown(
         appEnv,
         {
           user_id: 'user-1',
@@ -794,8 +1117,6 @@ describe('GitHub App selected-repository backup adapter', () => {
           repository_name: 'judo-notes',
           repository_id: 88,
         },
-        'snapshot-1',
-        '2026-10-17T00:00:00.000Z',
         [invalidSession]
       )).rejects.toThrow('Stored session payload is invalid');
       expect(calls).toEqual([]);
@@ -818,7 +1139,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       }
       throw new Error(`Unexpected GitHub API request: ${url}`);
     });
-    const invalidSession: SnapshotSession = {
+    const invalidSession: GitHubSessionRow = {
       id: 'empty-technique-session',
       session_date: '2026-10-17',
       category: 'Technical',
@@ -835,7 +1156,7 @@ describe('GitHub App selected-repository backup adapter', () => {
     };
 
     try {
-      await expect(writeGitHubBackup(
+      await expect(syncGitHubSessionMarkdown(
         appEnv,
         {
           user_id: 'user-1',
@@ -844,8 +1165,6 @@ describe('GitHub App selected-repository backup adapter', () => {
           repository_name: 'judo-notes',
           repository_id: 88,
         },
-        'snapshot-1',
-        '2026-10-17T00:00:00.000Z',
         [invalidSession]
       )).rejects.toThrow('Stored session payload is invalid');
       expect(calls).toEqual([]);

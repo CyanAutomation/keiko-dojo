@@ -2,7 +2,7 @@
 name: cloudflare-operations
 description: Maintain Keiko's Worker, D1, Queue, secret, migration, CI, and staged rollout configuration safely.
 tags: [keiko-dojo, cloudflare-workers, d1, migrations, operations]
-relatedSkills: [identity-and-tenant-security, backup-and-restore]
+relatedSkills: [identity-and-tenant-security, github-markdown-sync]
 ---
 
 # Cloudflare Operations
@@ -58,4 +58,4 @@ and listed in `README.md`; follow the staging and production gates in
 
 When changing queues or scheduled jobs, update all environment bindings and
 review retry, dead-letter, deduplication, and stale-dispatch recovery behavior
-with `backup-and-restore`.
+with `github-markdown-sync`.

@@ -20,7 +20,6 @@ export default defineConfig({
             AUTH_ISSUER: 'https://auth.example.test',
             AUTH_AUDIENCE: 'keiko-dojo-api',
             ENVIRONMENT: 'test',
-            SCHEDULED_BACKUPS_ENABLED: 'true',
           },
         },
       };

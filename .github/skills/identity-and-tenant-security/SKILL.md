@@ -2,7 +2,7 @@
 name: identity-and-tenant-security
 description: Preserve Keiko's Better Auth token boundary, operation scopes, per-user D1 ownership, rate limits, and safe logs.
 tags: [keiko-dojo, security, authentication, authorization, tenancy]
-relatedSkills: [session-api-contract, backup-and-restore, cloudflare-operations]
+relatedSkills: [session-api-contract, github-markdown-sync, cloudflare-operations]
 ---
 
 # Identity and Tenant Security
@@ -29,7 +29,7 @@ ownership, rate limits, cross-service authentication, or request logging.
   `userId` into every service and D1 read/write. Never authorize from caller
   supplied IDs, `owner`, `repo`, cookie data, or an unverified JWT payload.
 - Keep scopes narrow: session reads use `sessions:read`; session writes use
-  `sessions:write`; backup reads, writes, and restores use their respective
+  `sessions:write`; GitHub connection reads and writes use their respective
   `backups:*` scopes. MCP initialization, discovery, and calls are protected
   by `sessions:read`.
 - In deployed environments, rate-limit by the verified user ID and operation
@@ -60,4 +60,5 @@ the MatMetrics bearer token to Keiko.
   review checklist for end-to-end identity changes.
 
 For API or persistence contract changes, also read `session-api-contract`.
-For GitHub credentials and backup ownership, also read `backup-and-restore`.
+For GitHub credentials and repository ownership, also read
+`github-markdown-sync`.
