@@ -462,7 +462,7 @@ describe('GitHub App selected-repository backup adapter', () => {
     callbackUrl.searchParams.set('installation_id', '731');
       const callback = await worker.fetch(new Request(callbackUrl), testEnv);
       expect(callback.status).toBe(302);
-      expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/settings?githubBackup=connected');
+      expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/?githubBackup=connected');
       const stateHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(state))))
         .map((value) => value.toString(16).padStart(2, '0')).join('');
       const saved = await env.DB.prepare(
@@ -477,7 +477,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       expect(consumed?.consumed_at).toBeTruthy();
       const callCountAfterSuccess = githubCalls.length;
       const replay = await worker.fetch(new Request(callbackUrl), testEnv);
-      expect(replay.headers.get('location')).toBe('https://matmetrics.example.test/settings?githubBackup=failed');
+      expect(replay.headers.get('location')).toBe('https://matmetrics.example.test/?githubBackup=failed');
       expect(githubCalls).toHaveLength(callCountAfterSuccess);
     } finally {
       vi.stubGlobal('fetch', priorFetch);
@@ -526,7 +526,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       callbackUrl.searchParams.set('installation_id', '731');
       const callback = await worker.fetch(new Request(callbackUrl), appEnv);
 
-      expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/settings?githubBackup=connected');
+      expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/?githubBackup=connected');
       expect(isoTimestamp).toHaveBeenCalledTimes(1);
     } finally {
       isoTimestamp.mockRestore();
