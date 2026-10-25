@@ -104,6 +104,23 @@ afterAll(() => {
 });
 
 describe('Keiko session API', () => {
+  it('returns the GitHub installation callback to the MatMetrics dashboard', async () => {
+    const callbackEnv = Object.assign(Object.create(testEnv), {
+      ENVIRONMENT: 'production',
+      MATMETRICS_FRONTEND_URL: 'https://matmetrics.example.test',
+    }) as Env;
+    const response = await worker.fetch(
+      new Request('https://keiko.example.test/v1/backups/github-installation/callback?state=invalid'),
+      callbackEnv
+    );
+
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.origin).toBe(callbackEnv.MATMETRICS_FRONTEND_URL);
+    expect(location.pathname).toBe('/');
+    expect(location.searchParams.get('githubBackup')).toBe('failed');
+  });
+
   it('queues only selected-repository GitHub operations and scopes job access to its owner', async () => {
     const userId = `github-operation-${crypto.randomUUID()}`;
     await env.DB.prepare(
