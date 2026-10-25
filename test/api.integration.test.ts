@@ -451,8 +451,8 @@ describe('Keiko session API', () => {
       ).bind(userId).first()).toMatchObject({ wake_enqueued: 0, last_error: 'queue_unavailable' });
 
       await env.DB.prepare(
-        'UPDATE github_session_sync_state SET dispatch_after = ? WHERE user_id = ?'
-      ).bind(new Date(0).toISOString(), userId).run();
+        'UPDATE github_session_sync_state SET dispatch_after = ?, next_sync_at = ? WHERE user_id = ?'
+      ).bind(new Date(0).toISOString(), new Date(0).toISOString(), userId).run();
       const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
       const scheduleEnv = Object.assign(Object.create(testEnv), { BACKUP_QUEUE: { send } }) as Env;
       await worker.scheduled!({
@@ -502,6 +502,39 @@ describe('Keiko session API', () => {
       expect(await env.DB.prepare(
         'SELECT wake_enqueued, wake_enqueued_at FROM github_session_sync_state WHERE user_id = ?'
       ).bind(userId).first()).toMatchObject({ wake_enqueued: 1 });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('does not enqueue a scheduled wake before the debounce window expires', async () => {
+    const userId = `session-sync-not-due-${crypto.randomUUID()}`;
+    const nextSyncAt = new Date(Date.now() + 60_000).toISOString();
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 907, 'CyanAutomation', 'matmetrics', 97, new Date().toISOString()).run();
+    await env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at)
+       VALUES (?, ?, 1, 1, ?)`
+    ).bind(userId, 97, nextSyncAt).run();
+    const send = vi.fn(async (_message: unknown, _options?: { delaySeconds: number }) => {});
+    const scheduleEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+
+    try {
+      await worker.scheduled!({
+        scheduledTime: Date.now(), cron: '* * * * *', noRetry: () => {},
+      }, scheduleEnv);
+
+      expect(send).not.toHaveBeenCalled();
+      expect(await env.DB.prepare(
+        'SELECT wake_enqueued FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ wake_enqueued: 0 });
     } finally {
       await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
       await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
