@@ -3,24 +3,22 @@
 Keiko's local test configuration is self-contained. Separate staging and
 production D1 databases, backup queues, and dead-letter queues are provisioned.
 As of 2026-10-25, all five migrations are applied to staging and
-`/healthz` and `/readyz` return HTTP 200. The existing MatMetrics account's
-37 sessions were imported; the list and analytics previously matched the
-MatMetrics API source. A queued D1 snapshot and confirmed restore both
-completed, preserving the same analytics. REST/MCP analytics parity and scope
-denials were verified. A live GitHub App installation is connected only to
-`CyanAutomation/matmetrics`, and the latest staging backup job completed for
-all 37 sessions. The current repository contains 38 valid Markdown session
-files: one is not present in staging D1, so repository recovery is not yet
-validated. The superseded failed queue message was acknowledged after the
-successful replacement backup; the main queue and DLQ are clear. Vercel
-Production variables for the single-account staging pilot are configured, and
-Vercel ignores Keiko backup commits. Production deployment
-`dpl_BpKUPpffsdTnvVEQFwFCrsEdSkzH` is READY at commit
-`438f2ff34477676769238f2ff41956e4d06d8a56`; it owns
-`matmetrics-teal.vercel.app`. The home page and JWKS proxy return HTTP 200,
-and the unauthenticated session-list route returns HTTP 401 as expected. The
-signed-in session-list refresh still returns HTTP 403 after redeploy, so the
-pilot read/write gate has not passed. Production D1 has no Keiko application
+`/healthz` and `/readyz` return HTTP 200. Staging contains 38 sessions. A
+fresh snapshot and GitHub backup completed, and the repository now contains
+38 unique valid Markdown files with zero parse failures, duplicate IDs, or
+session-payload mismatches against staging D1. The lossless backup format is
+covered by MatMetrics parser tests. The earlier confirmed restore, isolated
+SQL recovery rehearsal, REST/MCP analytics parity, scope denials, retry
+handling, and DLQ checks remain verified. The staging GitHub App is connected
+only to `CyanAutomation/matmetrics`. Vercel Production is configured for the
+single-account staging pilot, and Vercel ignores Keiko backup commits. The
+READY Production deployment `dpl_EVWexwXGmphjGSwdqAQDtHpg1mFu` at commit
+`51c6476d72a46a9b401c4bdef63b9ae008c21422` owns
+`matmetrics-teal.vercel.app`; signed-in Training History loads all 38
+sessions. A synthetic CRUD smoke check found that the deployed MatMetrics
+gateway turns Keiko's successful `204` delete into `503`. The local gateway
+fix and regression test pass, but the fix still needs release before the
+authenticated write gate is closed. Production D1 has no Keiko application
 tables, and no production Worker deployment or account cutover exists. The
 staging Worker is deployed at
 [`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-staging.scheimann.workers.dev).
@@ -147,13 +145,18 @@ staging Worker is deployed at
   exist.
 - Keep the original Markdown repository through each account's rollback
   window. Keiko writes each session as a Markdown file in the same
-  `data/YYYY/MM/` layout, with a stable session ID in the filename and
-  frontmatter compatible with MatMetrics' Markdown reader. Before rollback,
+  `data/YYYY/MM/` layout, with a stable session ID in the filename and a
+  versioned lossless text payload that MatMetrics' Markdown reader restores.
+  Before rollback,
   pause writes and confirm Keiko's latest backup job completed. Remove the
   user's ID from `KEIKO_SESSION_CUTOVER_USER_IDS` and redeploy MatMetrics so
-  its list API reads the legacy Markdown repository again. Run the MatMetrics
-  import script in dry-run mode while `KEIKO_API_BASE_URL` still points at
-  Keiko; it compares the Markdown source with Keiko and must show zero parse
+  its list API reads the legacy Markdown repository again. Refresh the
+  MatMetrics checkout's `data/` directory from the latest `origin/main` backup
+  commit, then run `node --import tsx scripts/import-keiko-sessions.ts
+  --markdown-source` in dry-run mode while `KEIKO_API_BASE_URL` still points at
+  Keiko. The `--markdown-source` option compares repository files with Keiko;
+  the default API source would read Keiko on both sides after cutover. The
+  check must show zero parse
   failures, duplicate IDs, importable sessions, payload mismatches, and
   `keikoOnly`. Do not pass `--apply` in this rollback check. Keep the user's
   Auth Worker token issuance allowlist active through the comparison so the
@@ -172,25 +175,27 @@ staging Worker is deployed at
    MatMetrics account's session and analytics parity, D1 snapshot/restore,
    restore confirmation protection, successful queue delivery, terminal retry
    handling, live DLQ handoff and cleanup, and MCP/REST scope parity have been
-   verified. Resolve the one repository-only Markdown session before calling
-   the connected GitHub repository recovery validated.
+   verified. The latest staging backup has 38 sessions and the repository has
+   38 unique Markdown records with exact payload and analytics parity.
    Keiko's automated integration tests use
    synthetic identities to verify tenant isolation; a second live account is
    not required.
-2. From the MatMetrics repository root, export the current account data, run
-   `npm run test:keiko:import`, then run
-   `node --import tsx scripts/import-keiko-sessions.ts` in dry-run mode with
-   the staging API configured. Review parse failures, duplicate IDs, payload
-   mismatches, and existing records. Run with `--apply` only after review. The
-   importer source lives in [CyanAutomation/matmetrics](https://github.com/CyanAutomation/matmetrics/blob/main/scripts/import-keiko-sessions.ts).
-3. The staging session list and analytics previously matched the MatMetrics
-   API source. Keep the original Markdown copy and resolve the additional
-   repository-only session before calling recovery complete. Vercel Production
-   points the single-account pilot to staging, and the required Auth Worker
-   hostname is active in the READY deployment. The signed-in session-list
-   refresh still returns HTTP 403. Diagnose and clear that read failure, then
-   verify authenticated reads and writes before switching the API base to
-   Keiko Production. Keep the cutover allowlist limited to that one ID.
+2. From the MatMetrics repository root, run `npm run test:keiko:import`. Before
+   the account is routed to Keiko, the default importer source can read the
+   legacy MatMetrics API. After cutover, refresh `data/` from the latest
+   `origin/main` backup commit and use
+   `node --import tsx scripts/import-keiko-sessions.ts --markdown-source` for
+   dry-run comparison. Review parse failures, duplicate IDs, payload
+   mismatches, and existing records. Run with `--apply` only when an import is
+   intended and the missing records have been reviewed. The importer source
+   lives in [CyanAutomation/matmetrics](https://github.com/CyanAutomation/matmetrics/blob/main/scripts/import-keiko-sessions.ts).
+3. Vercel Production points the single-account pilot to staging, and signed-in
+   reads load all 38 sessions. The repository copy matches staging D1 exactly.
+   Release the MatMetrics fix for successful bodyless Keiko deletes, then
+   verify authenticated reads and writes through the deployed app. Keep the
+   original Markdown copy and the cutover allowlist limited to the existing
+   account. Do not switch the API base to Keiko Production until this deployed
+   CRUD gate and recovery checks pass.
 4. After all staging/recovery checks pass, apply migrations to production D1
    and deploy Keiko. Export the existing account data, repeat the importer
    dry-run/review/apply against production, compare session and analytics
