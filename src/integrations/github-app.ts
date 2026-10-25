@@ -395,6 +395,15 @@ function sessionMarkdown(session: MarkdownSession): string {
   const techniques = session.techniques.length
     ? session.techniques.map((technique) => `- ${escapeTechnique(technique)}`).join('\n')
     : '- (none recorded)';
+  const textPayload = JSON.stringify({
+    techniques: session.techniques,
+    ...(session.description !== undefined ? { description: session.description } : {}),
+    ...(session.notes !== undefined ? { notes: session.notes } : {}),
+  });
+  frontmatter.push(
+    'keikoBackupVersion: 1',
+    `keikoTextPayload: ${JSON.stringify(textPayload)}`
+  );
   return `---\n${frontmatter.join('\n')}\n---\n\n# ${session.date} - Judo Session: ${session.category}\n\n## Techniques Practiced\n${techniques}\n\n## Session Description\n\n${escapeMarkdown(session.description ?? '')}\n\n## Notes\n\n${escapeMarkdown(session.notes ?? '')}\n`;
 }
 

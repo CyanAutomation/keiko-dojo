@@ -211,6 +211,8 @@ describe('GitHub App selected-repository backup adapter', () => {
       'date: "2026-10-24"',
       'effort: 3',
       'category: "Technical"',
+      'keikoBackupVersion: 1',
+      `keikoTextPayload: ${JSON.stringify(JSON.stringify({ techniques: ['Ōuchi mata'] }))}`,
       '---',
       '',
       '# 2026-10-24 - Judo Session: Technical',
@@ -591,6 +593,12 @@ describe('GitHub App selected-repository backup adapter', () => {
       'category: "Technical"',
       'duration: 75',
       'videoUrl: "https://example.test/video.webm"',
+      'keikoBackupVersion: 1',
+      `keikoTextPayload: ${JSON.stringify(JSON.stringify({
+        techniques: ['Uchi mata'],
+        description: 'Entry practice',
+        notes: 'private training note',
+      }))}`,
       '---',
       '',
       '# 2026-10-17 - Judo Session: Technical',
@@ -615,6 +623,15 @@ describe('GitHub App selected-repository backup adapter', () => {
       JSON.parse(String(uploads[1]?.init?.body)).content,
       'base64'
     ).toString('utf8');
+    const expectedTextPayload = JSON.stringify({
+      techniques: ['Randori drills\n# injected heading'],
+      description: 'Warm-up\n---\n# Injected heading\n<script>alert(1)</script>',
+      notes: '[link](https://evil.test)\n- injected list\n```html',
+    });
+    expect(secondMarkdown).toContain('keikoBackupVersion: 1');
+    expect(secondMarkdown).toContain(
+      `keikoTextPayload: ${JSON.stringify(expectedTextPayload)}`
+    );
     expect(secondMarkdown).toContain('- Randori drills \\# injected heading');
     expect(secondMarkdown).toContain('Warm\\-up\n\\-\\-\\-\n\\# Injected heading\n&lt;script&gt;alert\\(1\\)&lt;/script&gt;');
     expect(secondMarkdown).toContain('\\[link\\]\\(https://evil\\.test\\)\n\\- injected list\n\\`\\`\\`html');
