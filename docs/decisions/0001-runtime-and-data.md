@@ -7,8 +7,9 @@
 
 Keiko Dojo runs as an independently deployed TypeScript Cloudflare Worker.
 Cloudflare D1 is its authoritative session store, reached only through a D1
-binding. Local, staging, and production use separate databases. MatMetrics'
-`matmetrics-data` database is not reused.
+binding. Local development and Production use separate databases. A temporary
+Staging environment used during the initial rollout was retired after the
+Production cutover. MatMetrics' `matmetrics-data` database is not reused.
 
 Session payloads keep the MatMetrics fields and categories. Keiko stores the
 verified stable user ID, record revision, and timestamps as server-owned
