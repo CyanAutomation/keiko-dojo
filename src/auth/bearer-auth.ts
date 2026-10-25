@@ -12,7 +12,6 @@ export type RequiredScope =
   | 'sessions:write'
   | 'backups:read'
   | 'backups:write'
-  | 'backups:restore'
   | 'github:read'
   | 'github:write';
 export type AuthenticatedUser = { userId: string };

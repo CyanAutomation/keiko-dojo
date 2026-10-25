@@ -1,10 +1,12 @@
 import { D1SessionRepository } from './storage/d1-session-repository';
 import { SessionService } from './application/session-service';
+import { dispatchGitHubSessionSync, dispatchPendingGitHubSessionSyncs } from './application/github-session-sync-queue';
 import { handleSessionsRequest } from './http/sessions';
 import { jsonError, jsonResponse } from './http/responses';
 import { authenticateRequest, AuthFailure } from './auth/bearer-auth';
 import { authFailureResponse } from './http/auth-errors';
-import { handleBackupRequest, processBackupMessage } from './http/backups';
+import { handleBackupRequest } from './http/backups';
+import { processGitHubSessionSyncMessage } from './http/github-sync';
 import { handleGitHubOperationRequest, processGitHubOperationMessage } from './http/github-operations';
 import { handleMcpRequest } from './http/mcp';
 
@@ -15,7 +17,8 @@ function normalizedPath(pathname: string): string {
 async function handleRequest(
   request: Request,
   env: Env,
-  requestId: string
+  requestId: string,
+  ctx?: ExecutionContext
 ): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === '/healthz') return handleHealthCheck(request, requestId);
@@ -30,7 +33,16 @@ async function handleRequest(
     return handleBackupRequest(request, env, requestId);
   }
 
-  const service = new SessionService(new D1SessionRepository(env.DB));
+  const service = new SessionService(new D1SessionRepository(env.DB, (userId) => {
+    const dispatch = dispatchGitHubSessionSync(env, userId);
+    if (ctx) {
+      ctx.waitUntil(dispatch.catch(() => {
+        console.error('github_session_sync_dispatch_failed');
+      }));
+      return;
+    }
+    return dispatch;
+  }));
   if (url.pathname === '/mcp') {
     return handleMcpRequest(request, env, requestId, service);
   }
@@ -98,14 +110,14 @@ async function handleAnalyticsSummary(
 }
 
 const worker = {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const requestId = crypto.randomUUID();
     const startedAt = Date.now();
     const url = new URL(request.url);
     let response: Response;
 
     try {
-      response = await handleRequest(request, env, requestId);
+      response = await handleRequest(request, env, requestId, ctx);
     } catch (error) {
       const errorName = error instanceof Error ? error.name : 'UnknownError';
       console.error({ event: 'request_failed', requestId, errorName });
@@ -140,6 +152,17 @@ const worker = {
       const value = message.body;
       if (
         value && typeof value === 'object' &&
+        'kind' in value && value.kind === 'github-session-sync' &&
+        'userId' in value && typeof value.userId === 'string'
+      ) {
+        await processGitHubSessionSyncMessage(
+          message as Message<{ kind: 'github-session-sync'; userId: string; operationId?: string }>,
+          env
+        );
+        continue;
+      }
+      if (
+        value && typeof value === 'object' &&
         'kind' in value && value.kind === 'github-operation' &&
         'jobId' in value && typeof value.jobId === 'string' &&
         'userId' in value && typeof value.userId === 'string'
@@ -150,101 +173,11 @@ const worker = {
         );
         continue;
       }
-      if (
-        value && typeof value === 'object' &&
-        'jobId' in value && typeof value.jobId === 'string' &&
-        'userId' in value && typeof value.userId === 'string'
-      ) {
-        await processBackupMessage(
-          message as Message<{ jobId: string; userId: string; operationId?: string }>,
-          env
-        );
-      } else {
-        message.ack();
-      }
+      message.ack();
     }
   },
-  async scheduled(controller: ScheduledController, env: Env) {
-    if (env.SCHEDULED_BACKUPS_ENABLED !== 'true') return;
-
-    const installations = await env.DB.prepare(
-      'SELECT user_id FROM github_installations WHERE revoked_at IS NULL'
-    ).all<{ user_id: string }>();
-    const requestedAt = new Date(controller.scheduledTime).toISOString();
-    const scheduleKey = `${controller.cron}:${requestedAt}`;
-    const dispatchAttemptedAt = new Date().toISOString();
-    const staleDispatchCutoff = new Date(Date.now() - 60_000).toISOString();
-
-    // Recover scheduled jobs left queued by an interrupted invocation even
-    // when their schedule key belongs to an earlier cron occurrence.
-    const staleJobs = await env.DB.prepare(
-      `SELECT jobs.id, jobs.user_id FROM backup_jobs AS jobs
-       INNER JOIN github_installations AS installations ON installations.user_id = jobs.user_id
-       WHERE installations.revoked_at IS NULL AND jobs.schedule_key IS NOT NULL AND (
-         (jobs.status = 'queued' AND jobs.dispatch_attempted_at <= ?) OR
-         (jobs.status = 'failed' AND jobs.error_code = 'queue_unavailable'
-          AND jobs.dispatch_attempted_at <= ?)
-       )`
-    ).bind(staleDispatchCutoff, staleDispatchCutoff).all<{ id: string; user_id: string }>();
-    for (const { id: jobId, user_id: userId } of staleJobs.results) {
-      const recovered = await env.DB.prepare(
-        `UPDATE backup_jobs SET status = 'queued', error_code = NULL, dispatch_attempted_at = ?
-         WHERE id = ? AND user_id = ? AND (
-           (status = 'queued' AND dispatch_attempted_at <= ?) OR
-           (status = 'failed' AND error_code = 'queue_unavailable' AND dispatch_attempted_at <= ?)
-         )`
-      ).bind(dispatchAttemptedAt, jobId, userId, staleDispatchCutoff, staleDispatchCutoff).run();
-      if (recovered.meta.changes !== 1) continue;
-      try {
-        await env.BACKUP_QUEUE.send({ jobId, userId });
-      } catch {
-        await env.DB.prepare(
-          `UPDATE backup_jobs SET status = 'failed', error_code = 'queue_unavailable'
-           WHERE id = ? AND user_id = ? AND status = 'queued'`
-        ).bind(jobId, userId).run();
-      }
-    }
-
-    for (const { user_id: userId } of installations.results) {
-      const id = crypto.randomUUID();
-      const inserted = await env.DB.prepare(
-        `INSERT OR IGNORE INTO backup_jobs
-         (id, user_id, status, requested_at, schedule_key, dispatch_attempted_at)
-         VALUES (?, ?, 'queued', ?, ?, ?)`
-      ).bind(id, userId, requestedAt, scheduleKey, dispatchAttemptedAt).run();
-      let jobId: string = id;
-      let shouldQueue = inserted.meta.changes === 1;
-      if (!shouldQueue) {
-        const existing = await env.DB.prepare(
-          `SELECT id FROM backup_jobs
-           WHERE user_id = ? AND schedule_key = ? AND (
-             (status = 'failed' AND error_code = 'queue_unavailable') OR
-             (status = 'queued' AND dispatch_attempted_at <= ?)
-           )`
-        ).bind(userId, scheduleKey, staleDispatchCutoff).first<{ id: string }>();
-        if (existing) {
-          const retried = await env.DB.prepare(
-            `UPDATE backup_jobs
-             SET status = 'queued', error_code = NULL, dispatch_attempted_at = ?
-             WHERE id = ? AND user_id = ? AND (
-               (status = 'failed' AND error_code = 'queue_unavailable') OR
-               (status = 'queued' AND dispatch_attempted_at <= ?)
-             )`
-          ).bind(dispatchAttemptedAt, existing.id, userId, staleDispatchCutoff).run();
-          shouldQueue = retried.meta.changes === 1;
-          jobId = existing.id;
-        }
-      }
-      if (!shouldQueue) continue;
-      try {
-        await env.BACKUP_QUEUE.send({ jobId, userId });
-      } catch {
-        await env.DB.prepare(
-          `UPDATE backup_jobs SET status = 'failed', error_code = 'queue_unavailable'
-           WHERE id = ? AND user_id = ? AND status = 'queued'`
-        ).bind(jobId, userId).run();
-      }
-    }
+  async scheduled(_controller: ScheduledController, env: Env) {
+    await dispatchPendingGitHubSessionSyncs(env);
   },
 } satisfies ExportedHandler<Env>;
 

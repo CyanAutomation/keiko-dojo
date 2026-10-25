@@ -6,7 +6,6 @@
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     "ENVIRONMENT": "local",
-    "SCHEDULED_BACKUPS_ENABLED": "true",
     "AUTH_JWKS_URL": "http://localhost:9002/api/auth/jwks",
     "AUTH_ISSUER": "http://localhost:9002",
     "AUTH_AUDIENCE": "keiko-dojo-api",
@@ -41,7 +40,7 @@
       "dead_letter_queue": "keiko-dojo-backups-local-dlq"
     }]
   },
-  "triggers": { "crons": ["0 2 * * *"] },
+  "triggers": { "crons": ["* * * * *"] },
   "env": {
     "production": {
       "name": "keiko-dojo",
@@ -54,10 +53,9 @@
           "dead_letter_queue": "keiko-dojo-backups-dlq"
         }]
       },
-      "triggers": { "crons": ["0 2 * * *"] },
+      "triggers": { "crons": ["* * * * *"] },
       "vars": {
         "ENVIRONMENT": "production",
-        "SCHEDULED_BACKUPS_ENABLED": "true",
         "AUTH_JWKS_URL": "https://matmetrics-teal.vercel.app/api/auth/jwks",
         "AUTH_ISSUER": "https://matmetrics-teal.vercel.app",
         "AUTH_AUDIENCE": "keiko-dojo-api",
