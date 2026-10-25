@@ -1,6 +1,5 @@
 import { importPKCS8, SignJWT } from 'jose';
 import { createPrivateKey } from 'node:crypto';
-import type { SnapshotSession } from '../domain/backup-snapshot';
 import { isSessionCategory } from '../domain/session';
 import { isSafeSessionMarkdownPath } from '../domain/github-session-markdown';
 import { configuredGitHubAppId } from './github-app-config';
@@ -479,7 +478,17 @@ type MarkdownSession = {
   videoUrl?: string;
 };
 
-function decodeSessionPayload(row: SnapshotSession): Record<string, unknown> {
+export type GitHubSessionRow = {
+  id: string;
+  session_date: string;
+  category: string;
+  effort: number;
+  payload: string;
+  revision: number;
+  updated_at: string;
+};
+
+function decodeSessionPayload(row: GitHubSessionRow): Record<string, unknown> {
   let value: unknown;
   try { value = JSON.parse(row.payload); } catch { throw new Error('Stored session payload is invalid'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -488,19 +497,19 @@ function decodeSessionPayload(row: SnapshotSession): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function hasValidSessionId(session: Record<string, unknown>, row: SnapshotSession): boolean {
+function hasValidSessionId(session: Record<string, unknown>, row: GitHubSessionRow): boolean {
   return typeof session.id === 'string' &&
     session.id === row.id &&
     /^[A-Za-z0-9_-]{1,100}$/.test(session.id);
 }
 
-function hasValidSessionDate(session: Record<string, unknown>, row: SnapshotSession): boolean {
+function hasValidSessionDate(session: Record<string, unknown>, row: GitHubSessionRow): boolean {
   return typeof session.date === 'string' &&
     session.date === row.session_date &&
     validSessionDate(session.date);
 }
 
-function hasValidSessionEffort(session: Record<string, unknown>, row: SnapshotSession): boolean {
+function hasValidSessionEffort(session: Record<string, unknown>, row: GitHubSessionRow): boolean {
   return typeof session.effort === 'number' &&
     Number.isInteger(session.effort) &&
     session.effort >= 1 &&
@@ -508,15 +517,15 @@ function hasValidSessionEffort(session: Record<string, unknown>, row: SnapshotSe
     session.effort === row.effort;
 }
 
-function hasValidSessionCategory(session: Record<string, unknown>, row: SnapshotSession): boolean {
+function hasValidSessionCategory(session: Record<string, unknown>, row: GitHubSessionRow): boolean {
   return typeof session.category === 'string' &&
     session.category === row.category &&
     isSessionCategory(session.category);
 }
 
-function matchesSnapshotIdentity(
+function matchesStoredSessionIdentity(
   session: Record<string, unknown>,
-  row: SnapshotSession
+  row: GitHubSessionRow
 ): session is Record<string, unknown> & Pick<MarkdownSession, 'id' | 'date' | 'effort' | 'category'> {
   return hasValidSessionId(session, row) &&
     hasValidSessionDate(session, row) &&
@@ -552,14 +561,14 @@ function hasValidOptionalFields(session: Record<string, unknown>): boolean {
 
 function isValidMarkdownSession(
   session: Record<string, unknown>,
-  row: SnapshotSession
+  row: GitHubSessionRow
 ): session is Record<string, unknown> & MarkdownSession {
-  return matchesSnapshotIdentity(session, row) &&
+  return matchesStoredSessionIdentity(session, row) &&
     hasValidTechniques(session) &&
     hasValidOptionalFields(session);
 }
 
-function markdownSession(row: SnapshotSession): MarkdownSession {
+function markdownSession(row: GitHubSessionRow): MarkdownSession {
   const session = decodeSessionPayload(row);
   if (!isValidMarkdownSession(session, row)) {
     throw new Error('Stored session payload is invalid');
@@ -615,10 +624,14 @@ function sessionMarkdown(session: MarkdownSession): string {
   return `---\n${frontmatter.join('\n')}\n---\n\n# ${session.date} - Judo Session: ${session.category}\n\n## Techniques Practiced\n${techniques}\n\n## Session Description\n\n${escapeMarkdown(session.description ?? '')}\n\n## Notes\n\n${escapeMarkdown(session.notes ?? '')}\n`;
 }
 
-function sessionFilePath(session: Pick<MarkdownSession, 'id' | 'date'>): string {
+export function githubSessionMarkdownPath(session: Pick<MarkdownSession, 'id' | 'date'>): string {
   const compactDate = session.date.replaceAll('-', '');
   const [year, month] = session.date.split('-');
   return `data/${year}/${month}/${compactDate}-matmetrics-${session.id}.md`;
+}
+
+export function githubSessionMarkdownPathForRow(row: GitHubSessionRow): string {
+  return githubSessionMarkdownPath(markdownSession(row));
 }
 
 async function writeSessionMarkdown(
@@ -652,21 +665,50 @@ async function writeSessionMarkdown(
   }));
 }
 
-export async function writeGitHubBackup(
+async function deleteSessionMarkdown(
+  token: string,
+  owner: string,
+  repository: string,
+  path: string,
+  commitMessage: string
+): Promise<void> {
+  if (!isSafeSessionMarkdownPath(path)) throw new Error('GitHub session path is invalid');
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
+  const existing = await githubFetch(url, token);
+  if (existing.status === 404) return;
+  const file = await responseJson<{ sha?: unknown }>(existing);
+  if (typeof file.sha !== 'string') throw new Error('GitHub session file revision is missing');
+  await responseJson(await githubFetch(url, token, 'DELETE', {
+    message: commitMessage,
+    sha: file.sha,
+  }));
+}
+
+export function isKeikoSessionMarkdownPath(path: string): boolean {
+  return isSafeSessionMarkdownPath(path) &&
+    /^data\/\d{4}\/(0[1-9]|1[0-2])\/\d{8}-matmetrics-[A-Za-z0-9_-]{1,100}\.md$/.test(path);
+}
+
+export async function syncGitHubSessionMarkdown(
   env: GitHubAppEnvironment,
   installation: GitHubInstallation,
-  snapshotId: string,
-  createdAt: string,
-  sessions: SnapshotSession[]
-): Promise<void> {
+  sessions: GitHubSessionRow[],
+  deletePaths: string[] = []
+): Promise<Array<{ id: string; path: string; revision: number }>> {
   const files = sessions.map((row) => {
     const session = markdownSession(row);
     return {
-      path: sessionFilePath(session),
+      id: session.id,
+      revision: row.revision,
+      path: githubSessionMarkdownPath(session),
       markdown: sessionMarkdown(session),
       sessionDate: row.session_date,
     };
   });
+  const currentPaths = new Set(files.map((file) => file.path));
+  const stalePaths = [...new Set(deletePaths)].filter((path) =>
+    isKeikoSessionMarkdownPath(path) && !currentPaths.has(path)
+  );
 
   let phase = 'installation_token_request';
   try {
@@ -679,12 +721,23 @@ export async function writeGitHubBackup(
         installation.repository_name,
         file.path,
         file.markdown,
-        `Keiko Dojo backup ${snapshotId} (${createdAt}): ${file.sessionDate}`
+        `Keiko Dojo backup session (${file.sessionDate}): ${file.id}`
       );
     }
+    phase = 'session_deletions';
+    for (const path of stalePaths) {
+      await deleteSessionMarkdown(
+        token,
+        installation.repository_owner,
+        installation.repository_name,
+        path,
+        'Keiko Dojo backup remove deleted session'
+      );
+    }
+    return files.map(({ id, path, revision }) => ({ id, path, revision }));
   } catch (error) {
     const details = safeTransportDetails(error);
-    console.error('github_backup_failed', {
+    console.error('github_session_sync_failed', {
       phase,
       causeName: error instanceof Error ? error.name : null,
       causeCode: details.causeCode ?? null,

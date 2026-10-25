@@ -10,6 +10,7 @@ import {
   listSelectedGitHubSessionMarkdown,
   updateSelectedGitHubMarkdown,
 } from '../integrations/github-app';
+import { dispatchGitHubSessionSync } from '../application/github-session-sync-queue';
 import { authFailureResponse } from './auth-errors';
 import { readJsonBodyLimited } from './request-body';
 import { jsonError, jsonResponse } from './responses';
@@ -145,21 +146,36 @@ async function createSyncJob(request: Request, env: Env, requestId: string): Pro
   if (!installation) return jsonError(requestId, 409, 'not_found', 'Connect a GitHub App repository first');
   const id = crypto.randomUUID();
   const requestedAt = new Date().toISOString();
+  const nextSyncAt = requestedAt;
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO backup_jobs (id, user_id, status, requested_at) VALUES (?, ?, 'queued', ?)`).bind(id, principal.userId, requestedAt),
     env.DB.prepare(
       `INSERT INTO github_operation_jobs (id, user_id, type, status, payload, created_at, updated_at)
        VALUES (?, ?, 'github-sync-all', 'queued', '{}', ?, ?)`
     ).bind(id, principal.userId, requestedAt, requestedAt),
+    env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at)
+       VALUES (?, ?, 1, 1, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         repository_id = excluded.repository_id,
+         generation = github_session_sync_state.generation + 1,
+         full_sync_required = 1,
+         next_sync_at = excluded.next_sync_at,
+         dispatch_after = NULL,
+         last_error = NULL`
+    ).bind(principal.userId, installation.repository_id, nextSyncAt),
   ]);
-  try {
-    await env.BACKUP_QUEUE.send({ jobId: id, userId: principal.userId, operationId: id });
-  } catch {
+  const queued = await dispatchGitHubSessionSync(env, principal.userId, {
+    immediate: true,
+    operationId: id,
+    force: true,
+  });
+  if (!queued) {
     const failedAt = new Date().toISOString();
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE backup_jobs SET status = 'failed', error_code = 'queue_unavailable' WHERE id = ? AND user_id = ?`).bind(id, principal.userId),
-      env.DB.prepare(`UPDATE github_operation_jobs SET status = 'failed', error_message = 'queue_unavailable', updated_at = ?, completed_at = ? WHERE id = ? AND user_id = ?`).bind(failedAt, failedAt, id, principal.userId),
-    ]);
+    await env.DB.prepare(
+      `UPDATE github_operation_jobs SET status = 'failed', error_message = 'queue_unavailable',
+       updated_at = ?, completed_at = ? WHERE id = ? AND user_id = ?`
+    ).bind(failedAt, failedAt, id, principal.userId).run();
     return jsonError(requestId, 503, 'internal_error', 'GitHub operation queue is unavailable');
   }
   return jsonResponse({ id, type: 'github-sync-all', status: 'queued', createdAt: requestedAt, updatedAt: requestedAt, attempts: 0 }, 202);
@@ -341,6 +357,10 @@ export async function processGitHubOperationMessage(
       `UPDATE github_operation_jobs SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
        WHERE id = ? AND user_id = ? AND status != 'completed'`
     ).bind(terminal ? 'failed' : 'queued', terminal ? errorMessage : null, updatedAt, terminal ? updatedAt : null, jobId, userId).run();
-    message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
+    if (terminal) {
+      message.ack();
+    } else {
+      message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
+    }
   }
 }

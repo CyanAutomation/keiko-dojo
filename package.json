@@ -18,7 +18,6 @@
     "cf-typegen:check": "wrangler types --check",
     "migrate:local": "wrangler d1 migrations apply keiko-dojo-local --local",
     "migrate:production": "wrangler d1 migrations apply keiko-dojo --remote --env production",
-    "backup:rehearse": "bash scripts/rehearse-d1-recovery.sh",
     "check:migrations": "wrangler d1 migrations apply keiko-dojo-local --local --persist-to .wrangler/migrations-check && wrangler d1 migrations list keiko-dojo-local --local --persist-to .wrangler/migrations-check"
   },
   "dependencies": {

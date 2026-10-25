@@ -3,7 +3,7 @@ import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { authenticateRequest } from '../src/auth/bearer-auth';
 import worker from '../src/index';
-import { processBackupMessage } from '../src/http/backups';
+import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
 
 const issuer = 'https://auth.example.test';
 const jwksUrl = `${issuer}/api/auth/jwks`;
@@ -149,14 +149,14 @@ describe('Keiko session API', () => {
     await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
   });
 
-  it('links a GitHub sync job to its D1 snapshot backup job', async () => {
+  it('queues a full Markdown sync without creating a D1 snapshot job', async () => {
     const userId = `github-sync-${crypto.randomUUID()}`;
     await env.DB.prepare(
       `INSERT INTO github_installations
        (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
        VALUES (?, ?, ?, ?, ?, ?)`
     ).bind(userId, 732, 'CyanAutomation', 'matmetrics', 88, new Date().toISOString()).run();
-    const send = vi.fn(async (_message: unknown) => {});
+    const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
     const operationEnv = Object.assign(Object.create(testEnv), {
       BACKUP_QUEUE: { send },
     }) as Env;
@@ -169,14 +169,17 @@ describe('Keiko session API', () => {
       expect(response.status).toBe(202);
       const job = await response.json() as { id: string; type: string; status: string };
       expect(job).toMatchObject({ type: 'github-sync-all', status: 'queued' });
-      expect(send).toHaveBeenCalledWith({ jobId: job.id, userId, operationId: job.id });
-      expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(job.id).first())
-        .toMatchObject({ status: 'queued' });
+      expect(send).toHaveBeenCalledWith(
+        { kind: 'github-session-sync', userId, operationId: job.id },
+        { delaySeconds: 0 }
+      );
+      expect(await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'backup_snapshots'").first())
+        .toBeNull();
       expect(await env.DB.prepare('SELECT type, status FROM github_operation_jobs WHERE id = ?').bind(job.id).first())
         .toMatchObject({ type: 'github-sync-all', status: 'queued' });
     } finally {
-      await env.DB.prepare('DELETE FROM backup_jobs WHERE user_id = ?').bind(userId).run();
       await env.DB.prepare('DELETE FROM github_operation_jobs WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
       await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
     }
   });
@@ -345,33 +348,245 @@ describe('Keiko session API', () => {
     expect(secondPage.data[0]?.session.id).not.toBe(firstPage.data[0]?.session.id);
   });
 
-  it('isolates backup status and queues a backup only for the caller', async () => {
+  it('isolates GitHub Markdown sync status by the authenticated user', async () => {
     const unauthorized = await call('/v1/backups/status', 'backup-user', {}, {
       scope: 'sessions:read',
     });
     expect(unauthorized.status).toBe(403);
 
-    const requested = await call('/v1/backups', 'backup-user', {
-      method: 'POST',
-      body: JSON.stringify({}),
-    }, { scope: 'backups:write' });
-    expect(requested.status).toBe(202);
     const otherStatus = await call('/v1/backups/status', 'other-user', {}, {
       scope: 'backups:read',
     });
     expect(await otherStatus.json()).toMatchObject({
-      latestJob: null,
-      snapshots: [],
+      configured: false,
+      pending: false,
+      lastSyncedAt: null,
     });
   });
 
-  it('rejects oversized backup and MCP bodies without relying on Content-Length', async () => {
-    const backup = await call('/v1/backups', 'large-backup-body', {
-      method: 'POST',
-      body: ' '.repeat(64 * 1024 + 1),
+  it('removes D1 restore endpoints and stored snapshot tables', async () => {
+    const restore = await call('/v1/backups/snapshot-id/restore', 'restore-user', {
+      method: 'POST', body: JSON.stringify({ confirm: true }),
     }, { scope: 'backups:write' });
-    expect(backup.status).toBe(413);
-    expect(await backup.json()).toMatchObject({ error: { code: 'payload_too_large' } });
+    expect(restore.status).toBe(405);
+    const tables = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('backup_snapshots', 'restore_activity', 'backup_jobs')"
+    ).all<{ name: string }>();
+    expect(tables.results).toEqual([]);
+  });
+
+  it('coalesces successful session mutations and queues one delayed GitHub sync', async () => {
+    const userId = `session-sync-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 900, 'CyanAutomation', 'matmetrics', 91, new Date().toISOString()).run();
+    const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const requestEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    const session = { ...testSession, id: 'coalesced-session' };
+
+    try {
+      const created = await call('/v1/sessions', userId, {
+        method: 'POST', body: JSON.stringify(session),
+      }, {}, requestEnv);
+      expect(created.status).toBe(201);
+      const updated = await call(`/v1/sessions/${session.id}`, userId, {
+        method: 'PUT', headers: { 'if-match': '\"1\"' },
+        body: JSON.stringify({ ...session, notes: 'Quick correction' }),
+      }, {}, requestEnv);
+      expect(updated.status).toBe(200);
+      const stale = await call(`/v1/sessions/${session.id}`, userId, {
+        method: 'PUT', headers: { 'if-match': '"1"' },
+        body: JSON.stringify(session),
+      }, {}, requestEnv);
+      expect(stale.status).toBe(412);
+      const deleted = await call(`/v1/sessions/${session.id}`, userId, {
+        method: 'DELETE', headers: { 'if-match': '\"2\"' },
+      }, {}, requestEnv);
+      expect(deleted.status).toBe(204);
+
+      expect(send).toHaveBeenCalledOnce();
+      expect(send).toHaveBeenCalledWith(
+        { kind: 'github-session-sync', userId },
+        { delaySeconds: 60 }
+      );
+      expect(await env.DB.prepare(
+        'SELECT generation FROM github_session_sync_items WHERE user_id = ? AND session_id = ?'
+      ).bind(userId, session.id).first()).toMatchObject({ generation: 3 });
+      expect(await env.DB.prepare(
+        'SELECT generation, wake_enqueued FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ generation: 3, wake_enqueued: 1 });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('keeps a successful D1 write successful when queue dispatch fails and retries it from cron', async () => {
+    const userId = `session-sync-queue-failure-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 903, 'CyanAutomation', 'matmetrics', 93, new Date().toISOString()).run();
+    const failingSend = vi.fn(async () => { throw new Error('queue unavailable'); });
+    const failingEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send: failingSend },
+    }) as Env;
+    const session = { ...testSession, id: 'queue-failure-session' };
+
+    try {
+      const response = await call('/v1/sessions', userId, {
+        method: 'POST', body: JSON.stringify(session),
+      }, {}, failingEnv);
+      expect(response.status).toBe(201);
+      expect(await env.DB.prepare(
+        'SELECT id FROM sessions WHERE user_id = ? AND id = ?'
+      ).bind(userId, session.id).first()).toMatchObject({ id: session.id });
+      expect(await env.DB.prepare(
+        'SELECT wake_enqueued, last_error FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ wake_enqueued: 0, last_error: 'queue_unavailable' });
+
+      await env.DB.prepare(
+        'UPDATE github_session_sync_state SET dispatch_after = ?, next_sync_at = ? WHERE user_id = ?'
+      ).bind(new Date(0).toISOString(), new Date(0).toISOString(), userId).run();
+      const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
+      const scheduleEnv = Object.assign(Object.create(testEnv), { BACKUP_QUEUE: { send } }) as Env;
+      await worker.scheduled!({
+        scheduledTime: Date.now(), cron: '* * * * *', noRetry: () => {},
+      }, scheduleEnv);
+      expect(send).toHaveBeenCalledWith(
+        { kind: 'github-session-sync', userId },
+        { delaySeconds: expect.any(Number) }
+      );
+      expect(await env.DB.prepare(
+        'SELECT wake_enqueued FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ wake_enqueued: 1 });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('recovers sync work when a queue wake is stuck without an active lease', async () => {
+    const userId = `session-sync-stale-wake-${crypto.randomUUID()}`;
+    const staleTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 905, 'CyanAutomation', 'matmetrics', 95, new Date().toISOString()).run();
+    await env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at,
+        wake_enqueued, wake_enqueued_at)
+       VALUES (?, ?, 1, 1, ?, 1, ?)`
+    ).bind(userId, 95, staleTime, staleTime).run();
+    const send = vi.fn(async (_message: unknown, _options?: { delaySeconds: number }) => {});
+    const scheduleEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+
+    try {
+      await worker.scheduled!({
+        scheduledTime: Date.now(), cron: '* * * * *', noRetry: () => {},
+      }, scheduleEnv);
+      expect(send).toHaveBeenCalledWith(
+        { kind: 'github-session-sync', userId },
+        { delaySeconds: 0 }
+      );
+      expect(await env.DB.prepare(
+        'SELECT wake_enqueued, wake_enqueued_at FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ wake_enqueued: 1 });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('does not enqueue a scheduled wake before the debounce window expires', async () => {
+    const userId = `session-sync-not-due-${crypto.randomUUID()}`;
+    const nextSyncAt = new Date(Date.now() + 60_000).toISOString();
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 907, 'CyanAutomation', 'matmetrics', 97, new Date().toISOString()).run();
+    await env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at)
+       VALUES (?, ?, 1, 1, ?)`
+    ).bind(userId, 97, nextSyncAt).run();
+    const send = vi.fn(async (_message: unknown, _options?: { delaySeconds: number }) => {});
+    const scheduleEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+
+    try {
+      await worker.scheduled!({
+        scheduledTime: Date.now(), cron: '* * * * *', noRetry: () => {},
+      }, scheduleEnv);
+
+      expect(send).not.toHaveBeenCalled();
+      expect(await env.DB.prepare(
+        'SELECT wake_enqueued FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ wake_enqueued: 0 });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('waits for the latest edit in the debounce window before calling GitHub', async () => {
+    const userId = `session-sync-delay-${crypto.randomUUID()}`;
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 901, 'CyanAutomation', 'matmetrics', 92, new Date().toISOString()).run();
+    await env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at, wake_enqueued)
+       VALUES (?, ?, 1, 0, ?, 1)`
+    ).bind(userId, 92, new Date(now + 25_000).toISOString()).run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+      const send = vi.fn(async (_message: unknown, _options?: { delaySeconds: number }) => {});
+    const syncEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    const priorFetch = globalThis.fetch;
+    vi.stubGlobal('fetch', async () => { throw new Error('GitHub should not be contacted before the debounce expires'); });
+
+    try {
+      await processGitHubSessionSyncMessage({
+        body: { kind: 'github-session-sync', userId }, attempts: 1, ack, retry,
+      } as unknown as Message<{ kind: 'github-session-sync'; userId: string }>, syncEnv);
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledWith(
+        { kind: 'github-session-sync', userId },
+        { delaySeconds: expect.any(Number) }
+      );
+      expect(send.mock.calls[0]?.[1]?.delaySeconds).toBeGreaterThan(0);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('rejects oversized GitHub sync and MCP bodies without relying on Content-Length', async () => {
+    const sync = await call('/v1/github/sync-all', 'large-sync-body', {
+      method: 'POST', body: ' '.repeat(64 * 1024 + 1),
+    }, { scope: 'github:write' });
+    expect(sync.status).toBe(413);
+    expect(await sync.json()).toMatchObject({ error: { code: 'payload_too_large' } });
 
     const mcp = await call('/mcp', 'large-mcp-body', {
       method: 'POST',
@@ -379,440 +594,6 @@ describe('Keiko session API', () => {
     }, { scope: 'sessions:read' });
     expect(mcp.status).toBe(413);
     expect(await mcp.json()).toMatchObject({ error: { code: 'payload_too_large' } });
-  });
-
-  it('previews restores, requires confirmation, and preserves newer D1 records', async () => {
-    const userId = 'restore-user';
-    const id = 'restore-session';
-    const current = { ...testSession, id, notes: 'newer D1 content' };
-    await call('/v1/sessions', userId, {
-      method: 'POST',
-      body: JSON.stringify(current),
-    });
-    await env.DB.prepare(
-      `UPDATE sessions SET updated_at = ? WHERE user_id = ? AND id = ?`
-    ).bind('2099-01-01T00:00:00.000Z', userId, id).run();
-    const snapshotId = `snapshot-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    const snapshotSession = { ...current, notes: 'older backup content' };
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
-       VALUES (?, ?, 'completed', ?, ?)`
-    ).bind(jobId, userId, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:01.000Z').run();
-    const snapshotPayload = JSON.stringify([{
-      id,
-      session_date: snapshotSession.date,
-      category: snapshotSession.category,
-      effort: snapshotSession.effort,
-      payload: JSON.stringify(snapshotSession),
-      revision: 1,
-      updated_at: '2026-01-01T00:00:00.000Z',
-    }]);
-    const snapshotDigest = await crypto.subtle.digest(
-      'SHA-256',
-      new TextEncoder().encode(snapshotPayload)
-    );
-    const snapshotChecksum = Array.from(new Uint8Array(snapshotDigest), (value) =>
-      value.toString(16).padStart(2, '0')
-    ).join('');
-    await env.DB.prepare(
-      `INSERT INTO backup_snapshots
-       (id, user_id, job_id, created_at, session_count, checksum, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      snapshotId,
-      userId,
-      jobId,
-      '2026-01-01T00:00:01.000Z',
-      1,
-      snapshotChecksum,
-      snapshotPayload
-    ).run();
-
-    const preview = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
-      scope: 'backups:restore',
-    });
-    expect(await preview.json()).toMatchObject({ preservedNewerCount: 1 });
-    const unconfirmed = await call(`/v1/backups/${snapshotId}/restore`, userId, {
-      method: 'POST',
-      body: JSON.stringify({ confirm: false }),
-    }, { scope: 'backups:restore' });
-    expect(unconfirmed.status).toBe(400);
-    const restored = await call(`/v1/backups/${snapshotId}/restore`, userId, {
-      method: 'POST',
-      body: JSON.stringify({ confirm: true }),
-    }, { scope: 'backups:restore' });
-    expect(restored.status).toBe(200);
-    const record = await call(`/v1/sessions/${id}`, userId);
-    expect(await record.json()).toMatchObject({
-      data: { session: { notes: 'newer D1 content' } },
-    });
-  });
-
-  it('rejects corrupted or tampered snapshots before preview or restore', async () => {
-    const userId = `invalid-snapshot-${crypto.randomUUID()}`;
-    const snapshotId = `snapshot-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    const invalidPayload = JSON.stringify([{
-      id: 'invalid-session',
-      session_date: '2026-10-16',
-      category: 'Technical',
-      effort: 3,
-      payload: JSON.stringify({
-        id: 'invalid-session', date: '2026-10-16', effort: 3,
-        category: 'Technical', techniques: 'not-an-array',
-      }),
-      revision: 1,
-      updated_at: '2026-10-16T12:00:00.000Z',
-    }]);
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(invalidPayload));
-    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
-       VALUES (?, ?, 'completed', ?, ?)`
-    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:01.000Z').run();
-    await env.DB.prepare(
-      `INSERT INTO backup_snapshots
-       (id, user_id, job_id, created_at, session_count, checksum, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, invalidPayload).run();
-
-    const preview = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
-      scope: 'backups:restore',
-    });
-    expect(preview.status).toBe(500);
-    const restore = await call(`/v1/backups/${snapshotId}/restore`, userId, {
-      method: 'POST',
-      body: JSON.stringify({ confirm: true }),
-    }, { scope: 'backups:restore' });
-    expect(restore.status).toBe(500);
-    expect(await env.DB.prepare('SELECT id FROM sessions WHERE user_id = ?').bind(userId).all()).toMatchObject({
-      results: [],
-    });
-  });
-
-  it('rejects a snapshot with a checksum that does not match its payload', async () => {
-    const userId = `checksum-snapshot-${crypto.randomUUID()}`;
-    const snapshotId = `snapshot-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    const payload = '[]';
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
-       VALUES (?, ?, 'completed', ?, ?)`
-    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:01.000Z').run();
-    await env.DB.prepare(
-      `INSERT INTO backup_snapshots
-       (id, user_id, job_id, created_at, session_count, checksum, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 0, '0'.repeat(64), payload).run();
-
-    const response = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
-      scope: 'backups:restore',
-    });
-    expect(response.status).toBe(500);
-  });
-
-  it('rejects snapshots when a row identity disagrees with its nested session', async () => {
-    const userId = `metadata-snapshot-${crypto.randomUUID()}`;
-    const snapshotId = `snapshot-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    const session = { ...testSession, id: 'nested-session-id' };
-    const payload = JSON.stringify([{
-      id: 'row-session-id',
-      session_date: session.date,
-      category: session.category,
-      effort: session.effort,
-      payload: JSON.stringify(session),
-      revision: 1,
-      updated_at: '2026-10-16T12:00:00.000Z',
-    }]);
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
-    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at, completed_at)
-       VALUES (?, ?, 'completed', ?, ?)`
-    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:01.000Z').run();
-    await env.DB.prepare(
-      `INSERT INTO backup_snapshots
-       (id, user_id, job_id, created_at, session_count, checksum, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
-
-    const response = await call(`/v1/backups/${snapshotId}/restore-preview`, userId, {}, {
-      scope: 'backups:restore',
-    });
-    expect(response.status).toBe(500);
-  });
-
-  it('validates a saved snapshot before retrying its GitHub backup job', async () => {
-    const userId = `retry-snapshot-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    const snapshotId = `snapshot-${crypto.randomUUID()}`;
-    const payload = '[]';
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
-    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
-       VALUES (?, ?, 'queued', ?)`
-    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z').run();
-    await env.DB.prepare(
-      `INSERT INTO backup_snapshots
-       (id, user_id, job_id, created_at, session_count, checksum, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
-
-    const retry = vi.fn();
-    const ack = vi.fn();
-    await processBackupMessage({
-      body: { jobId, userId },
-      attempts: 1,
-      retry,
-      ack,
-    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
-
-    expect(retry).toHaveBeenCalledOnce();
-    expect(ack).not.toHaveBeenCalled();
-    expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(jobId).first()).toMatchObject({
-      status: 'queued',
-    });
-  });
-
-  it('marks a terminal backup retry failed before Cloudflare transfers it to the DLQ', async () => {
-    const userId = `terminal-retry-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    const snapshotId = `snapshot-${crypto.randomUUID()}`;
-    const payload = '[]';
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
-    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
-       VALUES (?, ?, 'queued', ?)`
-    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z').run();
-    await env.DB.prepare(
-      `INSERT INTO backup_snapshots
-       (id, user_id, job_id, created_at, session_count, checksum, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
-
-    const retry = vi.fn();
-    const ack = vi.fn();
-    await processBackupMessage({
-      body: { jobId, userId },
-      attempts: 5,
-      retry,
-      ack,
-    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
-
-    expect(retry).toHaveBeenCalledWith({ delaySeconds: 160 });
-    expect(ack).not.toHaveBeenCalled();
-    expect(await env.DB.prepare(
-      'SELECT status, error_code FROM backup_jobs WHERE id = ?'
-    ).bind(jobId).first()).toMatchObject({ status: 'failed', error_code: 'backup_failed' });
-  });
-
-  it('keeps retrying a failed job on its final delivery so Cloudflare can transfer it to the DLQ', async () => {
-    const userId = `terminal-redelivery-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    const snapshotId = `snapshot-${crypto.randomUUID()}`;
-    const payload = '[]';
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
-    const checksum = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at, error_code)
-       VALUES (?, ?, 'failed', ?, 'backup_failed')`
-    ).bind(jobId, userId, '2026-10-16T12:00:00.000Z').run();
-    await env.DB.prepare(
-      `INSERT INTO backup_snapshots
-       (id, user_id, job_id, created_at, session_count, checksum, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(snapshotId, userId, jobId, '2026-10-16T12:00:00.000Z', 1, checksum, payload).run();
-
-    const retry = vi.fn();
-    const ack = vi.fn();
-    await processBackupMessage({
-      body: { jobId, userId },
-      attempts: 6,
-      retry,
-      ack,
-    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
-
-    expect(retry).toHaveBeenCalledOnce();
-    expect(ack).not.toHaveBeenCalled();
-    expect(await env.DB.prepare(
-      'SELECT status, error_code FROM backup_jobs WHERE id = ?'
-    ).bind(jobId).first()).toMatchObject({ status: 'failed', error_code: 'backup_failed' });
-  });
-
-  it('creates and completes a valid snapshot for a queued backup', async () => {
-    const userId = `valid-backup-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
-       VALUES (?, ?, 'queued', ?)`
-    ).bind(jobId, userId, new Date().toISOString()).run();
-    const ack = vi.fn();
-    const retry = vi.fn();
-    await processBackupMessage({
-      body: { jobId, userId },
-      attempts: 1,
-      retry,
-      ack,
-    } as unknown as Message<{ jobId: string; userId: string }>, testEnv);
-
-    expect(ack).toHaveBeenCalledOnce();
-    expect(retry).not.toHaveBeenCalled();
-    expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(jobId).first()).toMatchObject({
-      status: 'completed',
-    });
-    expect(await env.DB.prepare('SELECT session_count FROM backup_snapshots WHERE job_id = ?').bind(jobId).first()).toMatchObject({
-      session_count: 0,
-    });
-  });
-
-  it('keeps one snapshot when duplicate queue deliveries process the same job concurrently', async () => {
-    const userId = `concurrent-backup-${crypto.randomUUID()}`;
-    const jobId = `job-${crypto.randomUUID()}`;
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs (id, user_id, status, requested_at)
-       VALUES (?, ?, 'queued', ?)`
-    ).bind(jobId, userId, new Date().toISOString()).run();
-    const acks = [vi.fn(), vi.fn()];
-    const retries = [vi.fn(), vi.fn()];
-    const messages = [0, 1].map((index) => ({
-      body: { jobId, userId },
-      attempts: 1,
-      retry: retries[index],
-      ack: acks[index],
-    } as unknown as Message<{ jobId: string; userId: string }>));
-
-    await Promise.all(messages.map((message) => processBackupMessage(message, testEnv)));
-
-    const snapshots = await env.DB.prepare(
-      'SELECT id FROM backup_snapshots WHERE job_id = ?'
-    ).bind(jobId).all();
-    expect(snapshots.results).toHaveLength(1);
-    expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(jobId).first()).toMatchObject({
-      status: 'completed',
-    });
-    expect(acks.every((ack) => ack.mock.calls.length === 1)).toBe(true);
-    expect(retries.every((retry) => retry.mock.calls.length === 0)).toBe(true);
-  });
-
-  it('deduplicates scheduled backup jobs for the same schedule occurrence', async () => {
-    const userId = `scheduled-backup-${crypto.randomUUID()}`;
-    await env.DB.prepare(
-      `INSERT INTO github_installations
-       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)`
-    ).bind(userId, 99001, 'owner', 'repo', 99001, new Date().toISOString()).run();
-    const send = vi.fn(async (_message: unknown) => {});
-    const scheduledEnv = Object.assign(Object.create(env), {
-      SCHEDULED_BACKUPS_ENABLED: 'true',
-      BACKUP_QUEUE: { send },
-    }) as Env;
-    const scheduledTime = Date.parse('2026-10-17T03:00:00.000Z');
-    const controller = { cron: '0 3 * * *', scheduledTime } as ScheduledController;
-    await worker.scheduled!(controller, scheduledEnv);
-    await worker.scheduled!(controller, scheduledEnv);
-
-    expect(send).toHaveBeenCalledTimes(1);
-    const jobs = await env.DB.prepare(
-      'SELECT id FROM backup_jobs WHERE user_id = ? AND requested_at = ?'
-    ).bind(userId, new Date(scheduledTime).toISOString()).all();
-    expect(jobs.results).toHaveLength(1);
-  });
-
-  it('does not dispatch scheduled backups when the environment kill switch is disabled', async () => {
-    const userId = `scheduled-disabled-${crypto.randomUUID()}`;
-    await env.DB.prepare(
-      `INSERT INTO github_installations
-       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)`
-    ).bind(userId, 99004, 'owner', 'repo', 99004, new Date().toISOString()).run();
-    const send = vi.fn(async (_message: unknown) => {});
-    const scheduledEnv = Object.assign(Object.create(env), {
-      SCHEDULED_BACKUPS_ENABLED: 'false',
-      BACKUP_QUEUE: { send },
-    }) as Env;
-
-    await worker.scheduled!(
-      { cron: '0 3 * * *', scheduledTime: Date.now() } as ScheduledController,
-      scheduledEnv
-    );
-
-    expect(send).not.toHaveBeenCalled();
-    expect(await env.DB.prepare(
-      'SELECT id FROM backup_jobs WHERE user_id = ?'
-    ).bind(userId).all()).toMatchObject({ results: [] });
-  });
-
-  it('retries scheduled queue dispatch after a failed send without creating a second job', async () => {
-    const userId = `scheduled-retry-${crypto.randomUUID()}`;
-    await env.DB.prepare('DELETE FROM github_installations').run();
-    await env.DB.prepare(
-      `INSERT INTO github_installations
-       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)`
-    ).bind(userId, 99002, 'owner', 'repo', 99002, new Date().toISOString()).run();
-    const send = vi.fn()
-      .mockRejectedValueOnce(new Error('queue unavailable'))
-      .mockResolvedValueOnce(undefined);
-    const scheduledEnv = Object.assign(Object.create(env), {
-      SCHEDULED_BACKUPS_ENABLED: 'true',
-      BACKUP_QUEUE: { send },
-    }) as Env;
-    const scheduledTime = Date.parse('2026-10-17T04:00:00.000Z');
-    const controller = { cron: '0 4 * * *', scheduledTime } as ScheduledController;
-    await worker.scheduled!(controller, scheduledEnv);
-    await worker.scheduled!(controller, scheduledEnv);
-
-    expect(send).toHaveBeenCalledTimes(2);
-    const jobs = await env.DB.prepare(
-      `SELECT id, status FROM backup_jobs
-       WHERE user_id = ? AND requested_at = ?`
-    ).bind(userId, new Date(scheduledTime).toISOString()).all();
-    expect(jobs.results).toHaveLength(1);
-    expect(jobs.results[0]).toMatchObject({ status: 'queued' });
-    expect(send.mock.calls[0]?.[0]).toMatchObject({ jobId: jobs.results[0]?.id });
-    expect(send.mock.calls[1]?.[0]).toMatchObject({ jobId: jobs.results[0]?.id });
-  });
-
-  it('recovers a stale scheduled job from an earlier occurrence', async () => {
-    const userId = `scheduled-stale-${crypto.randomUUID()}`;
-    await env.DB.prepare('DELETE FROM github_installations').run();
-    await env.DB.prepare(
-      `INSERT INTO github_installations
-       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)`
-    ).bind(userId, 99003, 'owner', 'repo', 99003, new Date().toISOString()).run();
-    const oldJobId = `job-${crypto.randomUUID()}`;
-    const staleDispatchAt = new Date(Date.now() - 10 * 60_000).toISOString();
-    await env.DB.prepare(
-      `INSERT INTO backup_jobs
-       (id, user_id, status, requested_at, schedule_key, dispatch_attempted_at)
-       VALUES (?, ?, 'queued', ?, ?, ?)`
-    ).bind(
-      oldJobId,
-      userId,
-      new Date(Date.now() - 24 * 60 * 60_000).toISOString(),
-      '0 3 * * *:previous-occurrence',
-      staleDispatchAt
-    ).run();
-    const send = vi.fn(async (_message: unknown) => {});
-    const scheduledEnv = Object.assign(Object.create(env), {
-      SCHEDULED_BACKUPS_ENABLED: 'true',
-      BACKUP_QUEUE: { send },
-    }) as Env;
-
-    await worker.scheduled!(
-      { cron: '0 3 * * *', scheduledTime: Date.now() } as ScheduledController,
-      scheduledEnv
-    );
-
-    expect(send).toHaveBeenCalledWith({ jobId: oldJobId, userId });
-    expect(await env.DB.prepare('SELECT dispatch_attempted_at FROM backup_jobs WHERE id = ?').bind(oldJobId).first()).not.toMatchObject({
-      dispatch_attempted_at: staleDispatchAt,
-    });
   });
 
   it('exposes read-only MCP tools backed by the same user-scoped session service', async () => {

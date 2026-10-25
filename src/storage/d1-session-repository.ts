@@ -76,7 +76,21 @@ function rowToRecord(row: SessionRow): SessionRecord {
 }
 
 export class D1SessionRepository implements SessionRepository {
-  constructor(private readonly db: D1Database) {}
+  constructor(
+    private readonly db: D1Database,
+    private readonly enqueueGitHubSync?: (userId: string) => Promise<unknown> | void
+  ) {}
+
+  private async wakeGitHubSync(userId: string): Promise<void> {
+    try {
+      await this.enqueueGitHubSync?.(userId);
+    } catch {
+      // D1 triggers persist the dirty work. Queue dispatch must not turn a
+      // successful session write into an API failure; the cron dispatcher
+      // will recover a missed wake-up.
+      console.error('github_session_sync_dispatch_failed');
+    }
+  }
 
   async analytics(userId: string): Promise<AnalyticsSummary> {
     const totals = await this.db.prepare(
@@ -116,8 +130,18 @@ export class D1SessionRepository implements SessionRepository {
       `SELECT EXISTS(
          SELECT 1 FROM github_installations WHERE user_id = ? AND revoked_at IS NULL
        ) AS configured,
-       (SELECT MAX(completed_at) FROM backup_jobs WHERE user_id = ? AND status = 'completed') AS last_backup_at`
-    ).bind(userId, userId).first<{ configured: number; last_backup_at: string | null }>();
+       COALESCE(state.last_synced_at, NULL) AS last_synced_at,
+       CASE WHEN state.generation > 0 AND (
+         state.full_sync_required = 1 OR state.generation > COALESCE(state.completed_generation, 0) OR
+         EXISTS (SELECT 1 FROM github_session_sync_items WHERE user_id = ?)
+       ) THEN 1 ELSE 0 END AS pending
+       FROM (SELECT 1) AS singleton
+       LEFT JOIN github_session_sync_state AS state ON state.user_id = ?`
+    ).bind(userId, userId, userId).first<{
+      configured: number;
+      last_synced_at: string | null;
+      pending: number;
+    }>();
 
     const periods = ['all', 'last30Days', 'last90Days'] as const;
     const distributions = Object.fromEntries(periods.map((period) => [period, {
@@ -136,7 +160,8 @@ export class D1SessionRepository implements SessionRepository {
       recentEffort: recent.results,
       backupStatus: {
         configured: backup?.configured === 1,
-        lastBackupAt: backup?.last_backup_at ?? null,
+        lastSyncedAt: backup?.last_synced_at ?? null,
+        pending: backup?.pending === 1,
       },
     };
   }
@@ -225,6 +250,7 @@ export class D1SessionRepository implements SessionRepository {
       .run();
 
     if (result.meta.changes === 0) throw new SessionAlreadyExistsError();
+    await this.wakeGitHubSync(userId);
     return { session, revision: 1 };
   }
 
@@ -257,6 +283,7 @@ export class D1SessionRepository implements SessionRepository {
       if (!current) throw new SessionNotFoundError();
       throw new SessionRevisionConflictError();
     }
+    await this.wakeGitHubSync(userId);
     return { session, revision: expectedRevision + 1 };
   }
 
@@ -277,5 +304,6 @@ export class D1SessionRepository implements SessionRepository {
       if (!current) throw new SessionNotFoundError();
       throw new SessionRevisionConflictError();
     }
+    await this.wakeGitHubSync(userId);
   }
 }
