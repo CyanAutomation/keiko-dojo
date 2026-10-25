@@ -113,6 +113,157 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('sends a stable User-Agent header on every GitHub API request', async () => {
+    const priorFetch = globalThis.fetch;
+    const requests: Array<{ url: string; headers: Headers }> = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      requests.push({ url, headers: new Headers(init?.headers) });
+      if (url.endsWith('/app/installations/731')) {
+        return Response.json({ id: 731, repository_selection: 'selected' });
+      }
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'read-only-install-token' });
+      }
+      if (url.endsWith('/installation/repositories?per_page=100')) {
+        return Response.json({ total_count: 1, repositories: [{
+          id: 88, name: 'judo-notes', full_name: 'maki/judo-notes', owner: { login: 'maki' },
+        }] });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+
+    try {
+      await expect(verifySelectedRepositoryInstallation(appEnv, 731)).resolves.toMatchObject({
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      });
+      expect(requests).toHaveLength(3);
+      expect(requests.every(({ headers }) => headers.get('user-agent') === 'Keiko-Dojo/0.1')).toBe(true);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('logs safe GitHub backup failure details without provider response text', async () => {
+    const priorFetch = globalThis.fetch;
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      return Response.json({
+        message: 'private provider detail that must not enter logs',
+      }, { status: 403 });
+    });
+
+    try {
+      await expect(writeGitHubBackup(appEnv, {
+        user_id: 'safe-backup-diagnostic',
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      }, 'snapshot-diagnostic', '2026-10-24T00:00:00.000Z', [{
+        id: 'safe-diagnostic-session',
+        session_date: '2026-10-24',
+        category: 'Technical',
+        effort: 3,
+        payload: JSON.stringify({
+          id: 'safe-diagnostic-session', date: '2026-10-24', effort: 3,
+          category: 'Technical', techniques: ['Uchi mata'],
+        }),
+        revision: 1,
+        updated_at: '2026-10-24T00:00:00.000Z',
+      }])).rejects.toThrow();
+
+      expect(errorLog).toHaveBeenCalledWith('github_backup_failed', {
+        phase: 'session_contents',
+        causeName: 'GitHubAppApiError',
+        causeCode: null,
+        status: 403,
+        reason: 'other',
+        apiErrorCategory: 'forbidden',
+      });
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private provider detail');
+    } finally {
+      errorLog.mockRestore();
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('skips a GitHub content commit when the stored Markdown already matches', async () => {
+    const priorFetch = globalThis.fetch;
+    const requests: Array<{ method: string; url: string }> = [];
+    const markdown = [
+      '---',
+      'id: "unchanged-session"',
+      'date: "2026-10-24"',
+      'effort: 3',
+      'category: "Technical"',
+      '---',
+      '',
+      '# 2026-10-24 - Judo Session: Technical',
+      '',
+      '## Techniques Practiced',
+      '- Uchi mata',
+      '',
+      '## Session Description',
+      '',
+      '',
+      '',
+      '## Notes',
+      '',
+      '',
+      '',
+    ].join('\n');
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+      requests.push({ method, url });
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      if (method === 'GET' && url.endsWith('/20261024-matmetrics-unchanged-session.md')) {
+        return Response.json({
+          sha: 'existing-content-sha',
+          encoding: 'base64',
+          content: btoa(markdown),
+        });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+
+    try {
+      await writeGitHubBackup(appEnv, {
+        user_id: 'unchanged-backup-user',
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      }, 'snapshot-unchanged', '2026-10-24T00:00:00.000Z', [{
+        id: 'unchanged-session',
+        session_date: '2026-10-24',
+        category: 'Technical',
+        effort: 3,
+        payload: JSON.stringify({
+          id: 'unchanged-session', date: '2026-10-24', effort: 3,
+          category: 'Technical', techniques: ['Uchi mata'],
+        }),
+        revision: 1,
+        updated_at: '2026-10-24T00:00:00.000Z',
+      }]);
+
+      expect(requests).toHaveLength(2);
+      expect(requests.some(({ method }) => method === 'PUT')).toBe(false);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
   it('binds a selected-repository callback to its one-time initiating account state', async () => {
     const priorFetch = globalThis.fetch;
     const previousFrontendOrigin = appEnv.MATMETRICS_FRONTEND_URL;

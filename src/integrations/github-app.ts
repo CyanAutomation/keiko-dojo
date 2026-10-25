@@ -35,6 +35,7 @@ export class GitHubInstallationVerificationError extends Error {
 class GitHubAppApiError extends Error {
   constructor(readonly status: number, readonly category: string) {
     super('GitHub App API request failed');
+    this.name = 'GitHubAppApiError';
   }
 }
 
@@ -100,6 +101,7 @@ async function githubFetch(
     headers: {
       accept: 'application/vnd.github+json',
       authorization: `Bearer ${token}`,
+      'user-agent': 'Keiko-Dojo/0.1',
       'x-github-api-version': '2022-11-28',
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     },
@@ -249,6 +251,12 @@ function base64Utf8(value: string): string {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
+}
+
+function decodeBase64Utf8(value: string): string {
+  const binary = atob(value.replace(/\s/g, ''));
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 type MarkdownSession = {
@@ -410,10 +418,17 @@ async function writeSessionMarkdown(
   let sha: string | undefined;
   const existing = await githubFetch(url, token);
   if (existing.ok) {
-    const value = await responseJson<{ sha: string }>(existing);
+    const value = await responseJson<{ sha: string; content?: string; encoding?: string }>(existing);
     sha = value.sha;
+    if (value.encoding === 'base64' && typeof value.content === 'string') {
+      try {
+        if (decodeBase64Utf8(value.content) === markdown) return;
+      } catch {
+        // A malformed Contents response should not block repairing the file.
+      }
+    }
   } else if (existing.status !== 404) {
-    throw new Error('GitHub backup lookup failed');
+    await responseJson(existing);
   }
   await responseJson(await githubFetch(url, token, 'PUT', {
     message: commitMessage,
@@ -429,17 +444,32 @@ export async function writeGitHubBackup(
   createdAt: string,
   sessions: SnapshotSession[]
 ): Promise<void> {
-  const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name);
-  for (const session of sessions) {
-    const path = sessionFilePath(session);
-    await writeSessionMarkdown(
-      token,
-      installation.repository_owner,
-      installation.repository_name,
-      path,
-      sessionMarkdown(session),
-      `Keiko Dojo backup ${snapshotId} (${createdAt}): ${session.session_date}`
-    );
+  let phase = 'installation_token_request';
+  try {
+    const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name);
+    phase = 'session_contents';
+    for (const session of sessions) {
+      const path = sessionFilePath(session);
+      await writeSessionMarkdown(
+        token,
+        installation.repository_owner,
+        installation.repository_name,
+        path,
+        sessionMarkdown(session),
+        `Keiko Dojo backup ${snapshotId} (${createdAt}): ${session.session_date}`
+      );
+    }
+  } catch (error) {
+    const details = safeTransportDetails(error);
+    console.error('github_backup_failed', {
+      phase,
+      causeName: error instanceof Error ? error.name : null,
+      causeCode: details.causeCode ?? null,
+      status: error instanceof GitHubAppApiError ? error.status : null,
+      reason: details.reason,
+      apiErrorCategory: error instanceof GitHubAppApiError ? error.category : null,
+    });
+    throw error;
   }
 }
 
