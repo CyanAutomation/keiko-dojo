@@ -12,7 +12,8 @@ tenant-scoped and writes use revision ETags. Analytics, paginated REST reads,
 backup status/request/restore, and the read-only MCP tools share Keiko's
 application service and D1 repository. Separate per-user rate-limit bindings
 protect reads, session writes, and backup/restore operations in each deployed
-environment.
+environment. The production deployment has the first 38-session on-demand
+snapshot; its first scheduled run is due at 02:00 UTC on 2026-10-26.
 
 MatMetrics retains its existing `matmetrics-api` bearer-token verifier and
 browser auth workflow. For allowlisted accounts, its existing session routes
@@ -37,6 +38,14 @@ merge behavior that preserves newer D1 records. The GitHub App private key is
 the only additional long-lived credential required for GitHub App API access;
 installation access tokens are short-lived, repository-scoped, and never
 stored. GitHub sync failures do not block normal D1 session writes.
+
+The workspace now also implements selected-repository GitHub health checks,
+Log Doctor scans and guarded fixes, and on-demand sync-all as Keiko queue jobs.
+Job reads are tenant-scoped. MatMetrics routes the allowlisted account's
+existing GitHub controls through Keiko, polls job results, and provides a
+selected GitHub App connect/disconnect panel. Other accounts retain the
+existing MatMetrics GitHub path. These changes are local and tested; migration
+0006 and the application changes have not been deployed.
 
 The MatMetrics importer is dry-run by default. It reports parse failures,
 duplicate IDs, already-present records, payload mismatches, Keiko-only records,
@@ -73,6 +82,10 @@ account is not switched automatically by the importer.
 - MatMetrics server-side bearer-to-session binding, cookie allowlisting,
   CSRF checks, redirect rejection, upstream JWT verification, Keiko forwarding,
   and account allowlist routing through existing `/api/sessions*` routes.
+- Local implementation of Keiko-backed GitHub health, sync-all, and Log Doctor
+  jobs; selected-repository GitHub App settings in MatMetrics; and lossless
+  Markdown normalization that retains Keiko's exact text payload. This work
+  includes D1 migration 0006 and is not deployed yet.
 - Dry-run-first Markdown importer and integration tests for the
   Vercel-to-Cloudflare cookie boundary.
 - OpenAPI, auth decisions, setup guidance, and CI tests/type/migration checks.
@@ -80,18 +93,22 @@ account is not switched automatically by the importer.
 ## Remaining rollout work
 
 1. **Observe the production schedule.** The first production snapshot was
-   requested on demand and verified with 38 records. Confirm the next scheduled
-   run completes, then continue monitoring the sanitized Worker logs and backup
-   status. Staging remains disabled while production writes to the shared
-   repository. Keep the account allowlist limited to the existing user.
-2. **Move remaining GitHub services after the pilot settles.** The production
-   cutover is complete, but one scheduled run has not yet occurred. After that
-   run succeeds, move the remaining applicable GitHub sync, health, and Log
-   Doctor operations behind Keiko's authenticated API and background jobs.
-   Preserve their current UI contracts and require the selected-repository
-   GitHub App connection. Keep training-plan insights and AI features in
-   MatMetrics until their data-use policy is approved.
-3. **Onboard additional accounts separately.** Keep the current production
+   requested on demand and verified with 38 records. Confirm the first
+   scheduled run completes before deploying migration 0006 or routing the
+   remaining GitHub operations to Keiko. Continue monitoring sanitized Worker
+   logs and backup status. Keep the allowlist limited to the existing user.
+2. **Deploy and verify the GitHub service move.** Apply migration 0006 to
+   production, deploy the Keiko Worker and MatMetrics Production code, then
+   verify selected-repository connect/disconnect, health, 38-session sync,
+   Log Doctor scan/preview/apply, tenant-scoped job polling, and retry/DLQ
+   behavior. Training-plan insights and AI features remain in MatMetrics until
+   their data-use policy is approved.
+3. **Remove Staging after Production verification.** Once the new Production
+   Worker and Vercel deployment pass those checks and a production backup job
+   completes, remove the Staging Worker, D1 database, queues, dead-letter queue,
+   rate-limit namespaces, GitHub App connection/secrets, and Staging Wrangler
+   configuration and scripts. Retain the production and local environments.
+4. **Onboard additional accounts separately.** Keep the current production
    allowlist scoped to the existing Better Auth user. Before adding another
    account, define its GitHub App installation and repository scope, repeat the
    import/backup/recovery checks, and verify tenant isolation with tests.
@@ -106,7 +123,8 @@ session data.
 
 Production D1 and queues are deployed and contain the existing account's
 38 sessions. MatMetrics Production routes only the allowlisted account to the
-Keiko Production Worker. The staging Worker remains available for recovery
-comparison but its scheduled backup switch is off. Do not add more users or
-move the remaining shared GitHub services until the scheduled production
-backup has completed and the single-account pilot remains healthy.
+Keiko Production Worker. The Staging Worker remains available for recovery
+comparison but its scheduled backup switch is off. Do not add more users,
+deploy the remaining shared GitHub services, or remove Staging until the
+scheduled production backup has completed and the single-account pilot remains
+healthy.

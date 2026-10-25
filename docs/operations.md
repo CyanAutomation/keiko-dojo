@@ -2,7 +2,9 @@
 
 Keiko's local test configuration is self-contained. The staging and
 production D1 databases, backup queues, and dead-letter queues are deployed;
-all five migrations are applied in both environments. Staging and production
+all five deployed migrations are applied in both environments. Migration 0006
+adds the GitHub operation-job table and is local only until the approved
+Production rollout. Staging and production
 contain the same 38 sessions and matching training analytics. The production
 MatMetrics gateway passes authenticated create/read/delete smoke checks
 (201/200/204, then 404), and a route-location check confirmed the active app
@@ -189,12 +191,21 @@ or differ, keep writes paused and reconcile from the Markdown copy and Keiko's
 D1 snapshot before switching storage. The importer only imports into Keiko; it
 is not a reverse importer.
 
-After the pilot's first scheduled production backup completes, migrate the
-remaining applicable GitHub sync, health, and Log Doctor operations behind
-Keiko's authenticated API and background jobs. Preserve the current UI
-contracts and restrict repository access to the selected GitHub App
-installation. Keep training-plan insights and AI features in MatMetrics until
-their data-use policy is approved.
+The workspace now implements GitHub health checks, sync-all, Log Doctor scans,
+and confirmed fixes behind Keiko's authenticated API and Queue jobs. MatMetrics
+uses the selected GitHub App installation for the allowlisted account, polls
+tenant-scoped job status, and preserves the existing UI result contracts. The
+Keiko session Markdown normalizer retains its lossless text payload. Tests and
+type checks pass locally; this code and migration 0006 have not been deployed.
+
+Wait for the first scheduled production backup, then apply migration 0006 and
+deploy Keiko and MatMetrics. Verify connect/disconnect, health, 38-session
+sync, Log Doctor scan/preview/apply, tenant-scoped polling, and Queue retry/DLQ
+behavior. After those Production checks and a completed backup job, remove the
+Staging Worker, D1 database, queues and dead-letter queue, rate-limit
+namespaces, GitHub App connection/secrets, Wrangler environment, and staging
+scripts. Training-plan insights and AI features remain in MatMetrics until the
+data-use policy is approved.
 
 ## Monitoring
 
@@ -205,8 +216,7 @@ credentials are not logged.
 
 ## Remaining service moves
 
-MatMetrics continues to own training-plan insights and AI features. GitHub
-sync, health, and Log Doctor operations have not yet moved behind Keiko; move
-them after the single-account production session cutover is stable if Keiko is
-to become the shared backend for those services. Do not send session data to
-an AI provider until the data-use policy is approved.
+MatMetrics continues to own training-plan insights and AI features. The
+GitHub-service move is implemented locally and awaits the production schedule
+gate and deployment. Do not send session data to an AI provider until the
+data-use policy is approved.
