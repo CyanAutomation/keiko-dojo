@@ -29,7 +29,8 @@
   ],
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 0.1
+    "head_sampling_rate": 0.1,
+    "redact_query_string": true
   },
   "queues": {
     "producers": [{ "binding": "BACKUP_QUEUE", "queue": "keiko-dojo-backups-local" }],
