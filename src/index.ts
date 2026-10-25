@@ -5,6 +5,7 @@ import { jsonError, jsonResponse } from './http/responses';
 import { authenticateRequest, AuthFailure } from './auth/bearer-auth';
 import { authFailureResponse } from './http/auth-errors';
 import { handleBackupRequest, processBackupMessage } from './http/backups';
+import { handleGitHubOperationRequest, processGitHubOperationMessage } from './http/github-operations';
 import { handleMcpRequest } from './http/mcp';
 
 function normalizedPath(pathname: string): string {
@@ -21,6 +22,9 @@ async function handleRequest(
   if (url.pathname === '/readyz') return handleReadinessCheck(request, env, requestId);
   if (url.pathname === '/v1/analytics/summary') {
     return handleAnalyticsSummary(request, env, requestId);
+  }
+  if (url.pathname.startsWith('/v1/github/')) {
+    return handleGitHubOperationRequest(request, env, requestId);
   }
   if (url.pathname.startsWith('/v1/backups')) {
     return handleBackupRequest(request, env, requestId);
@@ -136,11 +140,23 @@ const worker = {
       const value = message.body;
       if (
         value && typeof value === 'object' &&
+        'kind' in value && value.kind === 'github-operation' &&
+        'jobId' in value && typeof value.jobId === 'string' &&
+        'userId' in value && typeof value.userId === 'string'
+      ) {
+        await processGitHubOperationMessage(
+          message as Message<{ kind: 'github-operation'; jobId: string; userId: string }>,
+          env
+        );
+        continue;
+      }
+      if (
+        value && typeof value === 'object' &&
         'jobId' in value && typeof value.jobId === 'string' &&
         'userId' in value && typeof value.userId === 'string'
       ) {
         await processBackupMessage(
-          message as Message<{ jobId: string; userId: string }>,
+          message as Message<{ jobId: string; userId: string; operationId?: string }>,
           env
         );
       } else {

@@ -104,6 +104,79 @@ afterAll(() => {
 });
 
 describe('Keiko session API', () => {
+  it('queues only selected-repository GitHub operations and scopes job access to its owner', async () => {
+    const userId = `github-operation-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 731, 'CyanAutomation', 'matmetrics', 88, new Date().toISOString()).run();
+
+    const arbitraryRepository = await call('/v1/github/health', userId, {
+      method: 'POST', body: JSON.stringify({ owner: 'attacker', repo: 'elsewhere' }),
+    }, { scope: 'github:read' });
+    expect(arbitraryRepository.status).toBe(400);
+
+    const queued = await call('/v1/github/health', userId, {
+      method: 'POST', body: '{}',
+    }, { scope: 'github:read' });
+    expect(queued.status).toBe(202);
+    const job = await queued.json() as { id: string; type: string; status: string };
+    expect(job).toMatchObject({ type: 'github-health', status: 'queued' });
+
+    const anotherUser = await call(`/v1/github/jobs/${job.id}`, `${userId}-other`, {}, { scope: 'github:read' });
+    expect(anotherUser.status).toBe(404);
+    const owner = await call(`/v1/github/jobs/${job.id}`, userId, {}, { scope: 'github:read' });
+    expect(owner.status).toBe(200);
+    expect(await owner.json()).toMatchObject({ id: job.id, type: 'github-health', status: 'queued' });
+    await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+  });
+
+  it('links a GitHub sync job to its D1 snapshot backup job', async () => {
+    const userId = `github-sync-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 732, 'CyanAutomation', 'matmetrics', 88, new Date().toISOString()).run();
+    const send = vi.fn(async (_message: unknown) => {});
+    const operationEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+
+    try {
+      const response = await call('/v1/github/sync-all', userId, {
+        method: 'POST', body: '{}',
+      }, { scope: 'github:write' }, operationEnv);
+
+      expect(response.status).toBe(202);
+      const job = await response.json() as { id: string; type: string; status: string };
+      expect(job).toMatchObject({ type: 'github-sync-all', status: 'queued' });
+      expect(send).toHaveBeenCalledWith({ jobId: job.id, userId, operationId: job.id });
+      expect(await env.DB.prepare('SELECT status FROM backup_jobs WHERE id = ?').bind(job.id).first())
+        .toMatchObject({ status: 'queued' });
+      expect(await env.DB.prepare('SELECT type, status FROM github_operation_jobs WHERE id = ?').bind(job.id).first())
+        .toMatchObject({ type: 'github-sync-all', status: 'queued' });
+    } finally {
+      await env.DB.prepare('DELETE FROM backup_jobs WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('rejects unsafe Log Doctor paths and requires explicit apply confirmation', async () => {
+    const userId = `github-fix-validation-${crypto.randomUUID()}`;
+    const unsafePath = await call('/v1/github/log-doctor/fix', userId, {
+      method: 'POST', body: JSON.stringify({ mode: 'dry-run', paths: ['data/2026/10/../../secrets.md'] }),
+    }, { scope: 'github:write' });
+    expect(unsafePath.status).toBe(400);
+
+    const unconfirmedApply = await call('/v1/github/log-doctor/fix', userId, {
+      method: 'POST', body: JSON.stringify({ mode: 'apply', paths: ['data/2026/10/20261024-matmetrics-session-1.md'] }),
+    }, { scope: 'github:write' });
+    expect(unconfirmedApply.status).toBe(400);
+  });
+
   it('requires a Keiko-only audience, subject, expiry, and operation scope', async () => {
     const wrongAudience = await call('/v1/sessions', 'user-a', {}, {
       aud: 'matmetrics-api',

@@ -16,7 +16,7 @@ import { authFailureResponse } from './auth-errors';
 import { readJsonBodyLimited } from './request-body';
 import { jsonError, jsonResponse } from './responses';
 
-type BackupMessage = { jobId: string; userId: string };
+type BackupMessage = { jobId: string; userId: string; operationId?: string };
 
 type BodyObjectResult =
   | { ok: true; value: Record<string, unknown> }
@@ -351,19 +351,42 @@ export async function processBackupMessage(
   message: Message<BackupMessage>,
   env: Env
 ): Promise<void> {
-  const { jobId, userId } = message.body;
+  const { jobId, userId, operationId } = message.body;
   const job = await env.DB.prepare(
     'SELECT status FROM backup_jobs WHERE id = ? AND user_id = ?'
   ).bind(jobId, userId).first<{ status: string }>();
   // Keep retrying failed jobs until the Queue consumer exhausts max_retries
   // and forwards the poison message to its dead-letter queue.
   if (!job || job.status === 'completed') {
+    if (operationId && job?.status === 'completed') {
+      const snapshot = await env.DB.prepare(
+        'SELECT id, session_count FROM backup_snapshots WHERE job_id = ? AND user_id = ?'
+      ).bind(jobId, userId).first<{ id: string; session_count: number }>();
+      if (snapshot) {
+        const completedAt = new Date().toISOString();
+        await env.DB.prepare(
+          `UPDATE github_operation_jobs SET status = 'completed', result = ?, error_message = NULL,
+           updated_at = ?, completed_at = ? WHERE id = ? AND user_id = ? AND status != 'completed'`
+        ).bind(JSON.stringify({
+          success: true,
+          message: `Synced ${snapshot.session_count} training session(s) to GitHub.`,
+          sessionCount: snapshot.session_count,
+          snapshotId: snapshot.id,
+        }), completedAt, completedAt, operationId, userId).run();
+      }
+    }
     message.ack();
     return;
   }
   await env.DB.prepare(
     `UPDATE backup_jobs SET status = 'running', error_code = NULL WHERE id = ? AND user_id = ? AND status IN ('queued', 'running')`
   ).bind(jobId, userId).run();
+  if (operationId) {
+    await env.DB.prepare(
+      `UPDATE github_operation_jobs SET status = 'running', error_message = NULL,
+       attempts = attempts + 1, updated_at = ? WHERE id = ? AND user_id = ? AND status IN ('queued', 'running')`
+    ).bind(new Date().toISOString(), operationId, userId).run();
+  }
   try {
     const rows = await env.DB.prepare(
       `SELECT id, session_date, category, effort, payload, revision, updated_at
@@ -420,13 +443,29 @@ export async function processBackupMessage(
       repository_name: string;
       repository_id: number;
     }>();
+    if (operationId && !installation) throw new Error('GitHub App connection was removed');
     if (installation && snapshotId && createdAt) {
       await writeGitHubBackup(env, installation, snapshotId, createdAt, snapshotRows);
     }
     const completedAt = new Date().toISOString();
-    await env.DB.prepare(
+    const backupCompletion = env.DB.prepare(
       `UPDATE backup_jobs SET status = 'completed', completed_at = ?, error_code = NULL WHERE id = ? AND user_id = ?`
-    ).bind(completedAt, jobId, userId).run();
+    ).bind(completedAt, jobId, userId);
+    if (operationId) {
+      const result = {
+        success: true,
+        message: `Synced ${snapshotRows.length} training session(s) to GitHub.`,
+        sessionCount: snapshotRows.length,
+        snapshotId,
+      };
+      const operationCompletion = env.DB.prepare(
+        `UPDATE github_operation_jobs SET status = 'completed', result = ?, error_message = NULL,
+         updated_at = ?, completed_at = ? WHERE id = ? AND user_id = ?`
+      ).bind(JSON.stringify(result), completedAt, completedAt, operationId, userId);
+      await env.DB.batch([backupCompletion, operationCompletion]);
+    } else {
+      await backupCompletion.run();
+    }
     message.ack();
   } catch {
     const current = await env.DB.prepare(
@@ -440,6 +479,15 @@ export async function processBackupMessage(
       `UPDATE backup_jobs SET status = ?, error_code = 'backup_failed'
        WHERE id = ? AND user_id = ? AND status != 'completed'`
     ).bind(message.attempts >= 5 ? 'failed' : 'queued', jobId, userId).run();
+    if (operationId) {
+      const failedAt = new Date().toISOString();
+      const terminal = message.attempts >= 5;
+      await env.DB.prepare(
+        `UPDATE github_operation_jobs SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
+         WHERE id = ? AND user_id = ? AND status != 'completed'`
+      ).bind(terminal ? 'failed' : 'queued', terminal ? 'backup_failed' : null, failedAt,
+        terminal ? failedAt : null, operationId, userId).run();
+    }
     message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
   }
 }

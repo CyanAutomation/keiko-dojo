@@ -32,16 +32,16 @@ server-to-server for a Keiko-only token for allowlisted accounts.
 ## Deployments
 
 Wrangler environments `staging` and `production` have separate Worker names
-and D1 bindings. Their D1 IDs and Better Auth issuer/JWKS settings are
-configured. The staging GitHub App is installed only on
-`CyanAutomation/matmetrics` with Contents read/write, and its private key is
-configured as a Worker secret. Its stateful connection targets that repository,
-and the latest staging backup completed for all 37 sessions. Repository
-recovery validation remains pending: the current repository has one more
-Markdown session file than staging D1. Production GitHub App settings,
-migrations, and deployment remain gated on resolving this difference and
-passing the signed-in pilot. Apply migrations to the corresponding remote
-database before routing clients to that Worker:
+and D1 bindings. The single-account session cutover is complete: Production
+contains all 38 sessions, its on-demand snapshot completed, and its Markdown
+repository copy has exact payload parity. Staging and Production currently
+contain matching 38-session datasets; Staging scheduled backups are disabled
+and Production's first scheduled run is due at 02:00 UTC on 2026-10-26. The
+current Production MatMetrics deployment points the allowlisted account at the
+Production Keiko Worker. See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md)
+for the pending GitHub-service deployment gate and Staging cleanup sequence.
+Apply migrations to the corresponding remote database before routing clients
+to that Worker:
 
 ```bash
 npm run migrate:staging
@@ -66,7 +66,9 @@ or authorize data. MCP is stateless at `/mcp` and exposes only
 The backup API uses D1 snapshots and Cloudflare Queues. A user can connect one
 GitHub App installation limited to one selected repository. Configure its
 private key only as a Wrangler secret; Keiko creates short-lived
-repository-scoped installation tokens for backup writes. See
+repository-scoped installation tokens for backup writes. The local workspace
+also implements queued GitHub health, sync-all, and Log Doctor operations for
+the allowlisted MatMetrics account; these changes are not deployed yet. See
 [`docs/operations.md`](docs/operations.md) for setup, recovery, and cutover.
 
 Architecture decisions are recorded in [`docs/decisions/`](docs/decisions/).
