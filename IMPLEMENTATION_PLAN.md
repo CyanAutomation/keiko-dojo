@@ -12,10 +12,12 @@ MatMetrics Production routes the allowlisted account to
 `matmetrics-teal.vercel.app`. The current Keiko Worker version is
 `5e2edcc7-d2f4-4a35-a434-6a164f5d199a`; MatMetrics Production deployment
 `dpl_DD42r7ZcwB6EVQ8pW2ARX8SFLY8r` is READY at commit
-`9846c37c1697362f32174754bb53a0e8627c985c`. Staging retirement is approved;
-Production verification and backup gates have passed, and the configuration
-cleanup is being prepared for review before the remaining Cloudflare resources
-are removed.
+`9846c37c1697362f32174754bb53a0e8627c985c`. Staging Cloudflare resources were
+retired after the Production verification and backup gates passed: the Worker,
+D1 database, primary queue, and dead-letter queue are deleted, and Production
+resources remain present. The Worker's GitHub private-key secret was removed
+with it. The separate Staging GitHub App installation still needs revocation;
+GitHub requires a fresh sudo-mode authentication to reach that setting.
 
 **Pre-rollout backup (2026-10-25 20:15 UTC):** A manually requested Production
 backup job completed at 20:15:49 UTC with a 38-session snapshot and no error.
@@ -99,12 +101,10 @@ account is not switched automatically by the importer.
 
 ## Remaining rollout work
 
-1. **Retire Staging resources.** Production health/readiness, the selected-repo
-   GitHub health check, all 38 synced sessions, the 38-file Log Doctor scan,
-   and the post-deployment Production backup have been verified. The Staging
-   queues are empty and the Staging D1 data is confirmed in Production. Remove
-   the Staging Worker, D1 database, backup queues, and related secrets/config.
-   Keep local and Production environments.
+1. **Revoke the Staging GitHub App installation.** The Staging Worker, D1,
+   queues, and Wrangler configuration have been removed. GitHub requires a
+   fresh sudo-mode authentication before the Staging app installation can be
+   uninstalled. Keep the Production installation untouched.
 2. **Onboard additional accounts separately.** Keep the current Production
    allowlist scoped to the existing Better Auth user. Before adding another
    account, define its GitHub App installation and repository scope, repeat the
@@ -121,6 +121,6 @@ session data.
 Production D1 contains the existing account's 38 sessions and the latest
 completed snapshot contains all 38. MatMetrics Production routes only the
 allowlisted account to the Keiko Production Worker. Keep the allowlist limited
-to the current user. Local development remains available; Staging deployment
-configuration and resources are being retired after the successful Production
-cutover.
+to the current user. Local development remains available. The Staging Worker,
+D1, queues, Wrangler environment, and scripts have been retired; only the
+separate GitHub App installation revocation remains.
