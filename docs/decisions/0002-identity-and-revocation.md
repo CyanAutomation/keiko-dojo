@@ -59,5 +59,6 @@ installation token is repository-scoped and never stored.
 - MatMetrics can migrate one account at a time without changing browser auth.
 - Until an account is on the server-side allowlist, its existing storage
   behavior remains in place.
-- Production rollout requires exact origin configuration, a valid Auth Worker
-  URL, matching Keiko issuer/JWKS configuration, and staging isolation checks.
+- Production rollout required exact origin configuration, a valid Auth Worker
+  URL, matching Keiko issuer/JWKS configuration, and Staging isolation checks
+  before the temporary Staging environment was retired.
