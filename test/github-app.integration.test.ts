@@ -3,8 +3,11 @@ import { generateKeyPairSync } from 'node:crypto';
 import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
+import { processGitHubOperationMessage } from '../src/http/github-operations';
 import {
+  checkSelectedGitHubRepository,
   GitHubInstallationVerificationError,
+  listSelectedGitHubSessionMarkdown,
   verifySelectedRepositoryInstallation,
   writeGitHubBackup,
 } from '../src/integrations/github-app';
@@ -51,6 +54,127 @@ afterAll(() => {
 });
 
 describe('GitHub App selected-repository backup adapter', () => {
+  it('queues, processes, and reports a selected-repository health job', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `health-job-${crypto.randomUUID()}`;
+    const allowRateLimit = { limit: async (_input: { key: string }) => ({ success: true }) };
+    const operationEnv = Object.assign(Object.create(appEnv), {
+      SESSION_READ_LIMITER: allowRateLimit,
+      SESSION_WRITE_LIMITER: allowRateLimit,
+      BACKUP_WRITE_LIMITER: allowRateLimit,
+    }) as Env;
+    const installation = {
+      user_id: userId, installation_id: 731,
+      repository_owner: 'CyanAutomation', repository_name: 'matmetrics', repository_id: 88,
+    };
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, installation.installation_id, installation.repository_owner,
+      installation.repository_name, installation.repository_id, new Date().toISOString()).run();
+    const token = await new SignJWT({ appUserId: userId, scope: 'github:read' })
+      .setProtectedHeader({ alg: 'EdDSA', kid: authKeyId })
+      .setSubject(userId)
+      .setIssuer('https://auth.example.test')
+      .setAudience('keiko-dojo-api')
+      .setIssuedAt()
+      .setExpirationTime('5m')
+      .sign(authPrivateKey);
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === 'https://auth.example.test/api/auth/jwks') return Response.json({ keys: [authPublicJwk] });
+      if (url.endsWith('/app/installations/731/access_tokens')) return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/CyanAutomation/matmetrics') return Response.json({ default_branch: 'main' });
+      if (url.endsWith('/git/ref/heads/main')) return Response.json({ object: { sha: 'b'.repeat(40) } });
+      throw new Error(`Unexpected GitHub API request: ${url} (${init?.method ?? 'GET'})`);
+    });
+
+    try {
+      const queued = await worker.fetch(new Request('https://keiko.example.test/v1/github/health', {
+        method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: '{}',
+      }), operationEnv);
+      expect(queued.status).toBe(202);
+      const job = await queued.json() as { id: string; type: string; status: string };
+      const ack = vi.fn();
+      const retry = vi.fn();
+      await processGitHubOperationMessage({
+        body: { kind: 'github-operation', jobId: job.id, userId },
+        attempts: 1,
+        ack,
+        retry,
+      } as unknown as Message<{ kind: 'github-operation'; jobId: string; userId: string }>, operationEnv);
+
+      expect(job).toMatchObject({ type: 'github-health', status: 'queued' });
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      const status = await worker.fetch(new Request(`https://keiko.example.test/v1/github/jobs/${job.id}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }), operationEnv);
+      expect(status.status).toBe(200);
+      expect(await status.json()).toMatchObject({
+        id: job.id,
+        type: 'github-health',
+        status: 'completed',
+        attempts: 1,
+        result: { success: true, branch: 'main' },
+      });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE user_id = ?').bind(userId).run();
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('checks and reads only the selected repository session Markdown with read permission', async () => {
+    const priorFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body?: unknown }> = [];
+    const markdown = '---\nid: "session-1"\n---\n';
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) as unknown : undefined;
+      requests.push({ url, body });
+      if (url.endsWith('/app/installations/731/access_tokens')) return Response.json({ token: 'read-token' });
+      if (url === 'https://api.github.com/repos/CyanAutomation/matmetrics') {
+        return Response.json({ default_branch: 'main' }, { headers: { 'x-ratelimit-limit': '5000', 'x-ratelimit-remaining': '4999' } });
+      }
+      if (url.endsWith('/git/ref/heads/main')) return Response.json({ object: { sha: 'a'.repeat(40) } });
+      if (url.endsWith('/git/trees/' + 'a'.repeat(40) + '?recursive=1')) {
+        return Response.json({ truncated: false, tree: [
+          { path: 'data/2026/10/20261024-matmetrics-session-1.md', type: 'blob', sha: 'blob-sha' },
+          { path: 'other/readme.md', type: 'blob', sha: 'ignored' },
+        ] });
+      }
+      if (url.includes('/contents/data/2026/10/20261024-matmetrics-session-1.md?ref=main')) {
+        return Response.json({ sha: 'blob-sha', encoding: 'base64', content: encodeBase64Utf8(markdown) });
+      }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+    const installation = {
+      user_id: 'user-a', installation_id: 731,
+      repository_owner: 'CyanAutomation', repository_name: 'matmetrics', repository_id: 88,
+    };
+
+    try {
+      const health = await checkSelectedGitHubRepository(appEnv, installation);
+      const listing = await listSelectedGitHubSessionMarkdown(appEnv, installation);
+
+      expect(health).toMatchObject({ success: true, branch: 'main', rateLimit: { limit: 5000, remaining: 4999 } });
+      expect(listing.branch).toBe('main');
+      expect(listing.files).toEqual([{ path: 'data/2026/10/20261024-matmetrics-session-1.md', sha: 'blob-sha', content: markdown }]);
+      expect(requests.filter((request) => String(request.url).endsWith('/app/installations/731/access_tokens')))
+        .toHaveLength(2);
+      expect(requests.filter((request) => String(request.url).endsWith('/app/installations/731/access_tokens'))
+        .map((request) => request.body))
+        .toEqual([
+          { repositories: ['matmetrics'], permissions: { contents: 'read' } },
+          { repositories: ['matmetrics'], permissions: { contents: 'read' } },
+        ]);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
   it.each([
     ['placeholder app ID', 'replace-with-github-app-id', 'https://github.com/apps/keiko-dojo/installations/new', 'test-private-key'],
     ['placeholder install URL', '12345', 'https://github.com/apps/replace-keiko-dojo/installations/new', 'test-private-key'],

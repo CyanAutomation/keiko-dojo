@@ -365,6 +365,135 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           description: Backup queue is unavailable.
+  /v1/github/health:
+    post:
+      summary: Queue a GitHub App connection check
+      description: Requires github:read. The connected repository is taken from the caller's selected GitHub App installation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                branch: { type: string, maxLength: 255 }
+              additionalProperties: false
+      responses:
+        '202':
+          description: GitHub health job queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubOperationJob' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/InsufficientScope' }
+        '409': { description: No GitHub App repository is connected. }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/github/sync-all:
+    post:
+      summary: Queue a full D1-to-GitHub Markdown sync
+      description: Requires github:write. Creates a D1 snapshot and writes sessions to the caller's selected repository.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '202':
+          description: Sync and backup job queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubOperationJob' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/InsufficientScope' }
+        '409': { description: No GitHub App repository is connected. }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { description: GitHub operation queue is unavailable. }
+  /v1/github/log-doctor:
+    post:
+      summary: Queue a selected-repository Markdown scan
+      description: Requires github:read. The scan is restricted to session Markdown files in the connected repository.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                branch: { type: string, maxLength: 255 }
+              additionalProperties: false
+      responses:
+        '202':
+          description: Log Doctor scan queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubOperationJob' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/InsufficientScope' }
+        '409': { description: No GitHub App repository is connected. }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/github/log-doctor/fix:
+    post:
+      summary: Queue a Log Doctor preview or confirmed fix
+      description: Requires github:write. Fix paths must identify session Markdown files in data/YYYY/MM/; apply mode requires confirmApply=true and is limited to 25 files.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode, paths]
+              properties:
+                branch: { type: string, maxLength: 255 }
+                mode: { type: string, enum: [dry-run, apply] }
+                confirmApply: { type: boolean }
+                options:
+                  type: object
+                  properties:
+                    normalizeFrontmatter: { type: boolean, enum: [true] }
+                    enforceSectionOrder: { type: boolean, enum: [true] }
+                    preserveUserContent: { type: boolean, enum: [true] }
+                  additionalProperties: false
+                paths:
+                  type: array
+                  minItems: 1
+                  maxItems: 25
+                  items: { type: string, pattern: '^data/\d{4}/\d{2}/\d{8}-matmetrics-[A-Za-z0-9_-]{1,100}\.md$' }
+              additionalProperties: false
+      responses:
+        '202':
+          description: Log Doctor fix job queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubOperationJob' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/InsufficientScope' }
+        '409': { description: No GitHub App repository is connected. }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/github/jobs/{jobId}:
+    get:
+      summary: Read a GitHub operation job
+      description: Requires github:read. Job lookup is scoped to the verified caller.
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,100}$' }
+      responses:
+        '200':
+          description: Current job status and, when completed, its operation result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubOperationJob' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/InsufficientScope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /v1/backups/{snapshotId}/restore-preview:
     get:
       summary: Preview a restore
@@ -555,6 +684,18 @@ components:
               type: [string, 'null']
             hasMore:
               type: boolean
+    GitHubOperationJob:
+      type: object
+      required: [id, type, status, attempts, createdAt, updatedAt]
+      properties:
+        id: { type: string, pattern: '^[A-Za-z0-9_-]{1,100}$' }
+        type: { enum: [github-health, log-doctor-scan, log-doctor-fix, github-sync-all] }
+        status: { enum: [queued, running, completed, failed] }
+        attempts: { type: integer, minimum: 0 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        result: { type: object, additionalProperties: true }
+        error: { type: string }
     AnalyticsSummary:
       type: object
       required: [totalSessions, averageEffort, distributions, recentEffort, backupStatus]

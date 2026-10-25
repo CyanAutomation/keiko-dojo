@@ -2,7 +2,9 @@
 
 Keiko's local test configuration is self-contained. The staging and
 production D1 databases, backup queues, and dead-letter queues are deployed;
-all five migrations are applied in both environments. Staging and production
+all five deployed migrations are applied in both environments. Migration 0006
+adds the GitHub operation-job table and is local only until the approved
+Production rollout. Staging and production
 contain the same 38 sessions and matching training analytics. The production
 MatMetrics gateway passes authenticated create/read/delete smoke checks
 (201/200/204, then 404), and a route-location check confirmed the active app
@@ -11,9 +13,11 @@ writes to production rather than staging. Production snapshot
 GitHub repository still contains 38 Markdown files with exact payload parity.
 The production GitHub App is restricted to `CyanAutomation/matmetrics`.
 Production scheduled backups are enabled and staging scheduled backups are
-disabled. The first scheduled production run remains to be observed; the prior
-D1 restore rehearsal, scope checks, retry handling, DLQ checks, and REST/MCP
-parity remain verified. The READY Vercel Production deployment
+disabled. A manual Production job completed at 20:15:49 UTC on 2026-10-25
+with all 38 sessions and no error; this satisfies the pre-migration backup
+gate. The next daily scheduled run remains due at 02:00 UTC on 2026-10-26.
+The prior D1 restore rehearsal, scope checks, retry handling, DLQ checks, and
+REST/MCP parity remain verified. The READY Vercel Production deployment
 `dpl_Cv8Y96iTgUAuJZQcoBiADwrZBfqD` at commit
 `b7a53ce3919b7b21928860b61833866b4e52d2d5` owns
 `matmetrics-teal.vercel.app`. The staging Worker remains deployed at
@@ -61,9 +65,11 @@ parity remain verified. The READY Vercel Production deployment
   than strict global quotas; monitor 429 responses in Workers Observability.
 - `SCHEDULED_BACKUPS_ENABLED` is a fail-closed cron switch: only the literal
   value `true` starts scheduled work. Local and production are enabled; staging
-  is disabled. The first on-demand production backup completed and was checked
-  before production scheduling was enabled. Observe the next scheduled run and
-  never run both schedules while the Workers share session paths.
+  is disabled. The first on-demand Production backup completed before
+  scheduling was enabled; a second manual job completed with 38 sessions at
+  20:15:49 UTC on 2026-10-25. Observe the next scheduled run as routine
+  operations. Never enable the staging schedule while the Workers share
+  session paths.
 - `Keiko Dojo Staging` and `Keiko Dojo Production` are GitHub Apps owned by
   CyanAutomation. Both have repository Contents read/write, GitHub's required
   Metadata read-only permission, no webhook, and are installed only on
@@ -173,7 +179,9 @@ The first production on-demand backup completed with a 38-session D1 snapshot.
 A post-backup `--markdown-source` dry-run reported 38 exact matches, zero parse
 failures, duplicate IDs, payload mismatches, missing records, or Keiko-only
 records. Staging scheduled backups are disabled; production's daily schedule
-is enabled. Observe the next scheduled run before expanding the rollout.
+is enabled. A second manual Production job completed with all 38 sessions at
+20:15:49 UTC on 2026-10-25, before migration 0006 and the GitHub service move.
+Observe the next scheduled run as routine operations.
 
 For rollback, pause writes and confirm Keiko's latest snapshot and repository
 Markdown copy. Remove the account from `KEIKO_SESSION_CUTOVER_USER_IDS` and
@@ -189,12 +197,22 @@ or differ, keep writes paused and reconcile from the Markdown copy and Keiko's
 D1 snapshot before switching storage. The importer only imports into Keiko; it
 is not a reverse importer.
 
-After the pilot's first scheduled production backup completes, migrate the
-remaining applicable GitHub sync, health, and Log Doctor operations behind
-Keiko's authenticated API and background jobs. Preserve the current UI
-contracts and restrict repository access to the selected GitHub App
-installation. Keep training-plan insights and AI features in MatMetrics until
-their data-use policy is approved.
+The workspace now implements GitHub health checks, sync-all, Log Doctor scans,
+and confirmed fixes behind Keiko's authenticated API and Queue jobs. MatMetrics
+uses the selected GitHub App installation for the allowlisted account, polls
+tenant-scoped job status, and preserves the existing UI result contracts. The
+Keiko session Markdown normalizer retains its lossless text payload. Tests and
+type checks pass locally; this code and migration 0006 have not been deployed.
+
+The manual Production backup gate passed at 20:15:49 UTC with all 38 sessions.
+Apply migration 0006 and deploy Keiko and MatMetrics. Verify
+connect/disconnect, health, 38-session sync, Log Doctor scan/preview/apply,
+tenant-scoped polling, and Queue retry/DLQ behavior. After those Production
+checks and a completed post-deployment backup, remove the Staging Worker, D1
+database, queues and dead-letter queue, rate-limit namespaces, GitHub App
+connection/secrets, Wrangler environment, and staging scripts. Training-plan
+insights and AI features remain in MatMetrics until the data-use policy is
+approved.
 
 ## Monitoring
 
@@ -205,8 +223,7 @@ credentials are not logged.
 
 ## Remaining service moves
 
-MatMetrics continues to own training-plan insights and AI features. GitHub
-sync, health, and Log Doctor operations have not yet moved behind Keiko; move
-them after the single-account production session cutover is stable if Keiko is
-to become the shared backend for those services. Do not send session data to
-an AI provider until the data-use policy is approved.
+MatMetrics continues to own training-plan insights and AI features. The
+GitHub-service move is implemented locally and awaits the approved Production
+migration and deployment. Do not send session data to an AI provider until the
+data-use policy is approved.

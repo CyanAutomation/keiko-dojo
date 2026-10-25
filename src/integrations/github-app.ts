@@ -2,6 +2,7 @@ import { importPKCS8, SignJWT } from 'jose';
 import { createPrivateKey } from 'node:crypto';
 import type { SnapshotSession } from '../domain/backup-snapshot';
 import { isSessionCategory } from '../domain/session';
+import { isSafeSessionMarkdownPath } from '../domain/github-session-markdown';
 import { configuredGitHubAppId } from './github-app-config';
 
 type GitHubAppEnvironment = Env & {
@@ -234,16 +235,223 @@ export async function verifySelectedRepositoryInstallation(
 async function scopedContentsToken(
   env: GitHubAppEnvironment,
   installationId: number,
-  repositoryName: string
+  repositoryName: string,
+  permission: 'read' | 'write' = 'write'
 ): Promise<string> {
   const jwt = await appJwt(env);
   const value = await responseJson<{ token: string }>(await githubFetch(
     `https://api.github.com/app/installations/${installationId}/access_tokens`,
     jwt,
     'POST',
-    { repositories: [repositoryName], permissions: { contents: 'write' } }
+    { repositories: [repositoryName], permissions: { contents: permission } }
   ));
   return value.token;
+}
+
+function repositoryUrl(installation: GitHubInstallation, suffix: string): string {
+  return `https://api.github.com/repos/${encodeURIComponent(installation.repository_owner)}/${encodeURIComponent(installation.repository_name)}${suffix}`;
+}
+
+async function limitedResponseJson<T>(response: Response, maxBytes: number): Promise<T> {
+  if (!response.ok) return responseJson<T>(response);
+  const contentLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error('GitHub response exceeds the supported size');
+  }
+  const text = await response.text();
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    throw new Error('GitHub response exceeds the supported size');
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error('GitHub returned an invalid response');
+  }
+}
+
+async function selectedRepositoryInfo(
+  token: string,
+  installation: GitHubInstallation
+): Promise<{ defaultBranch: string; response: Response }> {
+  const response = await githubFetch(repositoryUrl(installation, ''), token);
+  const repository = await limitedResponseJson<{ default_branch?: unknown }>(response, 256 * 1024);
+  if (typeof repository.default_branch !== 'string' || !repository.default_branch.trim()) {
+    throw new Error('GitHub repository does not expose a default branch');
+  }
+  return { defaultBranch: repository.default_branch, response };
+}
+
+async function resolveSelectedBranch(
+  token: string,
+  installation: GitHubInstallation,
+  requestedBranch?: string
+): Promise<{ branch: string; headSha: string; rateLimit: { limit?: number; remaining?: number; resetAt?: string } }> {
+  const repository = await selectedRepositoryInfo(token, installation);
+  const branch = requestedBranch?.trim() || repository.defaultBranch;
+  if (!branch || branch.length > 255 || /[\u0000-\u001f\u007f]/.test(branch)) {
+    throw new Error('GitHub branch is invalid');
+  }
+  const ref = await limitedResponseJson<{ object?: { sha?: unknown } }>(
+    await githubFetch(
+      repositoryUrl(installation, `/git/ref/heads/${encodeURIComponent(branch)}`),
+      token
+    ),
+    128 * 1024
+  );
+  if (typeof ref.object?.sha !== 'string' || !/^[a-f0-9]{40,64}$/i.test(ref.object.sha)) {
+    throw new Error('GitHub branch could not be resolved');
+  }
+  const limit = Number(repository.response.headers.get('x-ratelimit-limit'));
+  const remaining = Number(repository.response.headers.get('x-ratelimit-remaining'));
+  const resetSeconds = Number(repository.response.headers.get('x-ratelimit-reset'));
+  return {
+    branch,
+    headSha: ref.object.sha,
+    rateLimit: {
+      ...(Number.isFinite(limit) ? { limit } : {}),
+      ...(Number.isFinite(remaining) ? { remaining } : {}),
+      ...(Number.isFinite(resetSeconds) ? { resetAt: new Date(resetSeconds * 1000).toISOString() } : {}),
+    },
+  };
+}
+
+export async function checkSelectedGitHubRepository(
+  env: GitHubAppEnvironment,
+  installation: GitHubInstallation,
+  requestedBranch?: string
+): Promise<{
+  success: true;
+  message: string;
+  branch: string;
+  checkedAt: string;
+  rateLimit?: { limit: number; remaining: number; resetAt?: string };
+}> {
+  const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name, 'read');
+  const resolved = await resolveSelectedBranch(token, installation, requestedBranch);
+  const rateLimit = resolved.rateLimit.limit !== undefined && resolved.rateLimit.remaining !== undefined
+    ? {
+        limit: resolved.rateLimit.limit,
+        remaining: resolved.rateLimit.remaining,
+        ...(resolved.rateLimit.resetAt ? { resetAt: resolved.rateLimit.resetAt } : {}),
+      }
+    : undefined;
+  return {
+    success: true,
+    message: `Successfully connected to ${installation.repository_owner}/${installation.repository_name} on branch ${resolved.branch}`,
+    branch: resolved.branch,
+    checkedAt: new Date().toISOString(),
+    ...(rateLimit ? { rateLimit } : {}),
+  };
+}
+
+export type GitHubSessionMarkdownFile = { path: string; sha: string; content: string };
+
+const MAX_GITHUB_SESSION_FILES = 500;
+const MAX_GITHUB_MARKDOWN_BYTES = 1024 * 1024;
+const MAX_GITHUB_SESSION_SCAN_BYTES = 16 * 1024 * 1024;
+
+export async function listSelectedGitHubSessionMarkdown(
+  env: GitHubAppEnvironment,
+  installation: GitHubInstallation,
+  requestedBranch?: string
+): Promise<{ branch: string; files: GitHubSessionMarkdownFile[] }> {
+  const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name, 'read');
+  const resolved = await resolveSelectedBranch(token, installation, requestedBranch);
+  const tree = await limitedResponseJson<{
+    truncated?: unknown;
+    tree?: Array<{ path?: unknown; type?: unknown; sha?: unknown }>;
+  }>(
+    await githubFetch(repositoryUrl(installation, `/git/trees/${encodeURIComponent(resolved.headSha)}?recursive=1`), token),
+    4 * 1024 * 1024
+  );
+  if (tree.truncated === true || !Array.isArray(tree.tree)) {
+    throw new Error('GitHub session file listing exceeds the supported size');
+  }
+  const paths = tree.tree
+    .filter((entry) => entry.type === 'blob' && typeof entry.path === 'string' &&
+      /^data\/\d{4}\/\d{2}\/\d{8}-matmetrics-[A-Za-z0-9_-]{1,100}\.md$/.test(entry.path))
+    .map((entry) => ({ path: entry.path as string, sha: typeof entry.sha === 'string' ? entry.sha : '' }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  if (paths.length > MAX_GITHUB_SESSION_FILES) {
+    throw new Error('GitHub repository has too many session files to scan');
+  }
+
+  const files: GitHubSessionMarkdownFile[] = [];
+  let totalBytes = 0;
+  for (const entry of paths) {
+    const query = new URLSearchParams({ ref: resolved.branch });
+    const path = entry.path.split('/').map(encodeURIComponent).join('/');
+    const content = await limitedResponseJson<{
+      sha?: unknown;
+      encoding?: unknown;
+      content?: unknown;
+      size?: unknown;
+    }>(
+      await githubFetch(repositoryUrl(installation, `/contents/${path}?${query}`), token),
+      MAX_GITHUB_MARKDOWN_BYTES * 2
+    );
+    if (content.encoding !== 'base64' || typeof content.content !== 'string') {
+      throw new Error('GitHub session file has an unsupported encoding');
+    }
+    const decoded = decodeBase64Utf8(content.content);
+    const byteLength = new TextEncoder().encode(decoded).byteLength;
+    if (byteLength > MAX_GITHUB_MARKDOWN_BYTES) {
+      throw new Error('GitHub session file exceeds the supported size');
+    }
+    totalBytes += byteLength;
+    if (totalBytes > MAX_GITHUB_SESSION_SCAN_BYTES) {
+      throw new Error('GitHub session data exceeds the supported scan size');
+    }
+    files.push({ path: entry.path, sha: typeof content.sha === 'string' ? content.sha : entry.sha, content: decoded });
+  }
+  return { branch: resolved.branch, files };
+}
+
+export async function updateSelectedGitHubMarkdown(
+  env: GitHubAppEnvironment,
+  installation: GitHubInstallation,
+  branch: string,
+  file: GitHubSessionMarkdownFile,
+  updatedContent: string,
+  originalContent: string
+): Promise<string> {
+  if (!isSafeSessionMarkdownPath(file.path) || branch.length > 255 || /[\u0000-\u001f\u007f]/.test(branch)) {
+    throw new Error('GitHub session file update is invalid');
+  }
+  if (new TextEncoder().encode(updatedContent).byteLength > MAX_GITHUB_MARKDOWN_BYTES) {
+    throw new Error('GitHub session file exceeds the supported size');
+  }
+  const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name);
+  const path = file.path.split('/').map(encodeURIComponent).join('/');
+  const url = repositoryUrl(installation, `/contents/${path}`);
+  const body = {
+    message: 'log-doctor: normalize session markdown',
+    content: base64Utf8(updatedContent),
+    branch,
+    sha: file.sha,
+  };
+  try {
+    const response = await githubFetch(url, token, 'PUT', body);
+    const result = await limitedResponseJson<{ commit?: { sha?: unknown } }>(response, 256 * 1024);
+    return typeof result.commit?.sha === 'string' ? result.commit.sha : '';
+  } catch (error) {
+    if (!(error instanceof GitHubAppApiError) || (error.status !== 409 && error.status !== 422)) throw error;
+    const query = new URLSearchParams({ ref: branch });
+    const current = await limitedResponseJson<{ sha?: unknown; encoding?: unknown; content?: unknown }>(
+      await githubFetch(`${url}?${query}`, token), MAX_GITHUB_MARKDOWN_BYTES * 2
+    );
+    const latest = current.encoding === 'base64' && typeof current.content === 'string'
+      ? decodeBase64Utf8(current.content)
+      : '';
+    if (latest !== originalContent || typeof current.sha !== 'string') {
+      throw new Error('revision conflict: file changed after Log Doctor generated the fix; preview again before applying');
+    }
+    const retry = await limitedResponseJson<{ commit?: { sha?: unknown } }>(
+      await githubFetch(url, token, 'PUT', { ...body, sha: current.sha }),
+      256 * 1024
+    );
+    return typeof retry.commit?.sha === 'string' ? retry.commit.sha : '';
+  }
 }
 
 function base64Utf8(value: string): string {
