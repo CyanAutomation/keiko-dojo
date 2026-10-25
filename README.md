@@ -3,8 +3,8 @@
 [![CI](https://github.com/CyanAutomation/keiko-dojo/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/CyanAutomation/keiko-dojo/actions/workflows/ci.yml)
 
 Keiko Dojo is the shared API and domain service for MatMetrics and related
-training applications. The first implementation provides authenticated,
-user-scoped Judo session CRUD on Cloudflare Workers and D1.
+training applications. It provides authenticated, user-scoped Judo session CRUD
+on Cloudflare Workers and D1.
 
 ## Local development
 
@@ -31,21 +31,19 @@ server-to-server for a Keiko-only token for allowlisted accounts.
 
 ## Deployments
 
-Wrangler environments `staging` and `production` have separate Worker names
-and D1 bindings. The single-account session cutover is complete: Production
-contains all 38 sessions, its on-demand snapshot completed, and its Markdown
-repository copy has exact payload parity. Staging and Production currently
-contain matching 38-session datasets; Staging scheduled backups are disabled
-and Production's first scheduled run is due at 02:00 UTC on 2026-10-26. The
-current Production MatMetrics deployment points the allowlisted account at the
-Production Keiko Worker. See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md)
-for the pending GitHub-service deployment gate and Staging cleanup sequence.
-Apply migrations to the corresponding remote database before routing clients
-to that Worker:
+Wrangler keeps a local development configuration and a `production` remote
+environment. The single-account Production cutover is complete: Production
+contains all 38 sessions, its latest post-deployment D1 snapshot contains all
+38, and the selected MatMetrics repository has a successful 38-session sync.
+The Log Doctor scan checked all 38 training files successfully. MatMetrics
+Production routes the allowlisted account to the Production Keiko Worker. See
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for current deployment and
+environment-retirement status and [`docs/operations.md`](docs/operations.md)
+for backup and recovery procedures.
+
+Apply Production migrations before deploying a Worker change:
 
 ```bash
-npm run migrate:staging
-npm run deploy:staging
 npm run migrate:production
 npm run deploy:production
 ```
@@ -66,9 +64,9 @@ or authorize data. MCP is stateless at `/mcp` and exposes only
 The backup API uses D1 snapshots and Cloudflare Queues. A user can connect one
 GitHub App installation limited to one selected repository. Configure its
 private key only as a Wrangler secret; Keiko creates short-lived
-repository-scoped installation tokens for backup writes. The local workspace
-also implements queued GitHub health, sync-all, and Log Doctor operations for
-the allowlisted MatMetrics account; these changes are not deployed yet. See
-[`docs/operations.md`](docs/operations.md) for setup, recovery, and cutover.
+repository-scoped installation tokens for backup writes. Keiko-backed GitHub
+health checks, sync-all, and Log Doctor operations run as tenant-scoped queue
+jobs. See [`docs/operations.md`](docs/operations.md) for setup, recovery, and
+rollback.
 
 Architecture decisions are recorded in [`docs/decisions/`](docs/decisions/).

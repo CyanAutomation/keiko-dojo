@@ -43,42 +43,6 @@
   },
   "triggers": { "crons": ["0 2 * * *"] },
   "env": {
-    "staging": {
-      "name": "keiko-dojo-staging",
-      "queues": {
-        "producers": [{ "binding": "BACKUP_QUEUE", "queue": "keiko-dojo-backups-staging" }],
-        "consumers": [{
-          "queue": "keiko-dojo-backups-staging",
-          "max_batch_size": 10,
-          "max_retries": 5,
-          "dead_letter_queue": "keiko-dojo-backups-staging-dlq"
-        }]
-      },
-      "triggers": { "crons": ["0 3 * * *"] },
-      "vars": {
-        "ENVIRONMENT": "staging",
-        "SCHEDULED_BACKUPS_ENABLED": "false",
-        "AUTH_JWKS_URL": "https://matmetrics-teal.vercel.app/api/auth/jwks",
-        "AUTH_ISSUER": "https://matmetrics-teal.vercel.app",
-        "AUTH_AUDIENCE": "keiko-dojo-api",
-        "GITHUB_APP_ID": "5456778",
-        "GITHUB_APP_INSTALL_URL": "https://github.com/apps/keiko-dojo-staging/installations/new",
-        "MATMETRICS_FRONTEND_URL": "https://matmetrics-teal.vercel.app"
-      },
-      "d1_databases": [
-        {
-          "binding": "DB",
-          "database_name": "keiko-dojo-staging",
-          "database_id": "7002a569-f450-4050-bb2a-b4cba208bf59",
-          "migrations_dir": "migrations"
-        }
-      ],
-      "ratelimits": [
-        { "name": "SESSION_READ_LIMITER", "namespace_id": "119101", "simple": { "limit": 300, "period": 60 } },
-        { "name": "SESSION_WRITE_LIMITER", "namespace_id": "119102", "simple": { "limit": 120, "period": 60 } },
-        { "name": "BACKUP_WRITE_LIMITER", "namespace_id": "119103", "simple": { "limit": 10, "period": 60 } }
-      ]
-    },
     "production": {
       "name": "keiko-dojo",
       "queues": {

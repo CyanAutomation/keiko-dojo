@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <staging|production> <protected-export.sql> --confirm-export" >&2
+  echo "Usage: $0 production <protected-export.sql> --confirm-export" >&2
   exit 2
 }
 
@@ -11,7 +11,6 @@ usage() {
 environment="$1"
 export_path="$2"
 case "$environment" in
-  staging) database="keiko-dojo-staging" ;;
   production) database="keiko-dojo" ;;
   *) usage ;;
 esac
