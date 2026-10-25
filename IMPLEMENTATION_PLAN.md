@@ -1,6 +1,6 @@
 # Keiko Dojo implementation and rollout plan
 
-**Status (verified 2026-10-25):** The isolated Cloudflare staging/production resources are provisioned. Staging health/readiness return HTTP 200 and all five D1 migrations are applied. Staging contains 37 imported sessions; the complete list and analytics match the MatMetrics source (zero missing IDs or payload mismatches). A queued D1 snapshot completed and a previewed, explicitly confirmed restore of all 37 sessions succeeded with analytics unchanged. A full remote D1 SQL export was restored into an isolated local database as a rehearsal; all six application tables were queryable and the restored session count was 37. The user maintains the MatMetrics session-data backup in a separate repository, so no encrypted D1 SQL export needs to be retained outside Cloudflare. REST/MCP analytics parity and read/write scope denials were verified. The staging GitHub App is installed only on `CyanAutomation/matmetrics`, and its private key is configured. The authenticated installation callback now succeeds after adding a stable User-Agent header to GitHub API requests. A staging backup job completed for all 37 sessions, and its superseded failed queue message was acknowledged after the successful replacement backup. The main backup queue and DLQ are clear. Vercel Production variables for the one-account staging pilot are configured, and the project skips builds for Keiko backup commit messages. The refreshed Vercel Production deployment is READY at commit `438f2ff34477676769238f2ff41956e4d06d8a56` (`dpl_DmKXf6qV6JrXriRvEtTSRvT71PSz`) and owns `matmetrics-teal.vercel.app`. The MatMetrics home and JWKS proxy return HTTP 200; the unauthenticated session-list route returns HTTP 401 as expected. The authenticated pilot's session read/write flow still needs a signed-in account check. Production D1 has no Keiko application tables, and no production Worker is deployed.
+**Status (verified 2026-10-25):** Staging health/readiness return HTTP 200 and all five D1 migrations are applied. Staging contains 37 imported sessions; the list and analytics previously matched the MatMetrics API source. A queued D1 snapshot and confirmed restore completed with analytics unchanged. A full remote D1 SQL export was restored into an isolated local database with all six application tables queryable and 37 sessions. REST/MCP analytics parity, scope denials, and the latest 37-session staging backup job were verified. The GitHub repository currently has 38 valid Markdown session files: one is absent from staging D1, so repository recovery remains unverified until that record is reconciled. The staging GitHub App is connected only to `CyanAutomation/matmetrics`; its authenticated installation callback succeeds, and the main backup queue and DLQ are clear. Vercel Production is configured for the single-account staging pilot and now includes the required `CLOUDFLARE_AUTH_WORKER_HOST`. The same-commit Production redeploy is READY at commit `438f2ff34477676769238f2ff41956e4d06d8a56` (`dpl_BpKUPpffsdTnvVEQFwFCrsEdSkzH`) and owns `matmetrics-teal.vercel.app`. The signed-in session-list refresh still returns HTTP 403 after redeploy; the authenticated pilot has not passed. Production D1 remains unmigrated, with no production Worker deployment or account cutover.
 
 ## Current implementation
 
@@ -97,26 +97,29 @@ account is not switched automatically by the importer.
    this rollout. No separate MatMetrics staging origin is needed: keep the
    current production origin. Vercel Production variables now point
    `KEIKO_API_BASE_URL` at staging and allow only the existing account. The
-   refreshed Production deployment is READY and the current MatMetrics alias
-   points to it. Validate authenticated pilot reads and writes with the
-   existing account before proceeding to the Keiko Production gate.
+   READY Production deployment includes the Auth Worker hostname and owns the
+   MatMetrics alias, but the signed-in session-list refresh still returns HTTP
+   403. Diagnose and clear that read failure before attempting any session
+   write or proceeding to the Keiko Production gate.
 2. **Finish staging validation.** The staging Worker is deployed and its
    `/healthz` and `/readyz` endpoints return HTTP 200. The sole existing
    MatMetrics account has been imported and its sessions and analytics match
    the source. A D1 snapshot, restore preview, confirmed restore, successful
    queue delivery, terminal retry handling, restore confirmation safeguard,
    live DLQ handoff and cleanup, and MCP/REST scope parity have been checked.
-   Verify the connected repository backup/recovery before the pilot. Synthetic
-   identities in automated integration tests cover cross-tenant isolation; do
-   not require or create a second live account. Do not add the production user
-   ID to Keiko production before all staging gates pass.
+   Resolve the one repository-only Markdown record before marking repository
+   recovery validated or starting the pilot. Synthetic identities in automated
+   integration tests cover cross-tenant isolation; do not require or create a
+   second live account. Do not add the production user ID to Keiko production
+   before all staging gates pass.
 3. **Pilot the existing account in staging.** The existing account's 37
    sessions were imported from MatMetrics, and the complete session list and
    analytics were compared with zero missing IDs or payload mismatches. Keep
-   the Markdown copy and avoid dual writes. The Vercel Production redeploy is
-   complete and its allowlisted account is configured to use staging. Confirm
-   the one-account pilot routes to staging and verify normal session reads and
-   writes with an authenticated session. Do not route the user to Keiko
+   the Markdown copy and avoid dual writes. The Vercel Production redeploy with
+   the required Auth Worker hostname is READY, but a signed-in session-list
+   refresh still returns HTTP 403. Diagnose and clear that read failure, then
+   verify normal session reads and writes with the authenticated account before
+   proceeding. Do not route the user to Keiko
    production until the pilot and recovery checks pass.
 4. **Production cutover.** Only after staging and recovery checks pass, apply
    reviewed migrations to the already-provisioned production D1 and deploy.
@@ -125,10 +128,11 @@ account is not switched automatically by the importer.
    parity, then switch the Vercel Production `KEIKO_API_BASE_URL` to the
    production Worker for that one already-allowlisted Better Auth user ID.
    Keep scheduled backups disabled in production during the initial cutover.
-   After verifying one production backup, disable the staging cron before
-   enabling the production cron to avoid two Workers writing the same GitHub
-   session paths. Keep the existing MatMetrics repository as the session-data
-   backup and use Keiko's D1 snapshot and rehearsed restore for database
+   Before the first production backup writes to the shared GitHub repository,
+   disable the staging cron and verify that it is off. Run one production
+   backup on demand and verify it, then enable the production cron. Never run
+   both schedules while the Workers share session paths. Keep the existing
+   MatMetrics repository as the session-data backup and use Keiko's D1 snapshot and rehearsed restore for database
    recovery; no retained external SQL export is required. Monitor sanitized
    logs and metrics and keep the rollout at this account until more accounts
    are onboarded.
