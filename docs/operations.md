@@ -4,22 +4,25 @@ Keiko's local test configuration is self-contained. Separate staging and
 production D1 databases, backup queues, and dead-letter queues are provisioned.
 As of 2026-10-25, all five migrations are applied to staging and
 `/healthz` and `/readyz` return HTTP 200. The existing MatMetrics account's
-37 sessions were imported; the full list and analytics match the source with
-zero missing IDs or payload mismatches. A queued D1 snapshot and confirmed
-restore both completed, preserving the same analytics. REST/MCP analytics
-parity and scope denials were verified. A live GitHub App installation is
-connected only to `CyanAutomation/matmetrics`, and a staging backup job
-completed for all 37 sessions. The superseded failed queue message was
-acknowledged after the successful replacement backup; the main queue and DLQ
-are clear. Vercel Production variables for the single-account staging pilot
-are configured, and Vercel ignores Keiko backup commits. Production deployment
-`dpl_DmKXf6qV6JrXriRvEtTSRvT71PSz` is READY at commit
+37 sessions were imported; the list and analytics previously matched the
+MatMetrics API source. A queued D1 snapshot and confirmed restore both
+completed, preserving the same analytics. REST/MCP analytics parity and scope
+denials were verified. A live GitHub App installation is connected only to
+`CyanAutomation/matmetrics`, and the latest staging backup job completed for
+all 37 sessions. The current repository contains 38 valid Markdown session
+files: one is not present in staging D1, so repository recovery is not yet
+validated. The superseded failed queue message was acknowledged after the
+successful replacement backup; the main queue and DLQ are clear. Vercel
+Production variables for the single-account staging pilot are configured, and
+Vercel ignores Keiko backup commits. Production deployment
+`dpl_BpKUPpffsdTnvVEQFwFCrsEdSkzH` is READY at commit
 `438f2ff34477676769238f2ff41956e4d06d8a56`; it owns
 `matmetrics-teal.vercel.app`. The home page and JWKS proxy return HTTP 200,
 and the unauthenticated session-list route returns HTTP 401 as expected. The
-authenticated pilot read/write flow still needs verification with the existing
-account. Production D1 has no Keiko application tables, and no production
-Worker deployment or Keiko account cutover exists. The staging Worker is deployed at
+signed-in session-list refresh still returns HTTP 403 after redeploy, so the
+pilot read/write gate has not passed. Production D1 has no Keiko application
+tables, and no production Worker deployment or account cutover exists. The
+staging Worker is deployed at
 [`keiko-dojo-staging.scheimann.workers.dev`](https://keiko-dojo-staging.scheimann.workers.dev).
 
 ## Environment setup
@@ -44,7 +47,7 @@ Worker deployment or Keiko account cutover exists. The staging Worker is deploye
   and `KEIKO_SESSION_CUTOVER_USER_IDS` to only the existing account's Better
   Auth user ID. The variables are configured for Production only and point at
   the staging Worker. These values are active in the READY Production
-  deployment `dpl_DmKXf6qV6JrXriRvEtTSRvT71PSz` at commit
+  deployment `dpl_BpKUPpffsdTnvVEQFwFCrsEdSkzH` at commit
   `438f2ff34477676769238f2ff41956e4d06d8a56`. The current
   Vercel project has no custom-environment capacity, but this pilot does not
   require one. Keiko's staging `MATMETRICS_FRONTEND_URL` remains the exact
@@ -63,9 +66,11 @@ Worker deployment or Keiko account cutover exists. The staging Worker is deploye
   than strict global quotas; monitor 429 responses in Workers Observability.
 - `SCHEDULED_BACKUPS_ENABLED` is a fail-closed cron switch: only the literal
   value `true` starts scheduled work. Local and staging are configured `true`;
-  production is configured `false` until production cutover. When production
-  begins writing backups to the selected repository, disable staging first so
-  the two Workers cannot write the same session paths on overlapping schedules.
+  production is configured `false` until production cutover. Before the first
+  production backup writes to the shared repository, disable and verify the
+  staging cron. Keep the production cron disabled until an on-demand production
+  backup has completed and been checked, then enable production. Never run both
+  schedules while the Workers share session paths.
 - The staging GitHub App `Keiko Dojo Staging` is registered for the
   CyanAutomation account with repository Contents read/write (and GitHub's
   required Metadata read-only permission), no webhook, and Setup URL
@@ -167,8 +172,9 @@ Worker deployment or Keiko account cutover exists. The staging Worker is deploye
    MatMetrics account's session and analytics parity, D1 snapshot/restore,
    restore confirmation protection, successful queue delivery, terminal retry
    handling, live DLQ handoff and cleanup, and MCP/REST scope parity have been
-   verified. Confirm the connected GitHub repository backup/recovery before
-   proceeding. Keiko's automated integration tests use
+   verified. Resolve the one repository-only Markdown session before calling
+   the connected GitHub repository recovery validated.
+   Keiko's automated integration tests use
    synthetic identities to verify tenant isolation; a second live account is
    not required.
 2. From the MatMetrics repository root, export the current account data, run
@@ -177,24 +183,25 @@ Worker deployment or Keiko account cutover exists. The staging Worker is deploye
    the staging API configured. Review parse failures, duplicate IDs, payload
    mismatches, and existing records. Run with `--apply` only after review. The
    importer source lives in [CyanAutomation/matmetrics](https://github.com/CyanAutomation/matmetrics/blob/main/scripts/import-keiko-sessions.ts).
-3. The complete staging session list and analytics have been compared against
-   the source, with zero missing IDs or payload mismatches. Keep the original
-   Markdown copy. Vercel Production variables now point to the staging Worker
-   for the single existing account, and the Production redeploy is READY.
-   Verify authenticated session reads and writes for the controlled pilot
-   before switching the API base to Keiko Production. Switch to Keiko
-   Production only after production migration and cutover checks pass. Keep
-   the cutover allowlist limited to that one ID.
+3. The staging session list and analytics previously matched the MatMetrics
+   API source. Keep the original Markdown copy and resolve the additional
+   repository-only session before calling recovery complete. Vercel Production
+   points the single-account pilot to staging, and the required Auth Worker
+   hostname is active in the READY deployment. The signed-in session-list
+   refresh still returns HTTP 403. Diagnose and clear that read failure, then
+   verify authenticated reads and writes before switching the API base to
+   Keiko Production. Keep the cutover allowlist limited to that one ID.
 4. After all staging/recovery checks pass, apply migrations to production D1
    and deploy Keiko. Export the existing account data, repeat the importer
    dry-run/review/apply against production, compare session and analytics
    parity, then switch the Vercel Production `KEIKO_API_BASE_URL` to the
    production Worker for the already-allowlisted ID. Keep the allowlist limited
    to that one verified Better Auth user ID. Production scheduled backups stay
-   disabled during the initial cutover. After a successful production backup
-   is verified, deploy staging with `SCHEDULED_BACKUPS_ENABLED=false` and
-   production with `SCHEDULED_BACKUPS_ENABLED=true` so only one Worker writes
-   to the selected Markdown repository.
+   disabled during the initial cutover. Before the first production backup
+   writes to the shared repository, deploy staging with
+   `SCHEDULED_BACKUPS_ENABLED=false` and verify it is disabled. Run a
+   production backup on demand and verify it. Only then deploy production
+   with `SCHEDULED_BACKUPS_ENABLED=true`; never leave both schedules active.
 5. Do not dual-write. If rolling back, confirm Keiko's latest D1 snapshot and
    repository Markdown copy, reconcile new writes against Markdown, then remove
    the account from the allowlist.
