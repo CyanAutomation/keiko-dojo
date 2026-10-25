@@ -49,14 +49,20 @@ read-only tools are `list_sessions`, `get_session`, and
 `get_training_summary`; each calls the same `SessionService` used by REST.
 Pagination uses the REST opaque cursor. No write tool is published.
 
-## Backups
+## GitHub Markdown sync
 
-Backup endpoints use `backups:read`, `backups:write`, or `backups:restore`.
-`POST /v1/backups` queues an on-demand D1 snapshot. An optional GitHub App
-target must be a selected-repository installation granting access to exactly
-one repository. Restore preview records activity; applying a restore requires
-`{"confirm":true}` and preserves newer D1 records. Restore merges snapshot
-records and does not delete records absent from a snapshot.
+The GitHub integration writes a second-brain Markdown copy of sessions to one
+selected repository. It is not a D1 snapshot or a D1 restore source. After the
+initial full sync, successful D1 session creates, updates, and deletes mark
+their sessions dirty transactionally. A delayed queue sync coalesces changes
+for 60 seconds after the most recent write. GitHub errors leave the dirty work
+pending for retry and do not fail the D1 request. Date changes move the
+Markdown file; session deletes remove its managed Markdown file.
+
+Connection and sync status use `backups:read` and `backups:write`. The scoped
+status endpoint reports whether a repository is configured, whether changes
+are pending, the next sync time, and the last successful sync time. The
+`backups:restore` scope and D1 snapshot/restore endpoints are retired.
 
 ## Versioning
 

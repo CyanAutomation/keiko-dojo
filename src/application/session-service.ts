@@ -32,7 +32,7 @@ export type AnalyticsSummary = {
     last90Days: AnalyticsDistribution;
   };
   recentEffort: Array<{ date: string; effort: number }>;
-  backupStatus: { configured: boolean; lastBackupAt: string | null };
+  backupStatus: { configured: boolean; pending: boolean; lastSyncedAt: string | null };
 };
 
 export interface SessionRepository {

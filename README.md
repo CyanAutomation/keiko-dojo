@@ -33,13 +33,15 @@ server-to-server for a Keiko-only token for allowlisted accounts.
 
 Wrangler keeps a local development configuration and a `production` remote
 environment. The single-account Production cutover is complete: Production
-contains all 38 sessions, its latest post-deployment D1 snapshot contains all
-38, and the selected MatMetrics repository has a successful 38-session sync.
-The Log Doctor scan checked all 38 training files successfully. MatMetrics
-Production routes the allowlisted account to the Production Keiko Worker. See
+contains all 38 sessions, and the selected MatMetrics repository has a
+successful 38-session Markdown sync. The Log Doctor scan checked all 38
+training files successfully. Automatic, debounced GitHub Markdown sync and D1
+snapshot removal are implemented locally and take effect in Production after
+migration 0007 and the Worker deploy. MatMetrics Production routes the
+allowlisted account to the Production Keiko Worker. See
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for current deployment and
 environment-retirement status and [`docs/operations.md`](docs/operations.md)
-for backup and recovery procedures.
+for GitHub Markdown sync operations and the Production rollout.
 
 Apply Production migrations before deploying a Worker change:
 
@@ -61,12 +63,15 @@ or authorize data. MCP is stateless at `/mcp` and exposes only
 `list_sessions`, `get_session`, and `get_training_summary` with
 `sessions:read`.
 
-The backup API uses D1 snapshots and Cloudflare Queues. A user can connect one
-GitHub App installation limited to one selected repository. Configure its
-private key only as a Wrangler secret; Keiko creates short-lived
-repository-scoped installation tokens for backup writes. Keiko-backed GitHub
-health checks, sync-all, and Log Doctor operations run as tenant-scoped queue
-jobs. See [`docs/operations.md`](docs/operations.md) for setup, recovery, and
-rollback.
+The GitHub Markdown API uses D1-backed dirty tracking and Cloudflare Queues.
+After the initial repository sync, session creates, updates, and deletes are
+coalesced for 60 seconds after the latest write, then synced to the selected
+repository. GitHub failures never fail a successful D1 session write. The
+repository is a second-brain Markdown copy, not a D1 snapshot or restore
+source. A user can connect one GitHub App installation limited to one selected
+repository. Configure its private key only as a Wrangler secret; Keiko creates
+short-lived repository-scoped installation tokens. Keiko-backed GitHub health
+checks, sync-all, and Log Doctor operations run as tenant-scoped queue jobs.
+See [`docs/operations.md`](docs/operations.md) for the Production rollout.
 
 Architecture decisions are recorded in [`docs/decisions/`](docs/decisions/).
