@@ -16,8 +16,8 @@ MatMetrics Production routes the allowlisted account to
 retired after the Production verification and backup gates passed: the Worker,
 D1 database, primary queue, and dead-letter queue are deleted, and Production
 resources remain present. The Worker's GitHub private-key secret was removed
-with it. The separate Staging GitHub App installation still needs revocation;
-GitHub requires a fresh sudo-mode authentication to reach that setting.
+with it. The Staging GitHub App installation and its app registration are also
+deleted. The Production GitHub App installation and registration remain active.
 
 **Pre-rollout backup (2026-10-25 20:15 UTC):** A manually requested Production
 backup job completed at 20:15:49 UTC with a 38-session snapshot and no error.
@@ -101,11 +101,7 @@ account is not switched automatically by the importer.
 
 ## Remaining rollout work
 
-1. **Revoke the Staging GitHub App installation.** The Staging Worker, D1,
-   queues, and Wrangler configuration have been removed. GitHub requires a
-   fresh sudo-mode authentication before the Staging app installation can be
-   uninstalled. Keep the Production installation untouched.
-2. **Onboard additional accounts separately.** Keep the current Production
+1. **Onboard additional accounts separately.** Keep the current Production
    allowlist scoped to the existing Better Auth user. Before adding another
    account, define its GitHub App installation and repository scope, repeat the
    import/backup/recovery checks, and verify tenant isolation with tests.
@@ -122,5 +118,5 @@ Production D1 contains the existing account's 38 sessions and the latest
 completed snapshot contains all 38. MatMetrics Production routes only the
 allowlisted account to the Keiko Production Worker. Keep the allowlist limited
 to the current user. Local development remains available. The Staging Worker,
-D1, queues, Wrangler environment, and scripts have been retired; only the
-separate GitHub App installation revocation remains.
+D1, queues, Wrangler environment, scripts, GitHub App installation, and app
+registration have been retired.
