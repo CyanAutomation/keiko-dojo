@@ -17,18 +17,26 @@ READY Vercel Production deployment is
 `dpl_DD42r7ZcwB6EVQ8pW2ARX8SFLY8r` at commit
 `9846c37c1697362f32174754bb53a0e8627c985c`.
 
-The Staging backup queues had zero backlog, both their primary and dead-letter
-queues. Staging D1 held a duplicate 38-session dataset and no pending backup
-jobs. Production has a separate 38-session D1 snapshot and repository copy.
-Staging retirement is approved and in progress; the cleanup PR removes Staging
-configuration and scripts before the Staging Cloudflare resources are deleted.
+Before retirement, the Staging D1 database held a duplicate 38-session dataset
+and no pending backup jobs. Both Staging queues had zero backlog. The Staging
+Worker, D1 database (`7002a569-f450-4050-bb2a-b4cba208bf59`), primary queue
+(`keiko-dojo-backups-staging`), and dead-letter queue
+(`keiko-dojo-backups-staging-dlq`) have since been deleted. The Worker had only
+the `GITHUB_APP_PRIVATE_KEY` secret; deleting it removed that Keiko-side secret.
+The Production Worker, D1 database, and queues remain present. The Staging
+GitHub App installation still needs revocation; GitHub requires a fresh
+sudo-mode authentication to reach its uninstall setting. The Production App
+installation is separate and remains active.
 
 ## Environment setup
 
 - Local development uses the local D1 binding and local backup queues in
   `wrangler.jsonc`. Production has its own D1 binding, backup queue, dead-letter
-  queue, and unique rate-limit namespace IDs. The former Staging resources are
-  not used by Production.
+  queue, and unique rate-limit namespace IDs. Staging configuration and
+  resources have been removed. Workers Rate Limiting namespace IDs are
+  user-defined binding identifiers rather than separately managed Cloudflare
+  resources; the Staging bindings are removed from Wrangler and the deleted
+  Worker no longer references them.
 - Vercel Production `KEIKO_API_BASE_URL` points to
   `https://keiko-dojo.scheimann.workers.dev`;
   `MATMETRICS_AUTH_FRONTEND_ORIGIN` is
