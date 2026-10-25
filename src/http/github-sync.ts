@@ -296,7 +296,11 @@ export async function processGitHubSessionSyncMessage(
     const terminal = message.attempts >= 5;
     await setOperationStatus(env, operationId, userId,
       terminal ? 'failed' : 'queued', undefined, terminal ? 'github_sync_failed' : undefined);
-    if (!terminal) await dispatchGitHubSessionSync(env, userId);
-    message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
+    if (terminal) {
+      message.ack();
+    } else {
+      await dispatchGitHubSessionSync(env, userId);
+      message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
+    }
   }
 }
