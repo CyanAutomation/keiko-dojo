@@ -1,6 +1,6 @@
 # Keiko Dojo implementation and rollout plan
 
-**Status (verified 2026-10-25):** Staging health/readiness return HTTP 200 and all five D1 migrations are applied. Staging has 38 sessions. A fresh staging snapshot and GitHub backup completed; the repository now has 38 unique valid Markdown records, zero parser failures, zero duplicate IDs, and exact session-payload and analytics parity with staging D1. The lossless Keiko backup format and MatMetrics parser are covered by regression tests. The earlier D1 snapshot/restore, isolated SQL recovery rehearsal, REST/MCP parity, scope denials, retry handling, and DLQ checks remain verified. The staging GitHub App remains restricted to `CyanAutomation/matmetrics`, and its authenticated installation callback succeeds. Vercel Production is configured for the single-account staging pilot; the READY deployment at commit `51c6476d72a46a9b401c4bdef63b9ae008c21422` (`dpl_EVWexwXGmphjGSwdqAQDtHpg1mFu`) owns `matmetrics-teal.vercel.app`, and signed-in Training History loads all 38 sessions. A MatMetrics gateway regression was found during a synthetic CRUD check: the deployed gateway reports a successful Keiko `204` delete as `503`. The fix and regression test pass locally but have not yet been released, so the authenticated write gate remains open. Production D1 is unmigrated, with no production Worker deployment or account cutover.
+**Status (verified 2026-10-25):** The single-account production session cutover is complete. Staging and production health/readiness return HTTP 200, and all five D1 migrations are applied in both environments. Production contains all 38 source sessions; its complete analytics summary matches staging (38 sessions, average effort 3.63, and matching category/effort distributions). The live MatMetrics app writes to production only; authenticated create/read/delete returned 201/200/204 and a follow-up read returned 404. The deployed MatMetrics gateway correctly handles Keiko's bodyless 204 response. Production snapshot `6699dd39-4dee-4c4d-9ab9-6a7b45617b16` completed with 38 sessions, and the 38-file Markdown repository copy still has exact payload parity. The production GitHub App is installed only on `CyanAutomation/matmetrics`. Vercel Production points the existing allowlisted account at `https://keiko-dojo.scheimann.workers.dev`; deployment `dpl_Cv8Y96iTgUAuJZQcoBiADwrZBfqD` at commit `b7a53ce3919b7b21928860b61833866b4e52d2d5` owns `matmetrics-teal.vercel.app`. Staging scheduled backups are disabled and production's daily `0 2 * * *` schedule is enabled after the successful on-demand production snapshot. The prior D1 recovery rehearsal, restore safeguards, REST/MCP parity, scope denials, retry handling, and DLQ checks remain verified.
 
 ## Current implementation
 
@@ -53,9 +53,9 @@ account is not switched automatically by the importer.
   backups, restore safeguards, GitHub App selected-repository adapter, and
   per-session Markdown exports compatible with KeikoTracker.
 - Scheduled backups now require the explicit `SCHEDULED_BACKUPS_ENABLED=true`
-  flag. Local/staging are enabled in Wrangler configuration; production is
-  disabled until the account cutover is ready. Staging must be disabled before
-  production begins writing to the same GitHub repository.
+  flag. Local and production are enabled; staging is disabled after the
+  production cutover so the two Workers cannot write the shared repository on
+  overlapping schedules.
 - Production JWKS configuration now matches the public MatMetrics JWKS proxy
   that was verified from the deployed staging Worker.
 - Added `npm run backup:rehearse` to export remote D1 to a mode-0600 SQL file,
@@ -79,71 +79,22 @@ account is not switched automatically by the importer.
 
 ## Remaining rollout work
 
-1. **Finalize staging pilot configuration.** The separate staging and
-   production D1 databases, backup queues, and dead-letter queues are
-   provisioned. The staging D1 IDs and verified existing Better Auth
-   JWKS/issuer are configured in `wrangler.jsonc`; migrations `0001` through
-   `0005` are applied and staging contains all 38 sessions.
-   The three staging rate-limit namespace IDs are deployed and unique across the current account
-   Worker scripts. The `Keiko Dojo Staging` GitHub App is registered for the
-   CyanAutomation account with Contents read/write, required Metadata
-   read-only, no webhook, and the staging setup callback. It is installed only
-   on `CyanAutomation/matmetrics`; `GITHUB_APP_PRIVATE_KEY` is set as a staging
-   Wrangler secret. Its App ID and install URL are set in `wrangler.jsonc`.
-   The authenticated callback now succeeds and the stateful account connection
-   targets only `CyanAutomation/matmetrics`. The latest 38-session staging
-   backup completed successfully. Configure production App values and secret only at
-   the production deployment gate. Do not use Vercel Preview deployments for
-   this rollout. No separate MatMetrics staging origin is needed: keep the
-   current production origin. Vercel Production variables now point
-   `KEIKO_API_BASE_URL` at staging and allow only the existing account. The
-   READY Production deployment includes the Auth Worker hostname and owns the
-   MatMetrics alias. Signed-in reads now succeed. The remaining staging gate is
-   to release the MatMetrics fix for bodyless `204` responses, then verify CRUD
-   through the deployed app before proceeding to the Keiko Production gate.
-2. **Finish staging validation.** The staging Worker is deployed and its
-   `/healthz` and `/readyz` endpoints return HTTP 200. The sole existing
-   MatMetrics account has been imported and its sessions and analytics match
-   the source. A D1 snapshot, restore preview, confirmed restore, successful
-   queue delivery, terminal retry handling, restore confirmation safeguard,
-   live DLQ handoff and cleanup, and MCP/REST scope parity have been checked.
-   The current repository backup and staging D1 now have exact one-to-one
-   parity: 38 files, 38 unique IDs, zero parse failures, and zero payload
-   mismatches. The authenticated importer can compare this source with
-   `--markdown-source`; the default API source is Keiko-backed after the pilot
-   route is enabled. Synthetic identities in automated
-   integration tests cover cross-tenant isolation; do not require or create a
-   second live account. Do not add the production user ID to Keiko production
-   before all staging gates pass.
-3. **Pilot the existing account in staging.** The signed-in app reads all 38
-   sessions, and the latest Markdown repository copy matches every staging
-   payload and the analytics summary. A synthetic authenticated create/delete
-   smoke check passed through the updated gateway code. Release that gateway
-   change to MatMetrics Production, then repeat the CRUD check through the
-   deployed app; the current deployment still reports `503` for a successful
-   Keiko `204` delete. Keep the Markdown copy and avoid dual writes. Do not
-   route the user to Keiko Production until the deployed CRUD and recovery
-   checks pass.
-4. **Production cutover.** Only after staging and recovery checks pass, apply
-   reviewed migrations to the already-provisioned production D1 and deploy.
-   Export the existing account's current data, dry-run and review the import,
-   apply only reviewed missing records, compare full session and analytics
-   parity, then switch the Vercel Production `KEIKO_API_BASE_URL` to the
-   production Worker for that one already-allowlisted Better Auth user ID.
-   Keep scheduled backups disabled in production during the initial cutover.
-   Before the first production backup writes to the shared GitHub repository,
-   disable the staging cron and verify that it is off. Run one production
-   backup on demand and verify it, then enable the production cron. Never run
-   both schedules while the Workers share session paths. Keep the existing
-   MatMetrics repository as the session-data backup and use Keiko's D1 snapshot and rehearsed restore for database
-   recovery; no retained external SQL export is required. Monitor sanitized
-   logs and metrics and keep the rollout at this account until more accounts
-   are onboarded.
-5. **Migrate remaining shared services.** After the single-account production
-   session cutover is stable, move applicable GitHub sync, health, and Log
+1. **Observe the production schedule.** The first production snapshot was
+   requested on demand and verified with 38 records. Confirm the next scheduled
+   run completes, then continue monitoring the sanitized Worker logs and backup
+   status. Staging remains disabled while production writes to the shared
+   repository. Keep the account allowlist limited to the existing user.
+2. **Move remaining GitHub services after the pilot settles.** The production
+   cutover is complete, but one scheduled run has not yet occurred. After that
+   run succeeds, move the remaining applicable GitHub sync, health, and Log
    Doctor operations behind Keiko's authenticated API and background jobs.
-   Keep training-plan insights and AI features in MatMetrics until their
-   data-use policy is approved.
+   Preserve their current UI contracts and require the selected-repository
+   GitHub App connection. Keep training-plan insights and AI features in
+   MatMetrics until their data-use policy is approved.
+3. **Onboard additional accounts separately.** Keep the current production
+   allowlist scoped to the existing Better Auth user. Before adding another
+   account, define its GitHub App installation and repository scope, repeat the
+   import/backup/recovery checks, and verify tenant isolation with tests.
 
 ## Deployment boundaries
 
@@ -153,11 +104,9 @@ Keiko JWT is never returned to the browser. User IDs and repository names from
 request bodies do not select D1 ownership. No AI provider receives Keiko
 session data.
 
-The Keiko Production service remains off until staging recovery and the
-authenticated pilot have been demonstrated. Production D1 and queues are
-provisioned but remain empty; no production Worker deployment, schema
-migration, session import, or Keiko Production account cutover has occurred.
-MatMetrics Production is deployed with the one-account pilot configured to use
-the Keiko staging Worker. Signed-in reads pass; release the MatMetrics `204`
-response fix and verify authenticated writes before starting the Keiko
-Production cutover.
+Production D1 and queues are deployed and contain the existing account's
+38 sessions. MatMetrics Production routes only the allowlisted account to the
+Keiko Production Worker. The staging Worker remains available for recovery
+comparison but its scheduled backup switch is off. Do not add more users or
+move the remaining shared GitHub services until the scheduled production
+backup has completed and the single-account pilot remains healthy.
