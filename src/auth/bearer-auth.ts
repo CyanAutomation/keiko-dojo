@@ -12,7 +12,9 @@ export type RequiredScope =
   | 'sessions:write'
   | 'backups:read'
   | 'backups:write'
-  | 'backups:restore';
+  | 'backups:restore'
+  | 'github:read'
+  | 'github:write';
 export type AuthenticatedUser = { userId: string };
 export type AuthFailureKind = 'unauthorized' | 'forbidden' | 'unavailable' | 'rate_limited';
 
@@ -151,7 +153,7 @@ export async function authenticateRequest(
   const principal = validatePayload(payload, requiredScope);
   const environment = env.ENVIRONMENT as string;
   if (environment === 'local' || environment === 'test') return principal;
-  const limiter = requiredScope === 'sessions:read' || requiredScope === 'backups:read'
+  const limiter = requiredScope === 'sessions:read' || requiredScope === 'backups:read' || requiredScope === 'github:read'
     ? env.SESSION_READ_LIMITER
     : requiredScope === 'sessions:write'
       ? env.SESSION_WRITE_LIMITER
