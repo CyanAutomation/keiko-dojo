@@ -23,10 +23,9 @@ Worker, D1 database (`7002a569-f450-4050-bb2a-b4cba208bf59`), primary queue
 (`keiko-dojo-backups-staging`), and dead-letter queue
 (`keiko-dojo-backups-staging-dlq`) have since been deleted. The Worker had only
 the `GITHUB_APP_PRIVATE_KEY` secret; deleting it removed that Keiko-side secret.
-The Production Worker, D1 database, and queues remain present. The Staging
-GitHub App installation still needs revocation; GitHub requires a fresh
-sudo-mode authentication to reach its uninstall setting. The Production App
-installation is separate and remains active.
+The Production Worker, D1 database, queues, GitHub App installation, and app
+registration remain present. The Staging GitHub App installation and
+registration have been deleted; the Production App is separate and untouched.
 
 ## Environment setup
 
