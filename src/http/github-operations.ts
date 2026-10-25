@@ -357,6 +357,10 @@ export async function processGitHubOperationMessage(
       `UPDATE github_operation_jobs SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
        WHERE id = ? AND user_id = ? AND status != 'completed'`
     ).bind(terminal ? 'failed' : 'queued', terminal ? errorMessage : null, updatedAt, terminal ? updatedAt : null, jobId, userId).run();
-    message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
+    if (terminal) {
+      message.ack();
+    } else {
+      message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
+    }
   }
 }

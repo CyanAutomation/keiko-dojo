@@ -623,6 +623,89 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('acknowledges a terminal session-sync failure instead of retrying the message', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `terminal-session-sync-${crypto.randomUUID()}`;
+    const operationId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const queueSend = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const syncEnv = Object.assign(Object.create(appEnv), {
+      BACKUP_QUEUE: { send: queueSend },
+    }) as Env;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 906, 'CyanAutomation', 'judo-notes', 906, now).run();
+    await env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at)
+       VALUES (?, ?, 1, 1, ?)`
+    ).bind(userId, 906, new Date(0).toISOString()).run();
+    await env.DB.prepare(
+      `INSERT INTO github_operation_jobs
+       (id, user_id, type, status, payload, created_at, updated_at)
+       VALUES (?, ?, 'github-sync-all', 'queued', '{}', ?, ?)`
+    ).bind(operationId, userId, now, now).run();
+    vi.stubGlobal('fetch', async () => { throw new Error('GitHub unavailable'); });
+    const ack = vi.fn();
+    const retry = vi.fn();
+
+    try {
+      await processGitHubSessionSyncMessage({
+        body: { kind: 'github-session-sync', userId, operationId },
+        attempts: 5,
+        ack,
+        retry,
+      } as unknown as Message<{ kind: 'github-session-sync'; userId: string; operationId: string }>, syncEnv);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(await env.DB.prepare(
+        'SELECT status, error_message FROM github_operation_jobs WHERE id = ?'
+      ).bind(operationId).first()).toMatchObject({ status: 'failed', error_message: 'github_sync_failed' });
+      expect(queueSend).not.toHaveBeenCalled();
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_operation_jobs WHERE id = ?').bind(operationId),
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+      ]);
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
+  it('acknowledges a terminal GitHub operation failure instead of retrying the message', async () => {
+    const userId = `terminal-operation-${crypto.randomUUID()}`;
+    const jobId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    await env.DB.prepare(
+      `INSERT INTO github_operation_jobs
+       (id, user_id, type, status, payload, created_at, updated_at)
+       VALUES (?, ?, 'github-health', 'queued', '{}', ?, ?)`
+    ).bind(jobId, userId, now, now).run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+
+    try {
+      await processGitHubOperationMessage({
+        body: { kind: 'github-operation', jobId, userId },
+        attempts: 5,
+        ack,
+        retry,
+      } as unknown as Message<{ kind: 'github-operation'; jobId: string; userId: string }>, appEnv);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(await env.DB.prepare(
+        'SELECT status FROM github_operation_jobs WHERE id = ?'
+      ).bind(jobId).first()).toMatchObject({ status: 'failed' });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE id = ?').bind(jobId).run();
+    }
+  });
+
   it('binds a selected-repository callback to its one-time initiating account state', async () => {
     const priorFetch = globalThis.fetch;
     const previousFrontendOrigin = appEnv.MATMETRICS_FRONTEND_URL;

@@ -81,8 +81,9 @@ export async function dispatchPendingGitHubSessionSyncs(env: Env): Promise<void>
        AND state.wake_enqueued = 0
        AND (state.dispatch_after IS NULL OR state.dispatch_after <= ?)
        AND (state.lease_expires_at IS NULL OR state.lease_expires_at <= ?)
+       AND state.next_sync_at <= ?
      ORDER BY state.next_sync_at LIMIT 100`
-  ).bind(now, now).all<{ user_id: string }>();
+  ).bind(now, now, now).all<{ user_id: string }>();
 
   for (const { user_id: userId } of pending.results) {
     await dispatchGitHubSessionSync(env, userId);
