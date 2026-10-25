@@ -16,6 +16,13 @@ let authPrivateKey: CryptoKey;
 let authPublicJwk: JWK;
 const authKeyId = 'github-installation-test-key';
 
+function encodeBase64Utf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 beforeAll(async () => {
   const keys = generateKeyPairSync('rsa', { modulusLength: 2048 });
   appEnv = Object.create(env) as Env & { GITHUB_APP_PRIVATE_KEY?: string };
@@ -209,7 +216,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       '# 2026-10-24 - Judo Session: Technical',
       '',
       '## Techniques Practiced',
-      '- Uchi mata',
+      '- Ōuchi mata',
       '',
       '## Session Description',
       '',
@@ -231,7 +238,7 @@ describe('GitHub App selected-repository backup adapter', () => {
         return Response.json({
           sha: 'existing-content-sha',
           encoding: 'base64',
-          content: btoa(markdown),
+          content: encodeBase64Utf8(markdown),
         });
       }
       throw new Error(`Unexpected GitHub API request: ${url}`);
@@ -251,7 +258,7 @@ describe('GitHub App selected-repository backup adapter', () => {
         effort: 3,
         payload: JSON.stringify({
           id: 'unchanged-session', date: '2026-10-24', effort: 3,
-          category: 'Technical', techniques: ['Uchi mata'],
+          category: 'Technical', techniques: ['Ōuchi mata'],
         }),
         revision: 1,
         updated_at: '2026-10-24T00:00:00.000Z',
@@ -615,6 +622,7 @@ describe('GitHub App selected-repository backup adapter', () => {
 
   it('rejects malformed stored session payloads before writing repository contents', async () => {
     const priorFetch = globalThis.fetch;
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
     const tokenUrl = 'https://api.github.com/app/installations/731/access_tokens';
     const calls: Array<{ url: string; method: string }> = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -649,13 +657,15 @@ describe('GitHub App selected-repository backup adapter', () => {
         '2026-10-17T00:00:00.000Z',
         [invalidSession]
       )).rejects.toThrow('Stored session payload is invalid');
-      expect(calls).toEqual([{ url: tokenUrl, method: 'POST' }]);
+      expect(calls).toEqual([]);
+      expect(errorLog).not.toHaveBeenCalled();
     } finally {
+      errorLog.mockRestore();
       vi.stubGlobal('fetch', priorFetch);
     }
   });
 
-  it('rejects empty techniques before requesting repository contents', async () => {
+  it('rejects empty techniques before requesting GitHub access', async () => {
     const priorFetch = globalThis.fetch;
     const tokenUrl = 'https://api.github.com/app/installations/731/access_tokens';
     const calls: Array<{ url: string; method: string }> = [];
@@ -697,7 +707,7 @@ describe('GitHub App selected-repository backup adapter', () => {
         '2026-10-17T00:00:00.000Z',
         [invalidSession]
       )).rejects.toThrow('Stored session payload is invalid');
-      expect(calls).toEqual([{ url: tokenUrl, method: 'POST' }]);
+      expect(calls).toEqual([]);
     } finally {
       vi.stubGlobal('fetch', priorFetch);
     }

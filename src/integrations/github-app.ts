@@ -377,8 +377,7 @@ function validSessionDate(value: string): boolean {
   return date.toISOString().slice(0, 10) === value;
 }
 
-function sessionMarkdown(row: SnapshotSession): string {
-  const session = markdownSession(row);
+function sessionMarkdown(session: MarkdownSession): string {
   const escapeMarkdown = (value: string) => value
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -399,11 +398,10 @@ function sessionMarkdown(row: SnapshotSession): string {
   return `---\n${frontmatter.join('\n')}\n---\n\n# ${session.date} - Judo Session: ${session.category}\n\n## Techniques Practiced\n${techniques}\n\n## Session Description\n\n${escapeMarkdown(session.description ?? '')}\n\n## Notes\n\n${escapeMarkdown(session.notes ?? '')}\n`;
 }
 
-function sessionFilePath(session: SnapshotSession): string {
-  const value = markdownSession(session);
-  const compactDate = value.date.replaceAll('-', '');
-  const [year, month] = value.date.split('-');
-  return `data/${year}/${month}/${compactDate}-matmetrics-${value.id}.md`;
+function sessionFilePath(session: Pick<MarkdownSession, 'id' | 'date'>): string {
+  const compactDate = session.date.replaceAll('-', '');
+  const [year, month] = session.date.split('-');
+  return `data/${year}/${month}/${compactDate}-matmetrics-${session.id}.md`;
 }
 
 async function writeSessionMarkdown(
@@ -444,19 +442,27 @@ export async function writeGitHubBackup(
   createdAt: string,
   sessions: SnapshotSession[]
 ): Promise<void> {
+  const files = sessions.map((row) => {
+    const session = markdownSession(row);
+    return {
+      path: sessionFilePath(session),
+      markdown: sessionMarkdown(session),
+      sessionDate: row.session_date,
+    };
+  });
+
   let phase = 'installation_token_request';
   try {
     const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name);
     phase = 'session_contents';
-    for (const session of sessions) {
-      const path = sessionFilePath(session);
+    for (const file of files) {
       await writeSessionMarkdown(
         token,
         installation.repository_owner,
         installation.repository_name,
-        path,
-        sessionMarkdown(session),
-        `Keiko Dojo backup ${snapshotId} (${createdAt}): ${session.session_date}`
+        file.path,
+        file.markdown,
+        `Keiko Dojo backup ${snapshotId} (${createdAt}): ${file.sessionDate}`
       );
     }
   } catch (error) {
