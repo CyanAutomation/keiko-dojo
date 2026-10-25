@@ -33,12 +33,15 @@ server-to-server for a Keiko-only token for allowlisted accounts.
 
 Wrangler environments `staging` and `production` have separate Worker names
 and D1 bindings. Their D1 IDs and Better Auth issuer/JWKS settings are
-configured. The staging GitHub App is installed only on MatMetrics with
-Contents read/write, and its private key is configured as a Worker secret.
-The stateful Keiko repository connection and recovery validation remain
-pending. Production GitHub App settings, migrations, and deployment remain
-gated on staging recovery validation. Apply migrations to the corresponding
-remote database before routing clients to that Worker:
+configured. The staging GitHub App is installed only on
+`CyanAutomation/matmetrics` with Contents read/write, and its private key is
+configured as a Worker secret. Its stateful connection targets that repository,
+and the latest staging backup completed for all 37 sessions. Repository
+recovery validation remains pending: the current repository has one more
+Markdown session file than staging D1. Production GitHub App settings,
+migrations, and deployment remain gated on resolving this difference and
+passing the signed-in pilot. Apply migrations to the corresponding remote
+database before routing clients to that Worker:
 
 ```bash
 npm run migrate:staging
