@@ -2,6 +2,8 @@
 
 **Status (verified 2026-10-25):** The single-account production session cutover is complete. Staging and production health/readiness return HTTP 200, and all five D1 migrations are applied in both environments. Production contains all 38 source sessions; its complete analytics summary matches staging (38 sessions, average effort 3.63, and matching category/effort distributions). The live MatMetrics app writes to production only; authenticated create/read/delete returned 201/200/204 and a follow-up read returned 404. The deployed MatMetrics gateway correctly handles Keiko's bodyless 204 response. Production snapshot `6699dd39-4dee-4c4d-9ab9-6a7b45617b16` completed with 38 sessions, and the 38-file Markdown repository copy still has exact payload parity. The production GitHub App is installed only on `CyanAutomation/matmetrics`. Vercel Production points the existing allowlisted account at `https://keiko-dojo.scheimann.workers.dev`; deployment `dpl_Cv8Y96iTgUAuJZQcoBiADwrZBfqD` at commit `b7a53ce3919b7b21928860b61833866b4e52d2d5` owns `matmetrics-teal.vercel.app`. Staging scheduled backups are disabled and production's daily `0 2 * * *` schedule is enabled after the successful on-demand production snapshot. The prior D1 recovery rehearsal, restore safeguards, REST/MCP parity, scope denials, retry handling, and DLQ checks remain verified.
 
+**Pre-rollout backup (2026-10-25 20:15 UTC):** A manually requested Production backup job completed at 20:15:49 UTC with a 38-session snapshot and no error. This satisfies the backup gate for migration 0006 and the GitHub service move. Production's daily 02:00 UTC schedule remains enabled and will continue running.
+
 ## Current implementation
 
 Keiko owns a versioned session API backed by D1. The Worker validates EdDSA
@@ -12,8 +14,8 @@ tenant-scoped and writes use revision ETags. Analytics, paginated REST reads,
 backup status/request/restore, and the read-only MCP tools share Keiko's
 application service and D1 repository. Separate per-user rate-limit bindings
 protect reads, session writes, and backup/restore operations in each deployed
-environment. The production deployment has the first 38-session on-demand
-snapshot; its first scheduled run is due at 02:00 UTC on 2026-10-26.
+environment. The latest on-demand Production snapshot contains all 38 sessions;
+the next scheduled run is due at 02:00 UTC on 2026-10-26.
 
 MatMetrics retains its existing `matmetrics-api` bearer-token verifier and
 browser auth workflow. For allowlisted accounts, its existing session routes
@@ -92,11 +94,10 @@ account is not switched automatically by the importer.
 
 ## Remaining rollout work
 
-1. **Observe the production schedule.** The first production snapshot was
-   requested on demand and verified with 38 records. Confirm the first
-   scheduled run completes before deploying migration 0006 or routing the
-   remaining GitHub operations to Keiko. Continue monitoring sanitized Worker
-   logs and backup status. Keep the allowlist limited to the existing user.
+1. **Production backup gate passed.** The manual Production backup completed
+   at 20:15:49 UTC with a 38-session snapshot. The next daily scheduled run
+   remains enabled for 02:00 UTC on 2026-10-26 and should be monitored as part
+   of ongoing operations. Keep the allowlist limited to the existing user.
 2. **Deploy and verify the GitHub service move.** Apply migration 0006 to
    production, deploy the Keiko Worker and MatMetrics Production code, then
    verify selected-repository connect/disconnect, health, 38-session sync,
@@ -124,7 +125,7 @@ session data.
 Production D1 and queues are deployed and contain the existing account's
 38 sessions. MatMetrics Production routes only the allowlisted account to the
 Keiko Production Worker. The Staging Worker remains available for recovery
-comparison but its scheduled backup switch is off. Do not add more users,
-deploy the remaining shared GitHub services, or remove Staging until the
-scheduled production backup has completed and the single-account pilot remains
-healthy.
+comparison but its scheduled backup switch is off. The manual pre-rollout
+Production backup is complete. Keep the allowlist limited to the current user,
+and do not remove Staging until the new Production flows pass verification and
+a post-deployment backup completes.
