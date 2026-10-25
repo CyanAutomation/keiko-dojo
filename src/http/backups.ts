@@ -55,7 +55,8 @@ function frontendOrigin(env: Env): URL {
 }
 
 function githubResultRedirect(env: Env, result: 'connected' | 'failed'): Response {
-  const target = new URL(`/settings?githubBackup=${result}`, frontendOrigin(env));
+  const target = new URL('/', frontendOrigin(env));
+  target.searchParams.set('githubBackup', result);
   return new Response(null, {
     status: 302,
     headers: { Location: target.href, 'Cache-Control': 'no-store' },
