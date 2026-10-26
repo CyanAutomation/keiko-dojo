@@ -1084,25 +1084,30 @@ describe('GitHub App selected-repository backup adapter', () => {
     expect(secondMarkdown).toContain('\\[link\\]\\(https://evil\\.test\\)\n\\- injected list\n\\`\\`\\`html');
   });
 
-  it('rejects malformed stored session payloads before writing repository contents', async () => {
+  it.each([
+    ['malformed JSON', '{invalid-json'],
+    ['empty techniques', JSON.stringify({
+      id: 'invalid-session',
+      date: '2026-10-17',
+      category: 'Technical',
+      effort: 3,
+      techniques: ['   '],
+    })],
+  ])('rejects stored sessions with %s before requesting GitHub access', async (_case, payload) => {
     const priorFetch = globalThis.fetch;
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const tokenUrl = 'https://api.github.com/app/installations/731/access_tokens';
-    const calls: Array<{ url: string; method: string }> = [];
-    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
-      calls.push({ url, method: init?.method ?? 'GET' });
-      if (url === tokenUrl && init?.method === 'POST') {
-        return Response.json({ token: 'scoped-write-token' });
-      }
+      calls.push(url);
       throw new Error(`Unexpected GitHub API request: ${url}`);
     });
     const invalidSession: GitHubSessionRow = {
-      id: 'broken-session',
+      id: 'invalid-session',
       session_date: '2026-10-17',
       category: 'Technical',
       effort: 3,
-      payload: '{invalid-json',
+      payload,
       revision: 1,
       updated_at: '2026-10-17T00:00:00.000Z',
     };
@@ -1127,55 +1132,12 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
-  it('rejects empty techniques before requesting GitHub access', async () => {
-    const priorFetch = globalThis.fetch;
-    const tokenUrl = 'https://api.github.com/app/installations/731/access_tokens';
-    const calls: Array<{ url: string; method: string }> = [];
-    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = input instanceof Request ? input.url : String(input);
-      calls.push({ url, method: init?.method ?? 'GET' });
-      if (url === tokenUrl && init?.method === 'POST') {
-        return Response.json({ token: 'scoped-write-token' });
-      }
-      throw new Error(`Unexpected GitHub API request: ${url}`);
-    });
-    const invalidSession: GitHubSessionRow = {
-      id: 'empty-technique-session',
-      session_date: '2026-10-17',
-      category: 'Technical',
-      effort: 3,
-      payload: JSON.stringify({
-        id: 'empty-technique-session',
-        date: '2026-10-17',
-        category: 'Technical',
-        effort: 3,
-        techniques: ['   '],
-      }),
-      revision: 1,
-      updated_at: '2026-10-17T00:00:00.000Z',
-    };
-
-    try {
-      await expect(syncGitHubSessionMarkdown(
-        appEnv,
-        {
-          user_id: 'user-1',
-          installation_id: 731,
-          repository_owner: 'maki',
-          repository_name: 'judo-notes',
-          repository_id: 88,
-        },
-        [invalidSession]
-      )).rejects.toThrow('Stored session payload is invalid');
-      expect(calls).toEqual([]);
-    } finally {
-      vi.stubGlobal('fetch', priorFetch);
-    }
-  });
-
   it('rejects GitHub App installations with all-repository access or more than one selected repository', async () => {
+    const priorFetch = globalThis.fetch;
+    const calls: string[] = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
+      calls.push(url);
       if (url.endsWith('/app/installations/732')) {
         return Response.json({ id: 732, repository_selection: 'all' });
       }
@@ -1188,7 +1150,22 @@ describe('GitHub App selected-repository backup adapter', () => {
       }
       throw new Error(`Unexpected GitHub API request: ${url}`);
     });
-    await expect(verifySelectedRepositoryInstallation(appEnv, 732)).rejects.toThrow();
-    await expect(verifySelectedRepositoryInstallation(appEnv, 733)).rejects.toThrow();
+
+    try {
+      await expect(verifySelectedRepositoryInstallation(appEnv, 732))
+        .rejects.toMatchObject({ phase: 'installation_scope' });
+      expect(calls).toEqual(['https://api.github.com/app/installations/732']);
+
+      calls.length = 0;
+      await expect(verifySelectedRepositoryInstallation(appEnv, 733))
+        .rejects.toMatchObject({ phase: 'repository_scope' });
+      expect(calls).toEqual([
+        'https://api.github.com/app/installations/733',
+        'https://api.github.com/app/installations/733/access_tokens',
+        'https://api.github.com/installation/repositories?per_page=100',
+      ]);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
   });
 });
