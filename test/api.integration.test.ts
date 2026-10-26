@@ -581,7 +581,7 @@ describe('Keiko session API', () => {
     }
   });
 
-  it('rejects oversized GitHub sync and MCP bodies without relying on Content-Length', async () => {
+  it('returns payload-too-large for oversized GitHub sync and MCP request bodies', async () => {
     const sync = await call('/v1/github/sync-all', 'large-sync-body', {
       method: 'POST', body: ' '.repeat(64 * 1024 + 1),
     }, { scope: 'github:write' });
@@ -641,7 +641,7 @@ describe('Keiko session API', () => {
     }
   });
 
-  it('reports readiness only when D1 and auth configuration are present', async () => {
+  it('reports ready when D1 and auth configuration are available', async () => {
     const response = await worker.fetch(
       new Request('https://keiko.example.test/readyz'),
       env
@@ -649,6 +649,23 @@ describe('Keiko session API', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ status: 'ready' });
   });
+
+  it.each(['AUTH_JWKS_URL', 'AUTH_ISSUER', 'AUTH_AUDIENCE'] as const)(
+    'reports not ready when %s is missing',
+    async (setting) => {
+      const unavailableEnv = Object.create(env) as Env;
+      Object.defineProperty(unavailableEnv, setting, { value: '' });
+      const response = await worker.fetch(
+        new Request('https://keiko.example.test/readyz'),
+        unavailableEnv
+      );
+
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({
+        error: { code: 'authentication_unavailable', message: 'Service is not ready' },
+      });
+    }
+  );
 
   it('reports a non-200 JWKS response as authentication unavailable', async () => {
     const unavailableEnv = Object.assign(Object.create(testEnv), {
