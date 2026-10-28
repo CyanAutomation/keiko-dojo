@@ -32,9 +32,11 @@ the canonical validation message in `error.message`.
 ## Revisions
 
 Every stored record has a server-managed integer revision. Single-record reads
-and create/update responses include a strong ETag such as `"1"`; list records
-include the revision number. `PUT` and `DELETE` require the same revision in
-`If-Match`. Missing headers return 428 and stale revisions return 412.
+and create/update responses include a strong, user-scoped ETag. Clients can
+send it in `If-None-Match` to revalidate a single-record read; a current record
+returns 304. Item responses are private and require revalidation. `PUT` and
+`DELETE` accept the current ETag in `If-Match`; legacy quoted revision numbers
+remain accepted. Missing headers return 428 and stale revisions return 412.
 
 ## Analytics and MCP
 

@@ -252,7 +252,8 @@ describe('Keiko session API', () => {
       body: JSON.stringify(testSession),
     });
     expect(created.status).toBe(201);
-    expect(created.headers.get('etag')).toBe('"1"');
+    const createdEtag = created.headers.get('etag');
+    expect(createdEtag).toMatch(/^"1-[a-f0-9]{24}"$/);
 
     const listed = await call('/v1/sessions?limit=10', 'user-a');
     expect(listed.status).toBe(200);
@@ -263,11 +264,12 @@ describe('Keiko session API', () => {
 
     const updated = await call(`/v1/sessions/${testSession.id}`, 'user-a', {
       method: 'PUT',
-      headers: { 'if-match': '"1"' },
+      headers: { 'if-match': createdEtag! },
       body: JSON.stringify({ ...testSession, notes: 'Updated notes' }),
     });
     expect(updated.status).toBe(200);
-    expect(updated.headers.get('etag')).toBe('"2"');
+    const updatedEtag = updated.headers.get('etag');
+    expect(updatedEtag).toMatch(/^"2-[a-f0-9]{24}"$/);
 
     const stale = await call(`/v1/sessions/${testSession.id}`, 'user-a', {
       method: 'PUT',
@@ -278,9 +280,34 @@ describe('Keiko session API', () => {
 
     const deleted = await call(`/v1/sessions/${testSession.id}`, 'user-a', {
       method: 'DELETE',
-      headers: { 'if-match': '"2"' },
+      headers: { 'if-match': updatedEtag! },
     });
     expect(deleted.status).toBe(204);
+  });
+
+  it('revalidates session reads with user-scoped ETags', async () => {
+    const session = { ...testSession, id: `cache-${crypto.randomUUID()}` };
+    const first = await call('/v1/sessions', 'cache-user-a', {
+      method: 'POST', body: JSON.stringify(session),
+    });
+    const other = await call('/v1/sessions', 'cache-user-b', {
+      method: 'POST', body: JSON.stringify(session),
+    });
+    const firstTag = first.headers.get('etag')!;
+    const otherTag = other.headers.get('etag')!;
+    expect(firstTag).not.toBe(otherTag);
+
+    const notModified = await call(`/v1/sessions/${session.id}`, 'cache-user-a', {
+      headers: { 'if-none-match': firstTag },
+    });
+    expect(notModified.status).toBe(304);
+    expect(notModified.headers.get('cache-control')).toBe('private, no-cache');
+
+    const otherUserRead = await call(`/v1/sessions/${session.id}`, 'cache-user-b', {
+      headers: { 'if-none-match': firstTag },
+    });
+    expect(otherUserRead.status).toBe(200);
+    expect(otherUserRead.headers.get('etag')).toBe(otherTag);
   });
 
   it('keeps session records isolated by verified user', async () => {

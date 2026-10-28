@@ -94,22 +94,69 @@ async function githubFetch(
   url: string,
   token: string,
   method = 'GET',
-  body?: unknown
+  body?: unknown,
+  cacheNamespace?: string
 ): Promise<Response> {
-  const response = await fetch(url, {
+  const canRevalidate = method.toUpperCase() === 'GET' && cacheNamespace !== undefined;
+  const cacheKey = canRevalidate ? JSON.stringify([cacheNamespace, url]) : undefined;
+  let cached = cacheKey ? githubGetCache.get(cacheKey) : undefined;
+  if (cached && Date.now() - cached.storedAt > GITHUB_GET_CACHE_TTL_MS) {
+    removeGitHubGetCache(cacheKey!);
+    cached = undefined;
+  }
+  const headers = new Headers({
+    accept: 'application/vnd.github+json',
+    authorization: `Bearer ${token}`,
+    'user-agent': 'Keiko-Dojo/0.1',
+    'x-github-api-version': '2022-11-28',
+    ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+  });
+  if (cached) headers.set('if-none-match', cached.etag);
+  const fetchOptions: RequestInit = {
     method,
-    headers: {
-      accept: 'application/vnd.github+json',
-      authorization: `Bearer ${token}`,
-      'user-agent': 'Keiko-Dojo/0.1',
-      'x-github-api-version': '2022-11-28',
-      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-    },
+    headers,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     redirect: 'manual',
     cache: 'no-store',
     signal: AbortSignal.timeout(15000),
-  });
+  };
+  let response = await fetch(url, fetchOptions);
+  if (response.status === 304) {
+    if (!cached) {
+      headers.delete('if-none-match');
+      response = await fetch(url, fetchOptions);
+    } else {
+      const mergedHeaders = new Headers(cached.headers);
+      response.headers.forEach((value, name) => mergedHeaders.set(name, value));
+      mergedHeaders.delete('content-length');
+      mergedHeaders.delete('content-encoding');
+      response = new Response(cached.body.slice(0), {
+        status: cached.status,
+        statusText: cached.statusText,
+        headers: mergedHeaders,
+      });
+      cached.headers = [...mergedHeaders.entries()];
+      cached.storedAt = Date.now();
+      touchGitHubGetCache(cacheKey!, cached);
+      return response;
+    }
+  }
+  if (cacheKey) {
+    const etag = response.headers.get('etag');
+    if (response.ok && etag) {
+      const entry: GitHubGetCacheEntry = {
+        etag,
+        status: response.status,
+        statusText: response.statusText,
+        headers: [...response.headers.entries()],
+        body: await response.clone().arrayBuffer(),
+        storedAt: Date.now(),
+      };
+      touchGitHubGetCache(cacheKey, entry);
+    } else {
+      removeGitHubGetCache(cacheKey);
+    }
+  }
   if ([301, 302, 303, 307, 308].includes(response.status)) {
     const location = response.headers.get('location');
     if (location) {
@@ -119,6 +166,48 @@ async function githubFetch(
     throw new GitHubRedirectError(response.status, new URL(url).origin, new URL(url).pathname);
   }
   return response;
+}
+
+type GitHubGetCacheEntry = {
+  etag: string;
+  status: number;
+  statusText: string;
+  headers: Array<[string, string]>;
+  body: ArrayBuffer;
+  storedAt: number;
+};
+
+const MAX_GITHUB_GET_CACHE_ENTRIES = 256;
+const MAX_GITHUB_GET_CACHE_BYTES = 8 * 1024 * 1024;
+const GITHUB_GET_CACHE_TTL_MS = 10 * 60_000;
+const githubGetCache = new Map<string, GitHubGetCacheEntry>();
+let githubGetCacheBytes = 0;
+
+function removeGitHubGetCache(key: string): void {
+  const entry = githubGetCache.get(key);
+  if (!entry) return;
+  githubGetCache.delete(key);
+  githubGetCacheBytes -= entry.body.byteLength;
+}
+
+function touchGitHubGetCache(key: string, entry: GitHubGetCacheEntry): void {
+  removeGitHubGetCache(key);
+  if (entry.body.byteLength > MAX_GITHUB_GET_CACHE_BYTES) return;
+  githubGetCacheBytes += entry.body.byteLength;
+  githubGetCache.set(key, entry);
+  while (githubGetCache.size > MAX_GITHUB_GET_CACHE_ENTRIES || githubGetCacheBytes > MAX_GITHUB_GET_CACHE_BYTES) {
+    const oldest = githubGetCache.keys().next().value;
+    if (oldest === undefined) break;
+    removeGitHubGetCache(oldest);
+  }
+}
+
+function githubCacheScope(installation: GitHubInstallation): string {
+  return JSON.stringify([
+    installation.user_id,
+    installation.installation_id,
+    installation.repository_id,
+  ]);
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
@@ -235,16 +324,66 @@ async function scopedContentsToken(
   env: GitHubAppEnvironment,
   installationId: number,
   repositoryName: string,
-  permission: 'read' | 'write' = 'write'
+  permission: 'read' | 'write' = 'write',
+  userId = ''
 ): Promise<string> {
-  const jwt = await appJwt(env);
-  const value = await responseJson<{ token: string }>(await githubFetch(
-    `https://api.github.com/app/installations/${installationId}/access_tokens`,
-    jwt,
-    'POST',
-    { repositories: [repositoryName], permissions: { contents: permission } }
-  ));
-  return value.token;
+  const cacheKey = JSON.stringify([userId, installationId, repositoryName, permission]);
+  const now = Date.now();
+  const cached = installationTokenCache.get(cacheKey);
+  if (cached?.token && cached.expiresAt && cached.expiresAt > now + TOKEN_REFRESH_MARGIN_MS) {
+    touchInstallationTokenCache(cacheKey, cached);
+    return cached.token;
+  }
+  if (cached?.pending) return cached.pending;
+
+  const entry: InstallationTokenCacheEntry = {};
+  const pending = (async () => {
+    const jwt = await appJwt(env);
+    const value = await responseJson<{ token: string; expires_at?: string }>(await githubFetch(
+      `https://api.github.com/app/installations/${installationId}/access_tokens`,
+      jwt,
+      'POST',
+      { repositories: [repositoryName], permissions: { contents: permission } }
+    ));
+    const expiresAt = value.expires_at ? Date.parse(value.expires_at) : NaN;
+    if (Number.isFinite(expiresAt) && expiresAt > Date.now() + TOKEN_REFRESH_MARGIN_MS) {
+      entry.token = value.token;
+      entry.expiresAt = expiresAt;
+      entry.pending = undefined;
+      touchInstallationTokenCache(cacheKey, entry);
+    } else {
+      installationTokenCache.delete(cacheKey);
+    }
+    return value.token;
+  })();
+  entry.pending = pending;
+  touchInstallationTokenCache(cacheKey, entry);
+  try {
+    return await pending;
+  } catch (error) {
+    if (installationTokenCache.get(cacheKey) === entry) installationTokenCache.delete(cacheKey);
+    throw error;
+  }
+}
+
+type InstallationTokenCacheEntry = {
+  token?: string;
+  expiresAt?: number;
+  pending?: Promise<string>;
+};
+
+const MAX_INSTALLATION_TOKEN_CACHE_ENTRIES = 100;
+const TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
+const installationTokenCache = new Map<string, InstallationTokenCacheEntry>();
+
+function touchInstallationTokenCache(key: string, entry: InstallationTokenCacheEntry): void {
+  installationTokenCache.delete(key);
+  installationTokenCache.set(key, entry);
+  while (installationTokenCache.size > MAX_INSTALLATION_TOKEN_CACHE_ENTRIES) {
+    const oldest = installationTokenCache.keys().next().value;
+    if (oldest === undefined) break;
+    installationTokenCache.delete(oldest);
+  }
 }
 
 function repositoryUrl(installation: GitHubInstallation, suffix: string): string {
@@ -272,7 +411,9 @@ async function selectedRepositoryInfo(
   token: string,
   installation: GitHubInstallation
 ): Promise<{ defaultBranch: string; response: Response }> {
-  const response = await githubFetch(repositoryUrl(installation, ''), token);
+  const response = await githubFetch(
+    repositoryUrl(installation, ''), token, 'GET', undefined, githubCacheScope(installation)
+  );
   const repository = await limitedResponseJson<{ default_branch?: unknown }>(response, 256 * 1024);
   if (typeof repository.default_branch !== 'string' || !repository.default_branch.trim()) {
     throw new Error('GitHub repository does not expose a default branch');
@@ -293,7 +434,10 @@ async function resolveSelectedBranch(
   const ref = await limitedResponseJson<{ object?: { sha?: unknown } }>(
     await githubFetch(
       repositoryUrl(installation, `/git/ref/heads/${encodeURIComponent(branch)}`),
-      token
+      token,
+      'GET',
+      undefined,
+      githubCacheScope(installation)
     ),
     128 * 1024
   );
@@ -325,7 +469,9 @@ export async function checkSelectedGitHubRepository(
   checkedAt: string;
   rateLimit?: { limit: number; remaining: number; resetAt?: string };
 }> {
-  const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name, 'read');
+  const token = await scopedContentsToken(
+    env, installation.installation_id, installation.repository_name, 'read', installation.user_id
+  );
   const resolved = await resolveSelectedBranch(token, installation, requestedBranch);
   const rateLimit = resolved.rateLimit.limit !== undefined && resolved.rateLimit.remaining !== undefined
     ? {
@@ -354,13 +500,18 @@ export async function listSelectedGitHubSessionMarkdown(
   installation: GitHubInstallation,
   requestedBranch?: string
 ): Promise<{ branch: string; files: GitHubSessionMarkdownFile[] }> {
-  const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name, 'read');
+  const token = await scopedContentsToken(
+    env, installation.installation_id, installation.repository_name, 'read', installation.user_id
+  );
   const resolved = await resolveSelectedBranch(token, installation, requestedBranch);
   const tree = await limitedResponseJson<{
     truncated?: unknown;
     tree?: Array<{ path?: unknown; type?: unknown; sha?: unknown }>;
   }>(
-    await githubFetch(repositoryUrl(installation, `/git/trees/${encodeURIComponent(resolved.headSha)}?recursive=1`), token),
+    await githubFetch(
+      repositoryUrl(installation, `/git/trees/${encodeURIComponent(resolved.headSha)}?recursive=1`),
+      token, 'GET', undefined, githubCacheScope(installation)
+    ),
     4 * 1024 * 1024
   );
   if (tree.truncated === true || !Array.isArray(tree.tree)) {
@@ -386,7 +537,10 @@ export async function listSelectedGitHubSessionMarkdown(
       content?: unknown;
       size?: unknown;
     }>(
-      await githubFetch(repositoryUrl(installation, `/contents/${path}?${query}`), token),
+      await githubFetch(
+        repositoryUrl(installation, `/contents/${path}?${query}`),
+        token, 'GET', undefined, githubCacheScope(installation)
+      ),
       MAX_GITHUB_MARKDOWN_BYTES * 2
     );
     if (content.encoding !== 'base64' || typeof content.content !== 'string') {
@@ -420,7 +574,9 @@ export async function updateSelectedGitHubMarkdown(
   if (new TextEncoder().encode(updatedContent).byteLength > MAX_GITHUB_MARKDOWN_BYTES) {
     throw new Error('GitHub session file exceeds the supported size');
   }
-  const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name);
+  const token = await scopedContentsToken(
+    env, installation.installation_id, installation.repository_name, 'write', installation.user_id
+  );
   const path = file.path.split('/').map(encodeURIComponent).join('/');
   const url = repositoryUrl(installation, `/contents/${path}`);
   const body = {
@@ -437,7 +593,9 @@ export async function updateSelectedGitHubMarkdown(
     if (!(error instanceof GitHubAppApiError) || (error.status !== 409 && error.status !== 422)) throw error;
     const query = new URLSearchParams({ ref: branch });
     const current = await limitedResponseJson<{ sha?: unknown; encoding?: unknown; content?: unknown }>(
-      await githubFetch(`${url}?${query}`, token), MAX_GITHUB_MARKDOWN_BYTES * 2
+      await githubFetch(
+        `${url}?${query}`, token, 'GET', undefined, githubCacheScope(installation)
+      ), MAX_GITHUB_MARKDOWN_BYTES * 2
     );
     const latest = current.encoding === 'base64' && typeof current.content === 'string'
       ? decodeBase64Utf8(current.content)
@@ -640,11 +798,12 @@ async function writeSessionMarkdown(
   repository: string,
   path: string,
   markdown: string,
-  commitMessage: string
+  commitMessage: string,
+  cacheNamespace: string
 ): Promise<void> {
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
   let sha: string | undefined;
-  const existing = await githubFetch(url, token);
+  const existing = await githubFetch(url, token, 'GET', undefined, cacheNamespace);
   if (existing.ok) {
     const value = await responseJson<{ sha: string; content?: string; encoding?: string }>(existing);
     sha = value.sha;
@@ -670,11 +829,12 @@ async function deleteSessionMarkdown(
   owner: string,
   repository: string,
   path: string,
-  commitMessage: string
+  commitMessage: string,
+  cacheNamespace: string
 ): Promise<void> {
   if (!isSafeSessionMarkdownPath(path)) throw new Error('GitHub session path is invalid');
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
-  const existing = await githubFetch(url, token);
+  const existing = await githubFetch(url, token, 'GET', undefined, cacheNamespace);
   if (existing.status === 404) return;
   const file = await responseJson<{ sha?: unknown }>(existing);
   if (typeof file.sha !== 'string') throw new Error('GitHub session file revision is missing');
@@ -712,7 +872,9 @@ export async function syncGitHubSessionMarkdown(
 
   let phase = 'installation_token_request';
   try {
-    const token = await scopedContentsToken(env, installation.installation_id, installation.repository_name);
+    const token = await scopedContentsToken(
+      env, installation.installation_id, installation.repository_name, 'write', installation.user_id
+    );
     phase = 'session_contents';
     for (const file of files) {
       await writeSessionMarkdown(
@@ -721,7 +883,8 @@ export async function syncGitHubSessionMarkdown(
         installation.repository_name,
         file.path,
         file.markdown,
-        `Keiko Dojo backup session (${file.sessionDate}): ${file.id}`
+        `Keiko Dojo backup session (${file.sessionDate}): ${file.id}`,
+        githubCacheScope(installation)
       );
     }
     phase = 'session_deletions';
@@ -731,7 +894,8 @@ export async function syncGitHubSessionMarkdown(
         installation.repository_owner,
         installation.repository_name,
         path,
-        'Keiko Dojo backup remove deleted session'
+        'Keiko Dojo backup remove deleted session',
+        githubCacheScope(installation)
       );
     }
     return files.map(({ id, path, revision }) => ({ id, path, revision }));

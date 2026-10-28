@@ -152,7 +152,9 @@ paths:
           pattern: '^[A-Za-z0-9_-]+$'
     get:
       summary: Retrieve a session
-      description: Requires the sessions:read scope.
+      description: Requires sessions:read. Supports private ETag revalidation.
+      parameters:
+        - $ref: '#/components/parameters/IfNoneMatch'
       responses:
         '200':
           description: Session and server-owned revision metadata.
@@ -163,6 +165,11 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SessionResponse'
+        '304':
+          description: The user-scoped entity tag still matches the current record.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -512,20 +519,27 @@ components:
       scheme: bearer
       bearerFormat: JWT
   parameters:
+    IfNoneMatch:
+      in: header
+      name: If-None-Match
+      required: false
+      description: User-scoped ETag from a previous item response.
+      schema:
+        type: string
     IfMatch:
       in: header
       name: If-Match
       required: true
-      description: Strong ETag from the latest GET, formatted as a quoted revision number.
+      description: Strong user-scoped ETag from the latest GET. Legacy quoted revision numbers are also accepted.
       schema:
         type: string
-        pattern: '^"[1-9][0-9]*"$'
+        pattern: '^"(?:[1-9][0-9]*|[1-9][0-9]*-[a-f0-9]{24})"$'
   headers:
     ETag:
-      description: Strong entity tag containing the current revision number.
+      description: Strong user-scoped entity tag containing the current revision.
       schema:
         type: string
-        pattern: '^"[1-9][0-9]*"$'
+        pattern: '^"[1-9][0-9]*-[a-f0-9]{24}"$'
   schemas:
     SessionCategory:
       type: string
@@ -595,7 +609,7 @@ components:
     SessionRecord:
       type: object
       required: [session, revision]
-      description: Use revision as If-Match by quoting the number, for example "3".
+      description: Use the ETag response header as If-Match. Legacy clients may quote the revision number.
       properties:
         session:
           $ref: '#/components/schemas/Session'

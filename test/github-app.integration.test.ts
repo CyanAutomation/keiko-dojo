@@ -129,25 +129,30 @@ describe('GitHub App selected-repository backup adapter', () => {
 
   it('checks and reads only the selected repository session Markdown with read permission', async () => {
     const priorFetch = globalThis.fetch;
-    const requests: Array<{ url: string; body?: unknown }> = [];
+    const requests: Array<{ url: string; body?: unknown; headers: Headers }> = [];
     const markdown = '---\nid: "session-1"\n---\n';
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input);
       const body = init?.body ? JSON.parse(String(init.body)) as unknown : undefined;
-      requests.push({ url, body });
-      if (url.endsWith('/app/installations/731/access_tokens')) return Response.json({ token: 'read-token' });
-      if (url === 'https://api.github.com/repos/CyanAutomation/matmetrics') {
-        return Response.json({ default_branch: 'main' }, { headers: { 'x-ratelimit-limit': '5000', 'x-ratelimit-remaining': '4999' } });
+      const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
+      requests.push({ url, body, headers });
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'read-token', expires_at: new Date(Date.now() + 60 * 60_000).toISOString() });
       }
-      if (url.endsWith('/git/ref/heads/main')) return Response.json({ object: { sha: 'a'.repeat(40) } });
+      const etag = headers.get('if-none-match');
+      if (etag) return new Response(null, { status: 304, headers: { etag, 'x-ratelimit-limit': '5000', 'x-ratelimit-remaining': '4999' } });
+      if (url === 'https://api.github.com/repos/CyanAutomation/matmetrics') {
+        return Response.json({ default_branch: 'main' }, { headers: { etag: '"repo-main"', 'x-ratelimit-limit': '5000', 'x-ratelimit-remaining': '4999' } });
+      }
+      if (url.endsWith('/git/ref/heads/main')) return Response.json({ object: { sha: 'a'.repeat(40) } }, { headers: { etag: '"ref-main"' } });
       if (url.endsWith('/git/trees/' + 'a'.repeat(40) + '?recursive=1')) {
         return Response.json({ truncated: false, tree: [
           { path: 'data/2026/10/20261024-matmetrics-session-1.md', type: 'blob', sha: 'blob-sha' },
           { path: 'other/readme.md', type: 'blob', sha: 'ignored' },
-        ] });
+        ] }, { headers: { etag: '"tree-a"' } });
       }
       if (url.includes('/contents/data/2026/10/20261024-matmetrics-session-1.md?ref=main')) {
-        return Response.json({ sha: 'blob-sha', encoding: 'base64', content: encodeBase64Utf8(markdown) });
+        return Response.json({ sha: 'blob-sha', encoding: 'base64', content: encodeBase64Utf8(markdown) }, { headers: { etag: '"blob-a"' } });
       }
       throw new Error(`Unexpected GitHub API request: ${url}`);
     });
@@ -159,18 +164,19 @@ describe('GitHub App selected-repository backup adapter', () => {
     try {
       const health = await checkSelectedGitHubRepository(appEnv, installation);
       const listing = await listSelectedGitHubSessionMarkdown(appEnv, installation);
+      const repeatedListing = await listSelectedGitHubSessionMarkdown(appEnv, installation);
 
       expect(health).toMatchObject({ success: true, branch: 'main', rateLimit: { limit: 5000, remaining: 4999 } });
       expect(listing.branch).toBe('main');
       expect(listing.files).toEqual([{ path: 'data/2026/10/20261024-matmetrics-session-1.md', sha: 'blob-sha', content: markdown }]);
+      expect(repeatedListing).toEqual(listing);
       expect(requests.filter((request) => String(request.url).endsWith('/app/installations/731/access_tokens')))
-        .toHaveLength(2);
+        .toHaveLength(1);
       expect(requests.filter((request) => String(request.url).endsWith('/app/installations/731/access_tokens'))
         .map((request) => request.body))
-        .toEqual([
-          { repositories: ['matmetrics'], permissions: { contents: 'read' } },
-          { repositories: ['matmetrics'], permissions: { contents: 'read' } },
-        ]);
+        .toEqual([{ repositories: ['matmetrics'], permissions: { contents: 'read' } }]);
+      expect(requests.filter((request) => request.url.includes('/contents/data/')).map((request) => request.headers.get('if-none-match')))
+        .toEqual([null, '"blob-a"']);
     } finally {
       vi.stubGlobal('fetch', priorFetch);
     }
