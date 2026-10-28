@@ -13,6 +13,7 @@
     "deploy": "wrangler deploy",
     "deploy:production": "wrangler deploy --env production",
     "test": "vitest run",
+    "security:dependencies": "npm audit --audit-level=high",
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types",
     "cf-typegen:check": "wrangler types --check",
@@ -24,11 +25,11 @@
     "jose": "6.2.13"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "^1.4.6",
+    "@cloudflare/vitest-plugin": "^1.4.10",
     "@types/node": "^26.6.5",
     "fallow": "3.34.1",
     "typescript": "7.0.2",
     "vitest": "^5.0.5",
-    "wrangler": "4.151.1"
+    "wrangler": "4.155.0"
   }
 }

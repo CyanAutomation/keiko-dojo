@@ -1,6 +1,7 @@
 import { importPKCS8, SignJWT } from 'jose';
 import { createPrivateKey } from 'node:crypto';
 import { isSessionCategory } from '../domain/session';
+import { validateSafeHttpUrl } from '../domain/network-safety';
 import { isSafeSessionMarkdownPath } from '../domain/github-session-markdown';
 import { configuredGitHubAppId } from './github-app-config';
 
@@ -710,11 +711,16 @@ function isValidDuration(value: unknown): boolean {
   );
 }
 
+function isValidVideoUrl(value: unknown): boolean {
+  if (value === undefined || value === '') return true;
+  return typeof value === 'string' && validateSafeHttpUrl(value).ok;
+}
+
 function hasValidOptionalFields(session: Record<string, unknown>): boolean {
   return isValidDescription(session.description) &&
     isValidDescription(session.notes) &&
     isValidDuration(session.duration) &&
-    isValidDescription(session.videoUrl);
+    isValidVideoUrl(session.videoUrl);
 }
 
 function isValidMarkdownSession(

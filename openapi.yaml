@@ -574,7 +574,7 @@ components:
         videoUrl:
           type: string
           format: uri
-          description: Absolute HTTP(S) URL; private or internal network hosts are rejected.
+          description: Absolute HTTP(S) URL without embedded credentials; private or internal network hosts are rejected.
     Session:
       allOf:
         - $ref: '#/components/schemas/SessionFields'
