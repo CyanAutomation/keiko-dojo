@@ -11,9 +11,11 @@ descending and ID descending. Pagination uses an opaque keyset cursor and a
 maximum page size of 100. Optional filters are date bounds, category, and
 effort.
 
-`GET` responses carry a strong ETag containing the record revision. `PUT` and
-`DELETE` require `If-Match`; a missing precondition returns 428 and a stale
-revision returns 412. All errors use `{ "error": { "code", "message" },
+Single-record responses carry a strong ETag containing the record revision and
+a user-scoped digest. Item GETs allow private revalidation with
+`If-None-Match`; `PUT` and `DELETE` accept that ETag in `If-Match`. A missing
+precondition returns 428 and a stale revision returns 412. All errors use
+`{ "error": { "code", "message" },
 "requestId" }`. The API does not accept GitHub ownership claims.
 
 ## Consequences
