@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { authenticateRequest } from '../src/auth/bearer-auth';
 import worker from '../src/index';
 import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
+import { credentialBearingVideoUrl } from './helpers';
 
 const issuer = 'https://auth.example.test';
 const jwksUrl = `${issuer}/api/auth/jwks`;
@@ -375,6 +376,22 @@ describe('Keiko session API', () => {
     expect(secondPage.data[0]?.session.id).not.toBe(firstPage.data[0]?.session.id);
   });
 
+  it('rejects video URLs that contain embedded credentials', async () => {
+    const response = await call('/v1/sessions', 'video-url-credentials', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...testSession,
+        id: 'credential-url',
+        videoUrl: credentialBearingVideoUrl(),
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { message: 'Invalid videoUrl: credentials are not allowed' },
+    });
+  });
+
   it('isolates GitHub Markdown sync status by the authenticated user', async () => {
     const unauthorized = await call('/v1/backups/status', 'backup-user', {}, {
       scope: 'sessions:read',
@@ -617,10 +634,60 @@ describe('Keiko session API', () => {
 
     const mcp = await call('/mcp', 'large-mcp-body', {
       method: 'POST',
-      body: ' '.repeat(1024 * 1024 + 1),
+      body: ' '.repeat(64 * 1024 + 1),
     }, { scope: 'sessions:read' });
     expect(mcp.status).toBe(413);
     expect(await mcp.json()).toMatchObject({ error: { code: 'payload_too_large' } });
+  });
+
+  it('authenticates MCP requests before parsing their body', async () => {
+    const response = await worker.fetch(
+      new Request('https://keiko.example.test/mcp', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{invalid-json',
+      }),
+      testEnv
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({
+      error: { code: 'authentication_required' },
+    });
+  });
+
+  it('requires authentication for MCP initialization and negotiates for authorized clients', async () => {
+    const initialize = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-11-25' },
+    };
+    const unauthorized = await worker.fetch(
+      new Request('https://keiko.example.test/mcp', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(initialize),
+      }),
+      testEnv
+    );
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toMatchObject({
+      error: { code: 'authentication_required' },
+    });
+
+    const authorized = await call('/mcp', 'mcp-initialize', {
+      method: 'POST',
+      body: JSON.stringify(initialize),
+    }, { scope: 'sessions:read' });
+    expect(authorized.status).toBe(200);
+    expect(await authorized.json()).toMatchObject({
+      result: {
+        protocolVersion: '2025-11-25',
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: 'keiko-dojo', version: '1.0.0' },
+      },
+    });
   });
 
   it('exposes read-only MCP tools backed by the same user-scoped session service', async () => {

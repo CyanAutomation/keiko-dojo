@@ -28,7 +28,15 @@ type SyncItem = { session_id: string; generation: number };
 type SyncedFile = { session_id: string; path: string; revision: number };
 
 const MAX_SYNC_ITEMS_PER_BATCH = 50;
+const MAX_FULL_SYNC_SESSIONS = 500;
 const LEASE_SECONDS = 15 * 60;
+
+class FullSyncSessionLimitError extends Error {
+  constructor() {
+    super('GitHub session sync exceeds the supported file count');
+    this.name = 'FullSyncSessionLimitError';
+  }
+}
 
 async function rowsForIds(
   env: Env,
@@ -199,10 +207,10 @@ export async function processGitHubSessionSyncMessage(
     if (fullSync) {
       const result = await env.DB.prepare(
         `SELECT id, session_date, category, effort, payload, revision, updated_at
-         FROM sessions WHERE user_id = ? ORDER BY session_date DESC, id DESC`
-      ).bind(userId).all<GitHubSessionRow>();
+         FROM sessions WHERE user_id = ? ORDER BY session_date DESC, id DESC LIMIT ?`
+      ).bind(userId, MAX_FULL_SYNC_SESSIONS + 1).all<GitHubSessionRow>();
       rows = result.results;
-      if (rows.length > 500) throw new Error('GitHub session sync exceeds the supported file count');
+      if (rows.length > MAX_FULL_SYNC_SESSIONS) throw new FullSyncSessionLimitError();
       const expectedPaths = new Set(rows.map(githubSessionMarkdownPathForRow));
       const remote = await listSelectedGitHubSessionMarkdown(env, installation);
       deletePaths = remote.files
@@ -285,7 +293,19 @@ export async function processGitHubSessionSyncMessage(
       sessionCount: synced.length,
     });
     message.ack();
-  } catch {
+  } catch (error) {
+    if (error instanceof FullSyncSessionLimitError) {
+      await env.DB.prepare(
+        `UPDATE github_session_sync_state
+         SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,
+             wake_enqueued_at = NULL, dispatch_after = NULL,
+             last_error = 'session_limit_exceeded'
+         WHERE user_id = ? AND (? IS NULL OR lease_token = ?)`
+      ).bind(userId, leaseToken, leaseToken).run();
+      await setOperationStatus(env, operationId, userId, 'failed', undefined, 'session_limit_exceeded');
+      message.ack();
+      return;
+    }
     await env.DB.prepare(
       `UPDATE github_session_sync_state
        SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,

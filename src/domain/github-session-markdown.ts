@@ -1,4 +1,5 @@
 import { isSessionCategory, type SessionCategory } from './session';
+import { validateSafeHttpUrl } from './network-safety';
 
 export type GitHubMarkdownSession = {
   id: string;
@@ -33,6 +34,21 @@ const KNOWN_FRONTMATTER = new Set([
   'id', 'date', 'effort', 'category', 'duration', 'videoUrl',
   'keikoBackupVersion', 'keikoTextPayload',
 ]);
+
+function validateMarkdownVideoUrl(value: string): void {
+  const validation = validateSafeHttpUrl(value);
+  if (validation.ok) return;
+  if (validation.reason === 'invalid') {
+    throw new Error('invalid videoUrl: expected an absolute URL');
+  }
+  if (validation.reason === 'protocol') {
+    throw new Error('invalid videoUrl: protocol must be http or https');
+  }
+  if (validation.reason === 'credentials') {
+    throw new Error('invalid videoUrl: credentials are not allowed');
+  }
+  throw new Error('videoUrl must not point to a private or internal network host');
+}
 
 function parseScalar(raw: string): string | number {
   const value = raw.trim();
@@ -220,9 +236,7 @@ function readSession(document: MarkdownDocument): GitHubMarkdownSession {
   const videoUrl = values.get('videoUrl');
   if (videoUrl !== undefined && typeof videoUrl !== 'string') throw new Error('invalid "videoUrl" in frontmatter');
   if (typeof videoUrl === 'string' && videoUrl) {
-    let parsed: URL;
-    try { parsed = new URL(videoUrl); } catch { throw new Error('invalid videoUrl: expected an absolute URL'); }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('invalid videoUrl: protocol must be http or https');
+    validateMarkdownVideoUrl(videoUrl);
   }
 
   const payload = recoverTextPayload(values);
@@ -321,9 +335,7 @@ function readSessionForRepair(document: MarkdownDocument): GitHubMarkdownSession
   if (duration !== undefined && (typeof duration !== 'number' || !Number.isInteger(duration) || duration < 0)) throw new Error('invalid "duration" in frontmatter');
   if (videoUrl !== undefined && typeof videoUrl !== 'string') throw new Error('invalid "videoUrl" in frontmatter');
   if (typeof videoUrl === 'string' && videoUrl) {
-    let parsed: URL;
-    try { parsed = new URL(videoUrl); } catch { throw new Error('invalid videoUrl: expected an absolute URL'); }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('invalid videoUrl: protocol must be http or https');
+    validateMarkdownVideoUrl(videoUrl);
   }
   return {
     id, date, effort, category,

@@ -78,6 +78,7 @@ export async function dispatchPendingGitHubSessionSyncs(env: Env): Promise<void>
     `SELECT state.user_id FROM github_session_sync_state AS state
      INNER JOIN github_installations AS installation ON installation.user_id = state.user_id
      WHERE installation.revoked_at IS NULL
+       AND COALESCE(state.last_error, '') != 'session_limit_exceeded'
        AND state.wake_enqueued = 0
        AND (state.dispatch_after IS NULL OR state.dispatch_after <= ?)
        AND (state.lease_expires_at IS NULL OR state.lease_expires_at <= ?)

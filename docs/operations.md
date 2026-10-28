@@ -102,6 +102,9 @@ registration have been deleted; the Production App is separate and untouched.
   syncs skip identical Markdown. A date change moves the managed file; a
   session delete removes it. Initial and explicit full syncs remove stale
   managed session Markdown files from the selected repository.
+- Full reconciliation is capped at 500 sessions. The query reads at most 501
+  rows before rejecting an oversized sync, records `session_limit_exceeded`,
+  and stops automatic retries until a later session change or explicit sync.
 - GitHub GET responses with ETags are revalidated on repeat requests using a
   bounded, short-lived per-isolate cache scoped to the Keiko user, installation,
   and repository. Installation tokens are also reused per isolate only when

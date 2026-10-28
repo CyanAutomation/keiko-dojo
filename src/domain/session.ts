@@ -1,4 +1,4 @@
-import { isBlockedNetworkHostname } from './network-safety';
+import { validateSafeHttpUrl } from './network-safety';
 
 const SESSION_CATEGORIES = [
   'Technical',
@@ -130,29 +130,18 @@ function validateVideoUrl(
   const trimmed = value.trim();
   if (!trimmed) return { ok: true };
 
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    return {
-      ok: false,
-      error: 'Invalid videoUrl: expected a valid absolute URL',
-    };
+  const validation = validateSafeHttpUrl(trimmed);
+  if (!validation.ok) {
+    const error = validation.reason === 'invalid'
+      ? 'Invalid videoUrl: expected a valid absolute URL'
+      : validation.reason === 'protocol'
+        ? 'Invalid videoUrl: protocol must be http or https'
+        : validation.reason === 'credentials'
+          ? 'Invalid videoUrl: credentials are not allowed'
+          : 'Invalid videoUrl: private or internal network addresses are not allowed';
+    return { ok: false, error };
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return {
-      ok: false,
-      error: 'Invalid videoUrl: protocol must be http or https',
-    };
-  }
-  if (isBlockedNetworkHostname(parsed.hostname)) {
-    return {
-      ok: false,
-      error:
-        'Invalid videoUrl: private or internal network addresses are not allowed',
-    };
-  }
-  return { ok: true, value: parsed.toString() };
+  return { ok: true, value: validation.url.toString() };
 }
 
 function validateTechniques(value: unknown):

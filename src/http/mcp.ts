@@ -5,6 +5,7 @@ import { readJsonBodyLimited } from './request-body';
 import { jsonError } from './responses';
 
 const MCP_VERSION = '2025-11-25';
+const MAX_MCP_BODY_BYTES = 64 * 1024;
 const TOOLS = [
   {
     name: 'list_sessions',
@@ -80,9 +81,9 @@ async function parseJsonRpcRequest(
   request: Request,
   requestId: string
 ): Promise<JsonRpcRequest | Response> {
-  const parsed = await readJsonBodyLimited(request, 1024 * 1024);
+  const parsed = await readJsonBodyLimited(request, MAX_MCP_BODY_BYTES);
   if (!parsed.ok && parsed.reason === 'too_large') {
-    return jsonError(requestId, 413, 'payload_too_large', 'Request body exceeds the 1 MiB limit');
+    return jsonError(requestId, 413, 'payload_too_large', 'Request body exceeds the 64 KiB limit');
   }
   if (!parsed.ok) {
     return rpcError(null, -32700, 'Parse error');
@@ -219,18 +220,15 @@ export async function handleMcpRequest(
   if (origin && origin !== new URL(request.url).origin) {
     return jsonError(requestId, 403, 'authentication_required', 'Request origin could not be verified');
   }
+  const userId = await authenticateMcpUser(request, env, requestId);
+  if (userId instanceof Response) return userId;
   const body = await parseJsonRpcRequest(request, requestId);
   if (body instanceof Response) return body;
   if (body.method === 'notifications/initialized') {
-    const auth = await authenticateMcpUser(request, env, requestId);
-    return auth instanceof Response
-      ? auth
-      : new Response(null, { status: 202, headers: { 'Cache-Control': 'no-store' } });
+    return new Response(null, { status: 202, headers: { 'Cache-Control': 'no-store' } });
   }
   if (body.id === undefined || body.id === null || typeof body.id === 'object') {
     return rpcError(null, -32600, 'Request ID is required');
   }
-  const auth = await authenticateMcpUser(request, env, requestId);
-  if (auth instanceof Response) return auth;
-  return handleAuthenticatedRequest(body, auth, service);
+  return handleAuthenticatedRequest(body, userId, service);
 }
