@@ -142,13 +142,14 @@ function readListFilters(url: URL) {
   return { limit, from, to, category, effort, cursor };
 }
 
-function parseExpectedRevision(request: Request):
+async function parseExpectedRevision(request: Request, userId: string): Promise<
   | { ok: true; revision: number }
-  | { ok: false; status: 400 | 428 } {
+  | { ok: false; status: 400 | 428 }> {
   const ifMatch = request.headers.get('if-match');
   if (!ifMatch) return { ok: false, status: 428 };
-  const match = ifMatch.match(/^"([1-9]\d*)"$/);
+  const match = ifMatch.match(/^"([1-9]\d*)(?:-([a-f0-9]{24}))?"$/);
   if (!match) return { ok: false, status: 400 };
+  if (match[2] && match[2] !== await userTag(userId)) return { ok: false, status: 400 };
   const revision = Number(match[1]);
   return Number.isSafeInteger(revision)
     ? { ok: true, revision }
@@ -185,12 +186,37 @@ function sessionIdFromPath(pathname: string):
     : { ok: false, error: validation.error };
 }
 
-function recordResponse(record: SessionRecord, status = 200): Response {
-  return jsonResponse(
-    { data: record },
-    status,
-    { ETag: `"${record.revision}"` }
-  );
+async function userTag(userId: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId));
+  return [...new Uint8Array(digest).slice(0, 12)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function sessionEtag(userId: string, revision: number): Promise<string> {
+  return `"${revision}-${await userTag(userId)}"`;
+}
+
+function matchesIfNoneMatch(value: string | null, etag: string): boolean {
+  return value?.split(',').some((candidate) => {
+    const tag = candidate.trim();
+    return tag === '*' || tag.replace(/^W\//, '') === etag;
+  }) ?? false;
+}
+
+async function recordResponse(
+  record: SessionRecord,
+  userId: string,
+  status = 200,
+  revalidatable = false
+): Promise<Response> {
+  const headers = new Headers({ ETag: await sessionEtag(userId, record.revision) });
+  if (revalidatable) {
+    headers.set('Cache-Control', 'private, no-cache');
+    headers.set('Vary', 'Authorization');
+    return Response.json({ data: record }, { status, headers });
+  }
+  return jsonResponse({ data: record }, status, headers);
 }
 
 async function listSessions(
@@ -227,7 +253,7 @@ async function createSession(
   const body = await readJsonObject(request);
   if (!body.ok) return bodyFailureResponse(body.status, requestId);
   try {
-    return recordResponse(await service.create(userId, body.value), 201);
+    return recordResponse(await service.create(userId, body.value), userId, 201);
   } catch (error) {
     if (error instanceof SessionAlreadyExistsError) {
       return jsonError(requestId, 409, 'session_conflict', 'Session ID already exists');
@@ -252,15 +278,22 @@ async function handleCollectionRequest(
 }
 
 async function getSession(
+  request: Request,
   userId: string,
   id: string,
   service: SessionService,
   requestId: string
 ): Promise<Response> {
   const record = await service.get(userId, id);
-  return record
-    ? recordResponse(record)
-    : jsonError(requestId, 404, 'not_found', 'Session not found');
+  if (!record) return jsonError(requestId, 404, 'not_found', 'Session not found');
+  const etag = await sessionEtag(userId, record.revision);
+  if (matchesIfNoneMatch(request.headers.get('if-none-match'), etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: etag, 'Cache-Control': 'private, no-cache', Vary: 'Authorization' },
+    });
+  }
+  return recordResponse(record, userId, 200, true);
 }
 
 async function updateSession(
@@ -274,7 +307,7 @@ async function updateSession(
   const body = await readJsonObject(request);
   if (!body.ok) return bodyFailureResponse(body.status, requestId);
   try {
-    return recordResponse(await service.update(userId, id, body.value, revision));
+    return recordResponse(await service.update(userId, id, body.value, revision), userId);
   } catch (error) {
     if (error instanceof InvalidSessionError) {
       return jsonError(requestId, 400, error.code, error.message);
@@ -335,9 +368,9 @@ async function handleItemRequest(
     return jsonError(requestId, 400, 'bad_request', parsedId.error);
   }
   if (request.method.toUpperCase() === 'GET') {
-    return getSession(userId, parsedId.id, service, requestId);
+    return getSession(request, userId, parsedId.id, service, requestId);
   }
-  const expectedRevision = parseExpectedRevision(request);
+  const expectedRevision = await parseExpectedRevision(request, userId);
   if (!expectedRevision.ok) {
     return revisionFailureResponse(requestId, expectedRevision.status);
   }

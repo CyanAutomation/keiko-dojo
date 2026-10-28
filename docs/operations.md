@@ -102,6 +102,12 @@ registration have been deleted; the Production App is separate and untouched.
   syncs skip identical Markdown. A date change moves the managed file; a
   session delete removes it. Initial and explicit full syncs remove stale
   managed session Markdown files from the selected repository.
+- GitHub GET responses with ETags are revalidated on repeat requests using a
+  bounded, short-lived per-isolate cache scoped to the Keiko user, installation,
+  and repository. Installation tokens are also reused per isolate only when
+  GitHub supplies a valid expiry time; they are refreshed five minutes before
+  expiry. These caches are best-effort and do not persist across Worker isolate
+  eviction or deployment.
 - A Keiko account can connect one selected repository. Installations with
   all-repository access or multiple selected repositories are rejected. The
   API can disconnect the installation immediately; users can also uninstall
