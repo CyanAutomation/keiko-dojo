@@ -66,6 +66,30 @@ export function isBlockedNetworkHostname(hostname: string): boolean {
   return false;
 }
 
+export type SafeHttpUrlResult =
+  | { ok: true; url: URL }
+  | { ok: false; reason: 'invalid' | 'protocol' | 'credentials' | 'network' };
+
+export function validateSafeHttpUrl(value: string): SafeHttpUrlResult {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return { ok: false, reason: 'invalid' };
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { ok: false, reason: 'protocol' };
+  }
+  if (url.username || url.password) {
+    return { ok: false, reason: 'credentials' };
+  }
+  if (isBlockedNetworkHostname(url.hostname)) {
+    return { ok: false, reason: 'network' };
+  }
+  return { ok: true, url };
+}
+
 function normalizeNetworkHostname(hostname: string): string {
   const lowered = hostname.trim().toLowerCase().replace(/\.+$/, '');
   if (lowered.startsWith('[') && lowered.endsWith(']')) {

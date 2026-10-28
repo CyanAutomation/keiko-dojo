@@ -22,7 +22,8 @@ as the starting parity fixture set.
 - `description` and `notes` are optional strings.
 - `duration` is an optional non-negative integer measured in minutes.
 - Empty or whitespace-only `videoUrl` values are omitted. Other values must be
-  absolute HTTP(S) URLs and cannot point to private or internal network hosts.
+  absolute HTTP(S) URLs without embedded username/password credentials and
+  cannot point to private or internal network hosts.
 - Unknown request fields are ignored. In particular, `owner` and `repo` do not
   affect account selection or authorization.
 
