@@ -4,6 +4,7 @@ import {
   normalizeSessionMarkdown,
   parseSessionMarkdown,
 } from '../src/domain/github-session-markdown';
+import { credentialBearingVideoUrl } from './helpers';
 
 const originalText = {
   techniques: ['Ōuchi mata', 'Grip fighting'],
@@ -138,6 +139,30 @@ describe('GitHub session Markdown', () => {
     expect(result.changed).toBe(false);
     expect(result.errors.length).toBeGreaterThan(0);
     expect(result.markdown).toContain('# Broken');
+  });
+
+  it('rejects video URLs with embedded credentials in parsed and repaired Markdown', () => {
+    const markdown = keikoMarkdown().replace(
+      'category: "Technical"',
+      `category: "Technical"\nvideoUrl: ${JSON.stringify(credentialBearingVideoUrl())}`
+    );
+
+    expect(parseSessionMarkdown(markdown)).toMatchObject({ ok: false });
+    expect(normalizeSessionMarkdown(markdown).errors).toContain(
+      'invalid videoUrl: credentials are not allowed'
+    );
+  });
+
+  it('rejects private network video URLs in parsed and repaired Markdown', () => {
+    const markdown = keikoMarkdown().replace(
+      'category: "Technical"',
+      'category: "Technical"\nvideoUrl: "http://127.0.0.1/clip"'
+    );
+
+    expect(parseSessionMarkdown(markdown)).toMatchObject({ ok: false });
+    expect(normalizeSessionMarkdown(markdown).errors).toContain(
+      'videoUrl must not point to a private or internal network host'
+    );
   });
 
   it.each([

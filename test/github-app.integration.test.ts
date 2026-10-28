@@ -5,6 +5,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { processGitHubOperationMessage } from '../src/http/github-operations';
 import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
+import { dispatchPendingGitHubSessionSyncs } from '../src/application/github-session-sync-queue';
+import { credentialBearingVideoUrl } from './helpers';
 import {
   checkSelectedGitHubRepository,
   GitHubInstallationVerificationError,
@@ -629,6 +631,82 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('bounds an over-limit full sync and does not retry the permanent limit error', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `session-sync-limit-${crypto.randomUUID()}`;
+    const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const syncEnv = Object.assign(Object.create(appEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    const now = new Date().toISOString();
+    const insert = (index: number) => {
+      const session = {
+        id: `over-limit-${index}`,
+        date: '2026-10-25',
+        techniques: ['Uchi mata'],
+        effort: 3,
+        category: 'Technical',
+      };
+      return env.DB.prepare(
+        `INSERT INTO sessions
+         (user_id, id, session_date, category, effort, payload, revision, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      ).bind(userId, session.id, session.date, session.category, session.effort,
+        JSON.stringify(session), now, now);
+    };
+    const githubRequests: string[] = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      githubRequests.push(url);
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 905, 'maki', 'judo-notes', 905, now).run();
+
+    try {
+      const statements = Array.from({ length: 501 }, (_, index) => insert(index));
+      for (let offset = 0; offset < statements.length; offset += 50) {
+        await env.DB.batch(statements.slice(offset, offset + 50));
+      }
+      await env.DB.prepare(
+        `UPDATE github_session_sync_state SET full_sync_required = 1, next_sync_at = ?
+         WHERE user_id = ?`
+      ).bind(new Date(0).toISOString(), userId).run();
+
+      const ack = vi.fn();
+      const retry = vi.fn();
+      await processGitHubSessionSyncMessage({
+        body: { kind: 'github-session-sync', userId }, attempts: 1, ack, retry,
+      } as unknown as Message<{ kind: 'github-session-sync'; userId: string }>, syncEnv);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(githubRequests).toEqual([]);
+      expect(await env.DB.prepare(
+        'SELECT full_sync_required, last_error FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ full_sync_required: 1, last_error: 'session_limit_exceeded' });
+      await dispatchPendingGitHubSessionSyncs(syncEnv);
+      expect(send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ userId }),
+        expect.anything()
+      );
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+        env.DB.prepare('UPDATE github_installations SET revoked_at = ? WHERE user_id = ?')
+          .bind(new Date().toISOString(), userId),
+        env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+      ]);
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
   it('acknowledges a terminal session-sync failure instead of retrying the message', async () => {
     const priorFetch = globalThis.fetch;
     const userId = `terminal-session-sync-${crypto.randomUUID()}`;
@@ -1098,6 +1176,14 @@ describe('GitHub App selected-repository backup adapter', () => {
       category: 'Technical',
       effort: 3,
       techniques: ['   '],
+    })],
+    ['credential-bearing video URL', JSON.stringify({
+      id: 'invalid-session',
+      date: '2026-10-17',
+      category: 'Technical',
+      effort: 3,
+      techniques: ['Uchi mata'],
+      videoUrl: credentialBearingVideoUrl(),
     })],
   ])('rejects stored sessions with %s before requesting GitHub access', async (_case, payload) => {
     const priorFetch = globalThis.fetch;
