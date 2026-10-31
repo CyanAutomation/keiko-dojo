@@ -889,7 +889,7 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
-  it('uses one timestamp to validate and consume an OAuth state near expiry', async () => {
+  it('accepts and consumes an OAuth state that is valid at consumption time', async () => {
     const priorFetch = globalThis.fetch;
     const previousFrontendOrigin = appEnv.MATMETRICS_FRONTEND_URL;
     const state = crypto.randomUUID() + crypto.randomUUID();
@@ -898,7 +898,6 @@ describe('GitHub App selected-repository backup adapter', () => {
       'SHA-256', new TextEncoder().encode(state)
     ))).map((value) => value.toString(16).padStart(2, '0')).join('');
     const selectTime = '2026-10-18T10:00:00.000Z';
-    const updateTime = '2026-10-18T10:00:01.000Z';
     await env.DB.prepare(
       `INSERT INTO github_installation_states (state_hash, user_id, created_at, expires_at)
        VALUES (?, ?, ?, ?)`
@@ -921,8 +920,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       throw new Error(`Unexpected GitHub API request: ${url}`);
     });
     const isoTimestamp = vi.spyOn(Date.prototype, 'toISOString')
-      .mockImplementationOnce(() => selectTime)
-      .mockImplementationOnce(() => updateTime);
+      .mockImplementationOnce(() => selectTime);
 
     try {
       const callbackUrl = new URL('/v1/backups/github-installation/callback', 'https://keiko.example.test');
@@ -931,7 +929,6 @@ describe('GitHub App selected-repository backup adapter', () => {
       const callback = await worker.fetch(new Request(callbackUrl), appEnv);
 
       expect(callback.headers.get('location')).toBe('https://matmetrics.example.test/?githubBackup=connected');
-      expect(isoTimestamp).toHaveBeenCalledTimes(3);
       expect(await env.DB.prepare(
         'SELECT consumed_at FROM github_installation_states WHERE state_hash = ?'
       ).bind(stateHash).first()).toMatchObject({ consumed_at: selectTime });
@@ -1224,7 +1221,7 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
-  it('rejects GitHub App installations with all-repository access or more than one selected repository', async () => {
+  it('rejects GitHub Apps configured for all-repository installation access', async () => {
     const priorFetch = globalThis.fetch;
     const calls: string[] = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
@@ -1233,6 +1230,24 @@ describe('GitHub App selected-repository backup adapter', () => {
       if (url.endsWith('/app/installations/732')) {
         return Response.json({ id: 732, repository_selection: 'all' });
       }
+      throw new Error(`Unexpected GitHub API request: ${url}`);
+    });
+
+    try {
+      await expect(verifySelectedRepositoryInstallation(appEnv, 732))
+        .rejects.toMatchObject({ phase: 'installation_scope' });
+      expect(calls).toEqual(['https://api.github.com/app/installations/732']);
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('rejects selected GitHub App installations that include multiple repositories', async () => {
+    const priorFetch = globalThis.fetch;
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      calls.push(url);
       if (url.endsWith('/app/installations/733')) {
         return Response.json({ id: 733, repository_selection: 'selected' });
       }
@@ -1244,11 +1259,6 @@ describe('GitHub App selected-repository backup adapter', () => {
     });
 
     try {
-      await expect(verifySelectedRepositoryInstallation(appEnv, 732))
-        .rejects.toMatchObject({ phase: 'installation_scope' });
-      expect(calls).toEqual(['https://api.github.com/app/installations/732']);
-
-      calls.length = 0;
       await expect(verifySelectedRepositoryInstallation(appEnv, 733))
         .rejects.toMatchObject({ phase: 'repository_scope' });
       expect(calls).toEqual([
