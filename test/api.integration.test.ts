@@ -38,6 +38,8 @@ async function tokenFor(
     scope?: string;
     expired?: boolean;
     issuedAtOffsetSeconds?: number;
+    subject?: string;
+    appUserId?: string;
   } = {}
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
@@ -45,11 +47,11 @@ async function tokenFor(
     ? now - 600
     : now + (options.issuedAtOffsetSeconds ?? 0);
   return new SignJWT({
-    appUserId: userId,
+    appUserId: options.appUserId ?? userId,
     scope: options.scope ?? 'sessions:read sessions:write',
   })
     .setProtectedHeader({ alg: 'EdDSA', kid: keyId })
-    .setSubject(userId)
+    .setSubject(options.subject ?? userId)
     .setIssuer(issuer)
     .setAudience(options.aud ?? audience)
     .setIssuedAt(issuedAt)
@@ -204,6 +206,12 @@ describe('Keiko session API', () => {
     });
     expect(wrongAudience.status).toBe(401);
 
+    const mismatchedSubject = await call('/v1/sessions?limit=1', 'user-a', {}, {
+      subject: 'another-user',
+      scope: 'sessions:read',
+    });
+    expect(mismatchedSubject.status).toBe(401);
+
     const missingScope = await call('/v1/sessions', 'user-a', {}, {
       scope: 'backups:read',
     });
@@ -331,10 +339,14 @@ describe('Keiko session API', () => {
     );
   });
 
-  it('returns a user-scoped analytics summary', async () => {
+  it('returns an analytics summary scoped to the authenticated user', async () => {
     await call('/v1/sessions', 'user-a', {
       method: 'POST',
       body: JSON.stringify(testSession),
+    });
+    await call('/v1/sessions', 'other-analytics-user', {
+      method: 'POST',
+      body: JSON.stringify({ ...testSession, id: 'other-analytics-session', category: 'Randori', effort: 1 }),
     });
     const response = await call('/v1/analytics/summary', 'user-a');
     expect(response.status).toBe(200);
@@ -712,9 +724,41 @@ describe('Keiko session API', () => {
         },
       },
     });
-    const unauthorized = await call('/mcp', 'mcp-user', {
+    const listedTools = await call('/mcp', 'mcp-user', {
       method: 'POST',
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+    }, { scope: 'sessions:read' });
+    const toolList = await listedTools.json() as {
+      result: { tools: Array<{ name: string; annotations: { readOnlyHint: boolean } }> };
+    };
+    expect(toolList.result.tools.map(({ name }) => name).sort()).toEqual([
+      'get_session', 'get_training_summary', 'list_sessions',
+    ]);
+    expect(toolList.result.tools.every((tool) => tool.annotations.readOnlyHint)).toBe(true);
+
+    const ownSession = await call('/mcp', 'mcp-user', {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 3, method: 'tools/call',
+        params: { name: 'get_session', arguments: { id: testSession.id } },
+      }),
+    }, { scope: 'sessions:read' });
+    expect(await ownSession.json()).toMatchObject({
+      result: { structuredContent: { session: { id: testSession.id } } },
+    });
+    const otherUsersSession = await call('/mcp', 'other-mcp-user', {
+      method: 'POST',
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 4, method: 'tools/call',
+        params: { name: 'get_session', arguments: { id: testSession.id } },
+      }),
+    }, { scope: 'sessions:read' });
+    expect(await otherUsersSession.json()).toMatchObject({
+      result: { isError: true, structuredContent: { error: 'Session not found' } },
+    });
+    const unauthorized = await call('/mcp', 'mcp-user', {
+      method: 'POST',
+      body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/list' }),
     }, { scope: 'sessions:write' });
     expect(unauthorized.status).toBe(403);
   });
@@ -722,14 +766,20 @@ describe('Keiko session API', () => {
   it('keeps request logs free of session content and bearer tokens', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const secretText = 'private-training-note-do-not-log';
+    const bearerToken = await tokenFor('logging-user');
     try {
-      await call('/v1/sessions', 'logging-user', {
+      await worker.fetch(new Request('https://keiko.example.test/v1/sessions', {
         method: 'POST',
+        headers: {
+          authorization: `Bearer ${bearerToken}`,
+          'content-type': 'application/json',
+        },
         body: JSON.stringify({ ...testSession, id: 'safe-log-test', notes: secretText }),
-      });
+      }), testEnv);
       const serialized = log.mock.calls.map((args) => JSON.stringify(args)).join('\n');
       expect(serialized).not.toContain(secretText);
-      expect(serialized).not.toContain('eyJ');
+      expect(serialized).not.toContain(bearerToken);
+      expect(serialized).not.toContain('authorization');
     } finally {
       log.mockRestore();
     }
@@ -820,6 +870,21 @@ describe('Keiko session API', () => {
         code: 'authentication_required',
         message: 'Invalid access token',
       },
+    });
+  });
+
+  it('reports not ready when the D1 health query fails', async () => {
+    const unavailableEnv = Object.assign(Object.create(testEnv), {
+      DB: { prepare: () => { throw new Error('D1 unavailable'); } },
+    }) as unknown as Env;
+    const response = await worker.fetch(
+      new Request('https://keiko.example.test/readyz'),
+      unavailableEnv
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: { code: 'internal_error', message: 'Service is not ready' },
     });
   });
 });
