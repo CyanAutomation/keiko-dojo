@@ -8,9 +8,10 @@ on Cloudflare Workers and D1.
 
 ## Local development
 
-Requirements: Node.js 24 and npm 11.
+Requirements: Node.js 26 and npm 11.6.2.
 
 ```bash
+npm install --global npm@11.6.2
 npm ci
 npm run cf-typegen
 npm run dev
