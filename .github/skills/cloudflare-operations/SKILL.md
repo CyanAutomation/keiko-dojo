@@ -38,9 +38,10 @@ and recovery procedures.
 
 ## Commands and checks
 
-The project targets Node.js 24 and npm 11. Local setup and routine checks use:
+The project targets Node.js 26 and npm 11.6.2. Local setup and routine checks use:
 
 ```bash
+npm install --global npm@11.6.2
 npm ci
 npm run cf-typegen
 npm run migrate:local
