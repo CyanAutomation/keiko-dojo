@@ -10,14 +10,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
-  pull-requests: read
   security-events: write
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:
