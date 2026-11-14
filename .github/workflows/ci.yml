@@ -47,5 +47,8 @@ jobs:
           fetch-depth: 0
       - uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb # v3.99.8
         with:
-          version: 3.99.7
+          # Make PR coverage explicit; TruffleHog handles push and full-history events itself.
+          base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+          head: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+          version: 3.99.8
           extra_args: --no-verification
