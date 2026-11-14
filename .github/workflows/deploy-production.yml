@@ -12,12 +12,18 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main'
     environment:
       name: cloudflare
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
+      - name: Require main branch
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Production deployments can only be dispatched from main."
+            exit 1
+          fi
+
       - name: Check Cloudflare environment configuration
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
