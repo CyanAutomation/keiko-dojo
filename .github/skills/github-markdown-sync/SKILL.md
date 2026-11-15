@@ -8,19 +8,23 @@ relatedSkills: [identity-and-tenant-security, cloudflare-operations]
 # GitHub Markdown Sync
 
 Use this skill when changing session-to-GitHub Markdown sync, Cloudflare Queue
-handling, GitHub App installation, or repository reconciliation. The selected
-repository is a second-brain Markdown copy, not a D1 snapshot or restore source.
+handling, GitHub App installation, repository reconciliation, or tenant-scoped
+GitHub operation jobs. The selected repository is a second-brain Markdown copy,
+not a D1 snapshot or restore source.
 
 ## Read first
 
 - `docs/operations.md`, especially **GitHub Markdown sync** and **Monitoring**.
 - `src/http/backups.ts`, `src/http/github-sync.ts`,
+  `src/http/github-operations.ts`,
   `src/application/github-session-sync-queue.ts`, and
   `src/integrations/github-app.ts`.
 - `migrations/0007_github_session_sync.sql` and the session/installation
   migrations that define its trigger dependencies.
 - Existing scenarios in `test/api.integration.test.ts` and
   `test/github-app.integration.test.ts`.
+- For health, sync-all, and Log Doctor job behavior, inspect the relevant
+  operation routes, queue consumer, migration, and integration scenarios.
 
 ## Queue and sync rules
 
@@ -56,10 +60,26 @@ repository is a second-brain Markdown copy, not a D1 snapshot or restore source.
 - Do not log GitHub response bodies, private keys, or tokens. Report stable
   error codes instead.
 
+## GitHub operation jobs
+
+- Keep job creation and result access scoped to the verified user ID. A caller
+  must not read or operate on another user's job by supplying its ID.
+- Preserve narrow scopes: health checks and Log Doctor scans use
+  `github:read`; sync-all and confirmed Log Doctor fixes use `github:write`.
+- Treat queue messages as untrusted and potentially duplicated. Validate the
+  job, owner, operation type, payload, and allowed managed Markdown paths before
+  making repository changes.
+- Keep destructive Log Doctor fixes explicitly confirmed, bounded by the
+  existing file limit, and safe to retry. Preserve dry-run behavior and report
+  stable job states and error codes.
+- Keep worker failures, queue dispatch failures, attempts, and terminal job
+  states observable without logging repository contents or credentials.
+
 ## Verification
 
 Use integration tests for delayed coalescing, duplicate delivery, dispatch
 failure and recovery, initial reconciliation, path moves/deletes, installation
-selection, token scope, and one-time callback state as appropriate. The
-repository CI commands are `npm test`, `npm run typecheck`, and
-`npm run check:migrations`.
+selection, token scope, one-time callback state, tenant-scoped job access,
+operation authorization, queue failure, and safe Log Doctor fixes as
+appropriate. Run the focused tests and the repository CI checks defined in
+`.github/workflows/ci.yml`.

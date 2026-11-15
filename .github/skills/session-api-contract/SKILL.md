@@ -53,9 +53,9 @@ pagination, revisions, analytics, or the API documentation and fixtures.
 4. Extend `test/api.integration.test.ts` for externally visible behavior.
    Keep REST and MCP authorization and account scope consistent.
 
-## Verification commands
+## Verification
 
-For session contract changes, the repo's CI checks are:
+For focused local verification of session behavior, run:
 
 ```bash
 npm test
@@ -63,5 +63,7 @@ npm run typecheck
 npm run check:migrations
 ```
 
-`npm run cf-typegen:check` is also part of CI when Worker bindings or
-`wrangler.jsonc` change.
+These are focused checks, not the full CI gate. The definitive current CI and
+deployment checks are in `.github/workflows/ci.yml` and
+`.github/workflows/deploy-production.yml`; consult those when the change affects
+generated Worker types, dependencies, migrations, or deployment configuration.

@@ -22,14 +22,15 @@ and recovery procedures.
 
 ## Environment boundaries
 
-- Keep local, staging, and production Worker, D1, Queue, DLQ, cron, and
-  rate-limit namespace configuration separate. Do not point Keiko at
-  MatMetrics' `matmetrics-data` database.
+- Keep each configured environment's Worker, D1, Queue, DLQ, cron, and
+  rate-limit namespace configuration separate. Check `docs/operations.md`
+  before assuming staging resources exist. Do not point Keiko at MatMetrics'
+  `matmetrics-data` database.
 - Store `GITHUB_APP_PRIVATE_KEY` with Wrangler secrets; never put private keys
   or tokens in `wrangler.jsonc`, GitHub workflow variables, or source.
-- Keep production D1 and account cutover gated on staging and recovery
-  validation. Check `docs/operations.md` for current deployment state before
-  assuming a migration, deployment, import, or cutover has happened.
+- Follow the validation and recovery gates currently documented in
+  `docs/operations.md`. Check its current deployment state before assuming a
+  migration, deployment, import, or cutover has happened.
 - Apply a migration to the intended database before deploying code that
   depends on it. Add a new forward-only file under `migrations/`; never edit a
   migration already applied to a remote database.
@@ -51,10 +52,13 @@ npm run typecheck
 npm run check:migrations
 ```
 
-CI runs tests, generated Worker type checks, TypeScript type checks, and local
-migration checks. Keep generated `worker-configuration.d.ts` in sync when
-bindings change. Remote migration and deploy commands are environment-specific
-and listed in `README.md`; follow the staging and production gates in
+`.github/workflows/ci.yml` is the definitive list of CI checks. It currently
+runs the dependency audit, tests, generated Worker type checks, TypeScript type
+checks, and local migration checks. Production deployment repeats these gates
+in `.github/workflows/deploy-production.yml` before applying migrations and
+deploying. Keep generated `worker-configuration.d.ts` in sync when bindings
+change. Remote migration and deploy commands are environment-specific and
+listed in `README.md`; follow the current rollout and recovery instructions in
 `docs/operations.md` before using them.
 
 When changing queues or scheduled jobs, update all environment bindings and
