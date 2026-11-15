@@ -32,7 +32,7 @@ const IPV6_BLOCKED_CIDRS: Array<[bigint, number]> = [
   [ipv6ToBigInt('ff00::'), 8], // multicast
 ];
 
-export function isBlockedNetworkHostname(hostname: string): boolean {
+function isBlockedNetworkHostname(hostname: string): boolean {
   const normalizedHost = normalizeNetworkHostname(hostname);
   if (!normalizedHost) {
     return true;
