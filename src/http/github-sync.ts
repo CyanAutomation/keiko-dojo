@@ -133,160 +133,306 @@ async function completeNoop(
   });
 }
 
+type SyncBatch = {
+  fullSync: boolean;
+  rows: GitHubSessionRow[];
+  items: SyncItem[];
+  deletePaths: string[];
+  replaceManifest: boolean;
+};
+
+async function loadSyncBatch(
+  env: Env,
+  userId: string,
+  installation: Installation,
+  generation: number,
+  fullSync: boolean
+): Promise<SyncBatch | null> {
+  if (fullSync) {
+    const result = await env.DB.prepare(
+      `SELECT id, session_date, category, effort, payload, revision, updated_at
+       FROM sessions WHERE user_id = ? ORDER BY session_date DESC, id DESC LIMIT ?`
+    ).bind(userId, MAX_FULL_SYNC_SESSIONS + 1).all<GitHubSessionRow>();
+    const rows = result.results;
+    if (rows.length > MAX_FULL_SYNC_SESSIONS) throw new FullSyncSessionLimitError();
+    const expectedPaths = new Set(rows.map(githubSessionMarkdownPathForRow));
+    const remote = await listSelectedGitHubSessionMarkdown(env, installation);
+    return {
+      fullSync: true,
+      rows,
+      items: [],
+      deletePaths: remote.files
+        .filter((file) => isKeikoSessionMarkdownPath(file.path) && !expectedPaths.has(file.path))
+        .map((file) => file.path),
+      replaceManifest: true,
+    };
+  }
+
+  const pendingItems = await env.DB.prepare(
+    `SELECT session_id, generation FROM github_session_sync_items
+     WHERE user_id = ? AND generation <= ?
+     ORDER BY generation, session_id LIMIT ?`
+  ).bind(userId, generation, MAX_SYNC_ITEMS_PER_BATCH).all<SyncItem>();
+  const items = pendingItems.results;
+  if (!items.length) return null;
+
+  const ids = items.map((item) => item.session_id);
+  const rows = await rowsForIds(env, userId, ids);
+  const idList = ids.map(() => '?').join(', ');
+  const mapped = await env.DB.prepare(
+    `SELECT session_id, path, revision FROM github_synced_session_files
+     WHERE user_id = ? AND repository_id = ? AND session_id IN (${idList})`
+  ).bind(userId, installation.repository_id, ...ids).all<SyncedFile>();
+  const nextPaths = new Map(rows.map((row) => [row.id, githubSessionMarkdownPathForRow(row)]));
+  return {
+    fullSync: false,
+    rows,
+    items,
+    deletePaths: mapped.results
+      .filter((file) => nextPaths.get(file.session_id) !== file.path)
+      .map((file) => file.path),
+    replaceManifest: false,
+  };
+}
+
+async function clearProcessedItems(
+  env: Env,
+  userId: string,
+  generation: number,
+  batch: SyncBatch
+): Promise<void> {
+  const statements: D1PreparedStatement[] = [];
+  if (batch.fullSync) {
+    statements.push(env.DB.prepare(
+      'DELETE FROM github_session_sync_items WHERE user_id = ? AND generation <= ?'
+    ).bind(userId, generation));
+  } else {
+    for (const item of batch.items) {
+      statements.push(env.DB.prepare(
+        `DELETE FROM github_session_sync_items
+         WHERE user_id = ? AND session_id = ? AND generation = ?`
+      ).bind(userId, item.session_id, item.generation));
+    }
+  }
+  if (statements.length) await env.DB.batch(statements);
+}
+
+async function syncAndPersistBatch(
+  env: Env,
+  userId: string,
+  installation: Installation,
+  generation: number,
+  batch: SyncBatch
+): Promise<Array<{ id: string; path: string; revision: number }>> {
+  const synced = await syncGitHubSessionMarkdown(env, installation, batch.rows, batch.deletePaths);
+  const syncedById = new Map(synced.map((file) => [file.id, file]));
+  const removedIds = batch.fullSync
+    ? []
+    : batch.items.filter((item) => !syncedById.has(item.session_id)).map((item) => item.session_id);
+  await upsertSyncedFiles(env, userId, installation.repository_id,
+    synced.map((file) => ({ session_id: file.id, path: file.path, revision: file.revision })),
+    removedIds, batch.replaceManifest);
+  await clearProcessedItems(env, userId, generation, batch);
+  return synced;
+}
+
+async function finalizeSync(
+  env: Env,
+  userId: string,
+  generation: number,
+  leaseToken: string
+): Promise<void> {
+  const completedAt = new Date().toISOString();
+  const finalized = await env.DB.prepare(
+    `UPDATE github_session_sync_state
+     SET completed_generation = ?, full_sync_required = 0, last_synced_at = ?, last_error = NULL,
+         wake_enqueued = 0, wake_enqueued_at = NULL,
+         lease_token = NULL, lease_expires_at = NULL, dispatch_after = NULL
+     WHERE user_id = ? AND generation = ? AND lease_token = ?
+       AND NOT EXISTS (SELECT 1 FROM github_session_sync_items WHERE user_id = ?)`
+  ).bind(generation, completedAt, userId, generation, leaseToken, userId).run();
+
+  if (finalized.meta.changes !== 1) {
+    await env.DB.prepare(
+      `UPDATE github_session_sync_state
+       SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,
+           wake_enqueued_at = NULL, dispatch_after = NULL
+       WHERE user_id = ? AND lease_token = ?`
+    ).bind(userId, leaseToken).run();
+    await dispatchGitHubSessionSync(env, userId);
+  }
+}
+
+async function handleSyncFailure(
+  error: unknown,
+  env: Env,
+  message: Message<GitHubSessionSyncMessage>,
+  userId: string,
+  operationId: string | undefined,
+  leaseToken: string | null
+): Promise<void> {
+  if (error instanceof FullSyncSessionLimitError) {
+    await env.DB.prepare(
+      `UPDATE github_session_sync_state
+       SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,
+           wake_enqueued_at = NULL, dispatch_after = NULL,
+           last_error = 'session_limit_exceeded'
+       WHERE user_id = ? AND (? IS NULL OR lease_token = ?)`
+    ).bind(userId, leaseToken, leaseToken).run();
+    await setOperationStatus(env, operationId, userId, 'failed', undefined, 'session_limit_exceeded');
+    message.ack();
+    return;
+  }
+
+  await env.DB.prepare(
+    `UPDATE github_session_sync_state
+     SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,
+         wake_enqueued_at = NULL,
+         dispatch_after = ?, last_error = 'github_sync_failed'
+     WHERE user_id = ? AND (? IS NULL OR lease_token = ?)`
+  ).bind(new Date(Date.now() + 60_000).toISOString(), userId, leaseToken, leaseToken).run();
+  const terminal = message.attempts >= 5;
+  await setOperationStatus(env, operationId, userId,
+    terminal ? 'failed' : 'queued', undefined, terminal ? 'github_sync_failed' : undefined);
+  if (terminal) {
+    message.ack();
+  } else {
+    await dispatchGitHubSessionSync(env, userId);
+    message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
+  }
+}
+
+type SyncContext = { installation: Installation | null; state: SyncState | null };
+type PreparedSync = {
+  installation: Installation;
+  repositoryId: number;
+  generation: number;
+  fullSync: boolean;
+  leaseToken: string;
+};
+
+async function readSyncContext(env: Env, userId: string): Promise<SyncContext> {
+  const installation = await env.DB.prepare(
+    `SELECT user_id, installation_id, repository_owner, repository_name, repository_id
+     FROM github_installations WHERE user_id = ? AND revoked_at IS NULL`
+  ).bind(userId).first<Installation>();
+  const state = await env.DB.prepare(
+    `SELECT user_id, repository_id, generation, full_sync_required, next_sync_at,
+       wake_enqueued, lease_token
+     FROM github_session_sync_state WHERE user_id = ?`
+  ).bind(userId).first<SyncState>();
+  return { installation, state };
+}
+
+async function handleMissingSyncContext(
+  env: Env,
+  message: Message<GitHubSessionSyncMessage>,
+  userId: string,
+  operationId: string | undefined,
+  installation: Installation | null
+): Promise<void> {
+  if (operationId) {
+    await setOperationStatus(env, operationId, userId, 'failed', undefined,
+      installation ? 'sync_state_missing' : 'github_connection_missing');
+  }
+  message.ack();
+}
+
+async function deferSyncUntilDue(
+  env: Env,
+  message: Message<GitHubSessionSyncMessage>,
+  userId: string
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE github_session_sync_state SET wake_enqueued = 0, wake_enqueued_at = NULL
+     WHERE user_id = ? AND lease_token IS NULL`
+  ).bind(userId).run();
+  message.ack();
+  await dispatchGitHubSessionSync(env, userId);
+}
+
+async function handleUnavailableLease(
+  env: Env,
+  message: Message<GitHubSessionSyncMessage>,
+  userId: string,
+  operationId: string | undefined
+): Promise<void> {
+  if (operationId) {
+    await setOperationStatus(env, operationId, userId, 'queued');
+    message.retry({ delaySeconds: 15 });
+    return;
+  }
+  message.ack();
+}
+
+async function prepareSync(
+  env: Env,
+  message: Message<GitHubSessionSyncMessage>,
+  now: Date,
+  userId: string,
+  operationId: string | undefined,
+  leaseRef: { token: string | null }
+): Promise<PreparedSync | null> {
+  const { installation, state } = await readSyncContext(env, userId);
+  if (!installation || !state) {
+    await handleMissingSyncContext(env, message, userId, operationId, installation);
+    return null;
+  }
+  if (Date.parse(state.next_sync_at) > now.getTime() && !operationId) {
+    await deferSyncUntilDue(env, message, userId);
+    return null;
+  }
+
+  const leaseToken = crypto.randomUUID();
+  leaseRef.token = leaseToken;
+  const leaseExpiresAt = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString();
+  const claimed = await env.DB.prepare(
+    `UPDATE github_session_sync_state SET lease_token = ?, lease_expires_at = ?
+     WHERE user_id = ? AND repository_id = ? AND generation = ?
+       AND (lease_token IS NULL OR lease_expires_at <= ?)
+     RETURNING generation, full_sync_required`
+  ).bind(leaseToken, leaseExpiresAt, userId, state.repository_id,
+    state.generation, now.toISOString()).first<{ generation: number; full_sync_required: number }>();
+  if (!claimed) {
+    await handleUnavailableLease(env, message, userId, operationId);
+    return null;
+  }
+  return {
+    installation,
+    repositoryId: state.repository_id,
+    generation: claimed.generation,
+    fullSync: claimed.full_sync_required === 1,
+    leaseToken,
+  };
+}
+
 export async function processGitHubSessionSyncMessage(
   message: Message<GitHubSessionSyncMessage>,
   env: Env
 ): Promise<void> {
   const { userId, operationId } = message.body;
   const now = new Date();
-  const nowIso = now.toISOString();
-  let leaseToken: string | null = null;
+  const leaseRef = { token: null as string | null };
 
   try {
-    const installation = await env.DB.prepare(
-      `SELECT user_id, installation_id, repository_owner, repository_name, repository_id
-       FROM github_installations WHERE user_id = ? AND revoked_at IS NULL`
-    ).bind(userId).first<Installation>();
-    const beforeLease = await env.DB.prepare(
-      `SELECT user_id, repository_id, generation, full_sync_required, next_sync_at,
-         wake_enqueued, lease_token
-       FROM github_session_sync_state WHERE user_id = ?`
-    ).bind(userId).first<SyncState>();
-
-    if (!installation || !beforeLease) {
-      if (operationId) {
-        await setOperationStatus(env, operationId, userId, 'failed', undefined,
-          installation ? 'sync_state_missing' : 'github_connection_missing');
-      }
-      message.ack();
-      return;
-    }
-
-    if (Date.parse(beforeLease.next_sync_at) > now.getTime() && !operationId) {
-      await env.DB.prepare(
-        `UPDATE github_session_sync_state SET wake_enqueued = 0, wake_enqueued_at = NULL
-         WHERE user_id = ? AND lease_token IS NULL`
-      ).bind(userId).run();
-      message.ack();
-      await dispatchGitHubSessionSync(env, userId);
-      return;
-    }
-
-    leaseToken = crypto.randomUUID();
-    const leaseExpiresAt = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString();
-    const claimed = await env.DB.prepare(
-      `UPDATE github_session_sync_state SET lease_token = ?, lease_expires_at = ?
-       WHERE user_id = ? AND repository_id = ? AND generation = ?
-         AND (lease_token IS NULL OR lease_expires_at <= ?)
-       RETURNING generation, full_sync_required`
-    ).bind(leaseToken, leaseExpiresAt, userId, beforeLease.repository_id,
-      beforeLease.generation, nowIso).first<{ generation: number; full_sync_required: number }>();
-    if (!claimed) {
-      if (operationId) {
-        await setOperationStatus(env, operationId, userId, 'queued');
-        message.retry({ delaySeconds: 15 });
-      } else {
-        message.ack();
-      }
-      return;
-    }
-
+    const prepared = await prepareSync(env, message, now, userId, operationId, leaseRef);
+    if (!prepared) return;
     await setOperationStatus(env, operationId, userId, 'running');
-    if (installation.repository_id !== beforeLease.repository_id) {
+    if (prepared.installation.repository_id !== prepared.repositoryId) {
       throw new Error('GitHub repository changed during sync');
     }
 
-    const capturedGeneration = claimed.generation;
-    const fullSync = claimed.full_sync_required === 1;
-    let rows: GitHubSessionRow[] = [];
-    let items: SyncItem[] = [];
-    let previousFiles: SyncedFile[] = [];
-    let deletePaths: string[] = [];
-    let replaceManifest = false;
-
-    if (fullSync) {
-      const result = await env.DB.prepare(
-        `SELECT id, session_date, category, effort, payload, revision, updated_at
-         FROM sessions WHERE user_id = ? ORDER BY session_date DESC, id DESC LIMIT ?`
-      ).bind(userId, MAX_FULL_SYNC_SESSIONS + 1).all<GitHubSessionRow>();
-      rows = result.results;
-      if (rows.length > MAX_FULL_SYNC_SESSIONS) throw new FullSyncSessionLimitError();
-      const expectedPaths = new Set(rows.map(githubSessionMarkdownPathForRow));
-      const remote = await listSelectedGitHubSessionMarkdown(env, installation);
-      deletePaths = remote.files
-        .filter((file) => isKeikoSessionMarkdownPath(file.path) && !expectedPaths.has(file.path))
-        .map((file) => file.path);
-      replaceManifest = true;
-    } else {
-      const pendingItems = await env.DB.prepare(
-        `SELECT session_id, generation FROM github_session_sync_items
-         WHERE user_id = ? AND generation <= ?
-         ORDER BY generation, session_id LIMIT ?`
-      ).bind(userId, capturedGeneration, MAX_SYNC_ITEMS_PER_BATCH).all<SyncItem>();
-      items = pendingItems.results;
-      if (!items.length) {
-        await completeNoop(env, userId, operationId, capturedGeneration, leaseToken);
-        message.ack();
-        return;
-      }
-      const ids = items.map((item) => item.session_id);
-      rows = await rowsForIds(env, userId, ids);
-      const idList = ids.map(() => '?').join(', ');
-      const mapped = await env.DB.prepare(
-        `SELECT session_id, path, revision FROM github_synced_session_files
-         WHERE user_id = ? AND repository_id = ? AND session_id IN (${idList})`
-      ).bind(userId, installation.repository_id, ...ids).all<SyncedFile>();
-      previousFiles = mapped.results;
-      const nextPaths = new Map(rows.map((row) => [row.id, githubSessionMarkdownPathForRow(row)]));
-      deletePaths = previousFiles
-        .filter((file) => nextPaths.get(file.session_id) !== file.path)
-        .map((file) => file.path);
+    const batch = await loadSyncBatch(
+      env, userId, prepared.installation, prepared.generation, prepared.fullSync
+    );
+    if (!batch) {
+      await completeNoop(env, userId, operationId, prepared.generation, prepared.leaseToken);
+      message.ack();
+      return;
     }
 
-    const synced = await syncGitHubSessionMarkdown(env, installation, rows, deletePaths);
-    const syncedById = new Map(synced.map((file) => [file.id, file]));
-    const removedIds = fullSync
-      ? []
-      : items.filter((item) => !syncedById.has(item.session_id)).map((item) => item.session_id);
-    await upsertSyncedFiles(env, userId, installation.repository_id,
-      synced.map((file) => ({ session_id: file.id, path: file.path, revision: file.revision })),
-      removedIds, replaceManifest);
-
-    const clearStatements: D1PreparedStatement[] = [];
-    if (fullSync) {
-      clearStatements.push(env.DB.prepare(
-        'DELETE FROM github_session_sync_items WHERE user_id = ? AND generation <= ?'
-      ).bind(userId, capturedGeneration));
-    } else {
-      for (const item of items) {
-        clearStatements.push(env.DB.prepare(
-          `DELETE FROM github_session_sync_items
-           WHERE user_id = ? AND session_id = ? AND generation = ?`
-        ).bind(userId, item.session_id, item.generation));
-      }
-    }
-    if (clearStatements.length) await env.DB.batch(clearStatements);
-
-    const completedAt = new Date().toISOString();
-    const finalized = await env.DB.prepare(
-      `UPDATE github_session_sync_state
-       SET completed_generation = ?, full_sync_required = 0, last_synced_at = ?, last_error = NULL,
-           wake_enqueued = 0, wake_enqueued_at = NULL,
-           lease_token = NULL, lease_expires_at = NULL, dispatch_after = NULL
-       WHERE user_id = ? AND generation = ? AND lease_token = ?
-         AND NOT EXISTS (SELECT 1 FROM github_session_sync_items WHERE user_id = ?)`
-    ).bind(capturedGeneration, completedAt, userId, capturedGeneration, leaseToken, userId).run();
-
-    if (finalized.meta.changes !== 1) {
-      await env.DB.prepare(
-        `UPDATE github_session_sync_state
-         SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,
-             wake_enqueued_at = NULL, dispatch_after = NULL
-         WHERE user_id = ? AND lease_token = ?`
-      ).bind(userId, leaseToken).run();
-      await dispatchGitHubSessionSync(env, userId);
-    }
-
+    const synced = await syncAndPersistBatch(env, userId, prepared.installation, prepared.generation, batch);
+    await finalizeSync(env, userId, prepared.generation, prepared.leaseToken);
     await setOperationStatus(env, operationId, userId, 'completed', {
       success: true,
       message: `Synced ${synced.length} training session(s) to GitHub Markdown.`,
@@ -294,33 +440,6 @@ export async function processGitHubSessionSyncMessage(
     });
     message.ack();
   } catch (error) {
-    if (error instanceof FullSyncSessionLimitError) {
-      await env.DB.prepare(
-        `UPDATE github_session_sync_state
-         SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,
-             wake_enqueued_at = NULL, dispatch_after = NULL,
-             last_error = 'session_limit_exceeded'
-         WHERE user_id = ? AND (? IS NULL OR lease_token = ?)`
-      ).bind(userId, leaseToken, leaseToken).run();
-      await setOperationStatus(env, operationId, userId, 'failed', undefined, 'session_limit_exceeded');
-      message.ack();
-      return;
-    }
-    await env.DB.prepare(
-      `UPDATE github_session_sync_state
-       SET lease_token = NULL, lease_expires_at = NULL, wake_enqueued = 0,
-           wake_enqueued_at = NULL,
-           dispatch_after = ?, last_error = 'github_sync_failed'
-       WHERE user_id = ? AND (? IS NULL OR lease_token = ?)`
-    ).bind(new Date(Date.now() + 60_000).toISOString(), userId, leaseToken, leaseToken).run();
-    const terminal = message.attempts >= 5;
-    await setOperationStatus(env, operationId, userId,
-      terminal ? 'failed' : 'queued', undefined, terminal ? 'github_sync_failed' : undefined);
-    if (terminal) {
-      message.ack();
-    } else {
-      await dispatchGitHubSessionSync(env, userId);
-      message.retry({ delaySeconds: Math.min(300, 2 ** message.attempts * 5) });
-    }
+    await handleSyncFailure(error, env, message, userId, operationId, leaseRef.token);
   }
 }
