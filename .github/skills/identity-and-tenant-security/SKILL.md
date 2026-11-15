@@ -29,9 +29,10 @@ ownership, rate limits, cross-service authentication, or request logging.
   `userId` into every service and D1 read/write. Never authorize from caller
   supplied IDs, `owner`, `repo`, cookie data, or an unverified JWT payload.
 - Keep scopes narrow: session reads use `sessions:read`; session writes use
-  `sessions:write`; GitHub connection reads and writes use their respective
-  `backups:*` scopes. MCP initialization, discovery, and calls are protected
-  by `sessions:read`.
+  `sessions:write`; GitHub connection and sync-status endpoints use
+  `backups:read` or `backups:write`; health, sync-all, Log Doctor, and GitHub
+  operation-job endpoints use `github:read` or `github:write` as appropriate.
+  MCP initialization, discovery, and calls are protected by `sessions:read`.
 - In deployed environments, rate-limit by the verified user ID and operation
   class. Local and test configurations intentionally skip Cloudflare rate
   limit bindings.
