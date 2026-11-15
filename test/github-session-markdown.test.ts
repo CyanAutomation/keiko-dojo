@@ -56,6 +56,26 @@ describe('GitHub session Markdown', () => {
     });
   });
 
+  it('parses and preserves validated optional duration metadata', () => {
+    const markdown = keikoMarkdown().replace(
+      'effort: 4',
+      'effort: 4\nduration: 90'
+    );
+
+    expect(parseSessionMarkdown(markdown)).toMatchObject({
+      ok: true,
+      session: { duration: 90 },
+    });
+    const normalized = normalizeSessionMarkdown(markdown);
+    expect(normalized.errors).toEqual([]);
+    expect(normalized.changed).toBe(true);
+    expect(normalized.markdown).toContain('category: "Technical"\nduration: 90');
+    expect(parseSessionMarkdown(normalized.markdown)).toMatchObject({
+      ok: true,
+      session: { duration: 90 },
+    });
+  });
+
   it('leaves an already canonical Keiko backup unchanged', () => {
     const markdown = keikoMarkdown();
 
@@ -139,6 +159,45 @@ describe('GitHub session Markdown', () => {
     expect(result.changed).toBe(false);
     expect(result.errors.length).toBeGreaterThan(0);
     expect(result.markdown).toContain('# Broken');
+  });
+
+  it.each([
+    [
+      'invalid date',
+      keikoMarkdown().replace('date: "2026-10-24"', 'date: "2026-02-30"'),
+      'session date must be YYYY-MM-DD',
+    ],
+    [
+      'invalid effort',
+      keikoMarkdown().replace('effort: 4', 'effort: 6'),
+      'session effort must be between 1 and 5',
+    ],
+    [
+      'invalid duration',
+      keikoMarkdown().replace('effort: 4', 'effort: 4\nduration: -1'),
+      'invalid "duration" in frontmatter',
+    ],
+    [
+      'invalid video URL type',
+      keikoMarkdown().replace('effort: 4', 'effort: 4\nvideoUrl: 42'),
+      'invalid "videoUrl" in frontmatter',
+    ],
+    [
+      'invalid backup payload',
+      keikoMarkdown().replace(/keikoTextPayload: .*\n/u, 'keikoTextPayload: "not-json"\n'),
+      'Invalid Keiko backup text payload',
+    ],
+    [
+      'missing required section',
+      keikoMarkdown().replace(/## Notes\n\nUse the inside grip next time\.\n*/u, ''),
+      'markdown content is missing required section: Notes',
+    ],
+  ])('uses the same session validation for parsing and repair (%s)', (_name, markdown, expectedError) => {
+    expect(parseSessionMarkdown(markdown)).toMatchObject({
+      ok: false,
+      errors: [expectedError],
+    });
+    expect(normalizeSessionMarkdown(markdown).errors).toEqual([expectedError]);
   });
 
   it('rejects video URLs with embedded credentials in parsed and repaired Markdown', () => {

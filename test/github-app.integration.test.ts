@@ -1,12 +1,17 @@
 import { env } from 'cloudflare:workers';
 import { generateKeyPairSync } from 'node:crypto';
-import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
+import type { JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { processGitHubOperationMessage } from '../src/http/github-operations';
 import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
 import { dispatchPendingGitHubSessionSyncs } from '../src/application/github-session-sync-queue';
-import { credentialBearingVideoUrl } from './helpers';
+import {
+  createTestAuthKeys,
+  createTestToken,
+  credentialBearingVideoUrl,
+  testAuthIssuer,
+} from './helpers';
 import {
   checkSelectedGitHubRepository,
   GitHubInstallationVerificationError,
@@ -20,7 +25,6 @@ const originalFetch = globalThis.fetch;
 let appEnv: Env & { GITHUB_APP_PRIVATE_KEY?: string };
 let authPrivateKey: CryptoKey;
 let authPublicJwk: JWK;
-const authKeyId = 'github-installation-test-key';
 
 function encodeBase64Utf8(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -47,9 +51,9 @@ beforeAll(async () => {
       writable: true,
     },
   });
-  const authKeys = await generateKeyPair('EdDSA', { crv: 'Ed25519' });
+  const authKeys = await createTestAuthKeys();
   authPrivateKey = authKeys.privateKey;
-  authPublicJwk = { ...(await exportJWK(authKeys.publicKey)), alg: 'EdDSA', kid: authKeyId, use: 'sig' };
+  authPublicJwk = authKeys.publicJwk;
 });
 
 afterAll(() => {
@@ -76,17 +80,10 @@ describe('GitHub App selected-repository backup adapter', () => {
        VALUES (?, ?, ?, ?, ?, ?)`
     ).bind(userId, installation.installation_id, installation.repository_owner,
       installation.repository_name, installation.repository_id, new Date().toISOString()).run();
-    const token = await new SignJWT({ appUserId: userId, scope: 'github:read' })
-      .setProtectedHeader({ alg: 'EdDSA', kid: authKeyId })
-      .setSubject(userId)
-      .setIssuer('https://auth.example.test')
-      .setAudience('keiko-dojo-api')
-      .setIssuedAt()
-      .setExpirationTime('5m')
-      .sign(authPrivateKey);
+    const token = await createTestToken(authPrivateKey, userId, { scope: 'github:read' });
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input);
-      if (url === 'https://auth.example.test/api/auth/jwks') return Response.json({ keys: [authPublicJwk] });
+      if (url === `${testAuthIssuer}/api/auth/jwks`) return Response.json({ keys: [authPublicJwk] });
       if (url.endsWith('/app/installations/731/access_tokens')) return Response.json({ token: 'installation-token' });
       if (url === 'https://api.github.com/repos/CyanAutomation/matmetrics') return Response.json({ default_branch: 'main' });
       if (url.endsWith('/git/ref/heads/main')) return Response.json({ object: { sha: 'b'.repeat(40) } });
@@ -202,21 +199,14 @@ describe('GitHub App selected-repository backup adapter', () => {
     const priorFetch = globalThis.fetch;
     vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
-      if (url === 'https://auth.example.test/api/auth/jwks') {
+      if (url === `${testAuthIssuer}/api/auth/jwks`) {
         return Response.json({ keys: [authPublicJwk] });
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
 
     try {
-      const token = await new SignJWT({ appUserId: userId, scope: 'backups:write' })
-        .setProtectedHeader({ alg: 'EdDSA', kid: authKeyId })
-        .setSubject(userId)
-        .setIssuer('https://auth.example.test')
-        .setAudience('keiko-dojo-api')
-        .setIssuedAt()
-        .setExpirationTime('5m')
-        .sign(authPrivateKey);
+      const token = await createTestToken(authPrivateKey, userId, { scope: 'backups:write' });
       const response = await worker.fetch(new Request('https://keiko.example.test/v1/backups/github-installation', {
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -760,6 +750,52 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('releases a failed sync lease and applies bounded retry delay before the terminal attempt', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `retry-session-sync-${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+    const queueSend = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const syncEnv = Object.assign(Object.create(appEnv), {
+      BACKUP_QUEUE: { send: queueSend },
+    }) as Env;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 907, 'CyanAutomation', 'judo-notes', 907, now).run();
+    await env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at)
+       VALUES (?, ?, 1, 1, ?)`
+    ).bind(userId, 907, new Date(0).toISOString()).run();
+    vi.stubGlobal('fetch', async () => { throw new Error('GitHub unavailable'); });
+    const ack = vi.fn();
+    const retry = vi.fn();
+
+    try {
+      await processGitHubSessionSyncMessage({
+        body: { kind: 'github-session-sync', userId },
+        attempts: 2,
+        ack,
+        retry,
+      } as unknown as Message<{ kind: 'github-session-sync'; userId: string }>, syncEnv);
+
+      expect(ack).not.toHaveBeenCalled();
+      expect(retry).toHaveBeenCalledWith({ delaySeconds: 20 });
+      expect(queueSend).not.toHaveBeenCalled();
+      expect(await env.DB.prepare(
+        'SELECT lease_token, last_error FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ lease_token: null, last_error: 'github_sync_failed' });
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+      ]);
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
   it('acknowledges a terminal GitHub operation failure instead of retrying the message', async () => {
     const userId = `terminal-operation-${crypto.randomUUID()}`;
     const jobId = crypto.randomUUID();
@@ -803,25 +839,17 @@ describe('GitHub App selected-repository backup adapter', () => {
     }) as Env;
     vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
-      if (url === 'https://auth.example.test/api/auth/jwks') {
+      if (url === `${testAuthIssuer}/api/auth/jwks`) {
         return Response.json({ keys: [authPublicJwk] });
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
     try {
+    const installToken = await createTestToken(authPrivateKey, 'install-user', { scope: 'backups:write' });
     const started = await worker.fetch(new Request('https://keiko.example.test/v1/backups/github-installation', {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${await new SignJWT({
-          appUserId: 'install-user', scope: 'backups:write',
-        })
-          .setProtectedHeader({ alg: 'EdDSA', kid: authKeyId })
-          .setSubject('install-user')
-          .setIssuer('https://auth.example.test')
-          .setAudience('keiko-dojo-api')
-          .setIssuedAt()
-          .setExpirationTime('5m')
-          .sign(authPrivateKey)}`,
+        authorization: `Bearer ${installToken}`,
         'content-type': 'application/json',
       },
       body: '{}',
@@ -834,7 +862,7 @@ describe('GitHub App selected-repository backup adapter', () => {
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input);
       githubCalls.push(url);
-      if (url === 'https://auth.example.test/api/auth/jwks') {
+      if (url === `${testAuthIssuer}/api/auth/jwks`) {
         return Response.json({ keys: [authPublicJwk] });
       }
       if (url.endsWith('/app/installations/731')) {

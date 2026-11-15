@@ -1,8 +1,8 @@
 import { importPKCS8, SignJWT } from 'jose';
 import { createPrivateKey } from 'node:crypto';
-import { isSessionCategory } from '../domain/session';
+import { isSessionCategory, isValidSessionDate } from '../domain/session';
 import { validateSafeHttpUrl } from '../domain/network-safety';
-import { isSafeSessionMarkdownPath } from '../domain/github-session-markdown';
+import { isSafeSessionMarkdownPath, renderSessionFrontmatter } from '../domain/github-session-markdown';
 import { configuredGitHubAppId } from './github-app-config';
 
 type GitHubAppEnvironment = Env & {
@@ -211,33 +211,33 @@ function githubCacheScope(installation: GitHubInstallation): string {
   ]);
 }
 
+async function githubErrorMessage(response: Response): Promise<string> {
+  try {
+    const body: unknown = await response.clone().json();
+    if (body && typeof body === 'object' && 'message' in body && typeof body.message === 'string') {
+      return body.message.trim().toLowerCase();
+    }
+  } catch {
+    // The status remains useful when GitHub does not return a JSON error.
+  }
+  return '';
+}
+
+function classifyGitHubApiError(status: number, message: string): string {
+  if (message === 'bad credentials') return 'bad_credentials';
+  if (message.includes('not accessible by integration')) return 'integration_access_denied';
+  if (message.includes('not found')) return 'not_found';
+  if (message.includes('rate limit')) return 'rate_limited';
+  if (message.includes('requires authentication')) return 'authentication_required';
+  if (message.includes('validation failed')) return 'validation_failed';
+  if (message.includes('forbidden') || status === 403) return 'forbidden';
+  return 'other';
+}
+
 async function responseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    let message = '';
-    try {
-      const body: unknown = await response.clone().json();
-      if (body && typeof body === 'object' && 'message' in body && typeof body.message === 'string') {
-        message = body.message.trim().toLowerCase();
-      }
-    } catch {
-      // The status remains useful when GitHub does not return a JSON error.
-    }
-    const category = message === 'bad credentials'
-      ? 'bad_credentials'
-      : message.includes('not accessible by integration')
-        ? 'integration_access_denied'
-        : message.includes('not found')
-          ? 'not_found'
-          : message.includes('rate limit')
-            ? 'rate_limited'
-            : message.includes('requires authentication')
-              ? 'authentication_required'
-              : message.includes('validation failed')
-                ? 'validation_failed'
-                : message.includes('forbidden') || response.status === 403
-                  ? 'forbidden'
-                  : 'other';
-    throw new GitHubAppApiError(response.status, category);
+    const message = await githubErrorMessage(response);
+    throw new GitHubAppApiError(response.status, classifyGitHubApiError(response.status, message));
   }
   return response.json() as Promise<T>;
 }
@@ -665,7 +665,7 @@ function hasValidSessionId(session: Record<string, unknown>, row: GitHubSessionR
 function hasValidSessionDate(session: Record<string, unknown>, row: GitHubSessionRow): boolean {
   return typeof session.date === 'string' &&
     session.date === row.session_date &&
-    validSessionDate(session.date);
+    isValidSessionDate(session.date);
 }
 
 function hasValidSessionEffort(session: Record<string, unknown>, row: GitHubSessionRow): boolean {
@@ -750,14 +750,6 @@ function markdownSession(row: GitHubSessionRow): MarkdownSession {
   };
 }
 
-function validSessionDate(value: string): boolean {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (!match) return false;
-  const [, year, month, day] = match;
-  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
-  return date.toISOString().slice(0, 10) === value;
-}
-
 function sessionMarkdown(session: MarkdownSession): string {
   const escapeMarkdown = (value: string) => value
     .replace(/&/g, '&amp;')
@@ -765,14 +757,7 @@ function sessionMarkdown(session: MarkdownSession): string {
     .replace(/>/g, '&gt;')
     .replace(/([\\`*_{}\[\]()#+\-.!|~])/g, '\\$1');
   const escapeTechnique = (value: string) => escapeMarkdown(value.replace(/[\r\n\t]+/g, ' ').trim());
-  const frontmatter = [
-    `id: ${JSON.stringify(session.id)}`,
-    `date: ${JSON.stringify(session.date)}`,
-    `effort: ${session.effort}`,
-    `category: ${JSON.stringify(session.category)}`,
-    ...(session.duration !== undefined ? [`duration: ${session.duration}`] : []),
-    ...(session.videoUrl ? [`videoUrl: ${JSON.stringify(session.videoUrl)}`] : []),
-  ];
+  const frontmatter = renderSessionFrontmatter(session);
   const techniques = session.techniques.length
     ? session.techniques.map((technique) => `- ${escapeTechnique(technique)}`).join('\n')
     : '- (none recorded)';
@@ -788,7 +773,7 @@ function sessionMarkdown(session: MarkdownSession): string {
   return `---\n${frontmatter.join('\n')}\n---\n\n# ${session.date} - Judo Session: ${session.category}\n\n## Techniques Practiced\n${techniques}\n\n## Session Description\n\n${escapeMarkdown(session.description ?? '')}\n\n## Notes\n\n${escapeMarkdown(session.notes ?? '')}\n`;
 }
 
-export function githubSessionMarkdownPath(session: Pick<MarkdownSession, 'id' | 'date'>): string {
+function githubSessionMarkdownPath(session: Pick<MarkdownSession, 'id' | 'date'>): string {
   const compactDate = session.date.replaceAll('-', '');
   const [year, month] = session.date.split('-');
   return `data/${year}/${month}/${compactDate}-matmetrics-${session.id}.md`;

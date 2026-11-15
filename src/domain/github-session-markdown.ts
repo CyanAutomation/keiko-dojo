@@ -1,4 +1,4 @@
-import { isSessionCategory, type SessionCategory } from './session';
+import { isSessionCategory, isValidSessionDate, type SessionCategory } from './session';
 import { validateSafeHttpUrl } from './network-safety';
 
 export type GitHubMarkdownSession = {
@@ -19,6 +19,14 @@ export type MarkdownParseResult =
 
 type Frontmatter = Map<string, string | number>;
 type MarkdownDocument = { frontmatter: Frontmatter; body: string };
+type SessionMarkdownFrontmatterInput = {
+  id: string;
+  date: string;
+  effort: number;
+  category: string;
+  duration?: number;
+  videoUrl?: string;
+};
 type KeikoTextPayload = {
   techniques: string[];
   description?: string;
@@ -200,53 +208,92 @@ function orderedBody(body: string): string {
   return `${intro}\n\n${sections.join('\n\n')}\n`;
 }
 
-function validDate(value: string): boolean {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (!match) return false;
-  const [, year, month, day] = match;
-  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
-  return date.toISOString().slice(0, 10) === value;
+type RequiredSessionFields = Pick<GitHubMarkdownSession, 'id' | 'date' | 'effort' | 'category'>;
+type OptionalSessionFields = Pick<GitHubMarkdownSession, 'duration' | 'videoUrl'>;
+
+function readSessionId(value: string | number | undefined): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(value)) {
+    throw new Error('missing or invalid "id" in frontmatter');
+  }
+  return value;
+}
+
+function readSessionDate(value: string | number | undefined): string {
+  if (typeof value !== 'string' || !isValidSessionDate(value)) {
+    throw new Error('session date must be YYYY-MM-DD');
+  }
+  return value;
+}
+
+function readSessionEffort(value: string | number | undefined): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 5) {
+    throw new Error('session effort must be between 1 and 5');
+  }
+  return value;
+}
+
+function readSessionCategory(value: string | number | undefined): SessionCategory {
+  if (typeof value !== 'string' || !isSessionCategory(value)) {
+    throw new Error(`invalid session category "${String(value ?? '')}"`);
+  }
+  return value;
+}
+
+function readRequiredSessionFields(values: Frontmatter): RequiredSessionFields {
+  const id = readSessionId(values.get('id'));
+  const date = readSessionDate(values.get('date'));
+  const effort = readSessionEffort(values.get('effort'));
+  const category = readSessionCategory(values.get('category'));
+  return { id, date, effort, category };
+}
+
+function readSessionDuration(value: string | number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error('invalid "duration" in frontmatter');
+  }
+  return value;
+}
+
+function readSessionVideoUrl(value: string | number | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error('invalid "videoUrl" in frontmatter');
+  if (value) validateMarkdownVideoUrl(value);
+  return value;
+}
+
+function readOptionalSessionFields(values: Frontmatter): OptionalSessionFields {
+  const duration = readSessionDuration(values.get('duration'));
+  const videoUrl = readSessionVideoUrl(values.get('videoUrl'));
+  return {
+    ...(duration === undefined ? {} : { duration }),
+    ...(videoUrl === undefined ? {} : { videoUrl }),
+  };
+}
+
+function validateSessionBody(body: string): void {
+  if (!firstTitle(body)) throw new Error('markdown content must begin with a level-1 title');
+  const missingSections = validateRequiredSections(body);
+  if (missingSections.length) throw new Error(missingSections[0]);
+}
+
+function readSessionText(body: string, values: Frontmatter): Pick<GitHubMarkdownSession, 'techniques' | 'description' | 'notes'> {
+  const payload = recoverTextPayload(values);
+  return {
+    techniques: payload?.techniques ?? extractTechniques(body),
+    ...(payload ? (payload.description === undefined ? {} : { description: payload.description }) : { description: sectionBody(body, 'Session Description') }),
+    ...(payload ? (payload.notes === undefined ? {} : { notes: payload.notes }) : { notes: sectionBody(body, 'Notes') }),
+  };
 }
 
 function readSession(document: MarkdownDocument): GitHubMarkdownSession {
-  const values = document.frontmatter;
-  const id = values.get('id');
-  const date = values.get('date');
-  const effort = values.get('effort');
-  const category = values.get('category');
-  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(id)) {
-    throw new Error('missing or invalid "id" in frontmatter');
-  }
-  if (typeof date !== 'string' || !validDate(date)) throw new Error('session date must be YYYY-MM-DD');
-  if (typeof effort !== 'number' || !Number.isInteger(effort) || effort < 1 || effort > 5) {
-    throw new Error('session effort must be between 1 and 5');
-  }
-  if (typeof category !== 'string' || !isSessionCategory(category)) {
-    throw new Error(`invalid session category "${String(category ?? '')}"`);
-  }
-  const title = firstTitle(document.body);
-  if (!title) throw new Error('markdown content must begin with a level-1 title');
-  const missingSections = validateRequiredSections(document.body);
-  if (missingSections.length) throw new Error(missingSections[0]);
-
-  const duration = values.get('duration');
-  if (duration !== undefined && (typeof duration !== 'number' || !Number.isInteger(duration) || duration < 0)) {
-    throw new Error('invalid "duration" in frontmatter');
-  }
-  const videoUrl = values.get('videoUrl');
-  if (videoUrl !== undefined && typeof videoUrl !== 'string') throw new Error('invalid "videoUrl" in frontmatter');
-  if (typeof videoUrl === 'string' && videoUrl) {
-    validateMarkdownVideoUrl(videoUrl);
-  }
-
-  const payload = recoverTextPayload(values);
+  const required = readRequiredSessionFields(document.frontmatter);
+  validateSessionBody(document.body);
+  const optional = readOptionalSessionFields(document.frontmatter);
   return {
-    id, date, effort, category,
-    techniques: payload?.techniques ?? extractTechniques(document.body),
-    ...(payload ? (payload.description === undefined ? {} : { description: payload.description }) : { description: sectionBody(document.body, 'Session Description') }),
-    ...(payload ? (payload.notes === undefined ? {} : { notes: payload.notes }) : { notes: sectionBody(document.body, 'Notes') }),
-    ...(typeof duration === 'number' ? { duration } : {}),
-    ...(typeof videoUrl === 'string' ? { videoUrl } : {}),
+    ...required,
+    ...readSessionText(document.body, document.frontmatter),
+    ...optional,
   };
 }
 
@@ -273,14 +320,7 @@ function recoverMetadata(markdown: string): { id?: string; date?: string } {
 }
 
 function renderMarkdown(session: GitHubMarkdownSession, original: MarkdownDocument): string {
-  const frontmatter = [
-    `id: ${JSON.stringify(session.id)}`,
-    `date: ${JSON.stringify(session.date)}`,
-    `effort: ${session.effort}`,
-    `category: ${JSON.stringify(session.category)}`,
-    ...(session.duration !== undefined ? [`duration: ${session.duration}`] : []),
-    ...(session.videoUrl ? [`videoUrl: ${JSON.stringify(session.videoUrl)}`] : []),
-  ];
+  const frontmatter = renderSessionFrontmatter(session);
   if (original.frontmatter.get('keikoBackupVersion') !== undefined) {
     const version = original.frontmatter.get('keikoBackupVersion');
     const payload = original.frontmatter.get('keikoTextPayload');
@@ -295,6 +335,17 @@ function renderMarkdown(session: GitHubMarkdownSession, original: MarkdownDocume
   return `---\n${frontmatter.join('\n')}\n---\n\n${orderedBody(original.body)}`;
 }
 
+export function renderSessionFrontmatter(session: SessionMarkdownFrontmatterInput): string[] {
+  return [
+    `id: ${JSON.stringify(session.id)}`,
+    `date: ${JSON.stringify(session.date)}`,
+    `effort: ${session.effort}`,
+    `category: ${JSON.stringify(session.category)}`,
+    ...(session.duration !== undefined ? [`duration: ${session.duration}`] : []),
+    ...(session.videoUrl ? [`videoUrl: ${JSON.stringify(session.videoUrl)}`] : []),
+  ];
+}
+
 export function normalizeSessionMarkdown(markdown: string): {
   markdown: string;
   changed: boolean;
@@ -303,7 +354,7 @@ export function normalizeSessionMarkdown(markdown: string): {
   const normalizedInput = markdown.replace(/\r\n?/g, '\n');
   try {
     const document = splitDocument(normalizedInput);
-    const session = readSessionForRepair(document);
+    const session = readSession(document);
     const normalized = renderMarkdown(session, document);
     const changed = normalized !== `${normalizedInput.replace(/\n+$/, '')}\n`;
     return { markdown: normalized, changed, errors: [] };
@@ -314,37 +365,6 @@ export function normalizeSessionMarkdown(markdown: string): {
       errors: [error instanceof Error ? error.message : 'invalid session Markdown'],
     };
   }
-}
-
-function readSessionForRepair(document: MarkdownDocument): GitHubMarkdownSession {
-  const frontmatter = document.frontmatter;
-  const id = frontmatter.get('id');
-  const date = frontmatter.get('date');
-  const effort = frontmatter.get('effort');
-  const category = frontmatter.get('category');
-  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(id)) throw new Error('missing or invalid "id" in frontmatter');
-  if (typeof date !== 'string' || !validDate(date)) throw new Error('session date must be YYYY-MM-DD');
-  if (typeof effort !== 'number' || !Number.isInteger(effort) || effort < 1 || effort > 5) throw new Error('session effort must be between 1 and 5');
-  if (typeof category !== 'string' || !isSessionCategory(category)) throw new Error(`invalid session category "${String(category ?? '')}"`);
-  if (!firstTitle(document.body)) throw new Error('markdown content must begin with a level-1 title');
-  const missingSections = validateRequiredSections(document.body);
-  if (missingSections.length) throw new Error(missingSections[0]);
-  const payload = recoverTextPayload(frontmatter);
-  const duration = frontmatter.get('duration');
-  const videoUrl = frontmatter.get('videoUrl');
-  if (duration !== undefined && (typeof duration !== 'number' || !Number.isInteger(duration) || duration < 0)) throw new Error('invalid "duration" in frontmatter');
-  if (videoUrl !== undefined && typeof videoUrl !== 'string') throw new Error('invalid "videoUrl" in frontmatter');
-  if (typeof videoUrl === 'string' && videoUrl) {
-    validateMarkdownVideoUrl(videoUrl);
-  }
-  return {
-    id, date, effort, category,
-    techniques: payload?.techniques ?? extractTechniques(document.body),
-    ...(payload ? (payload.description === undefined ? {} : { description: payload.description }) : { description: sectionBody(document.body, 'Session Description') }),
-    ...(payload ? (payload.notes === undefined ? {} : { notes: payload.notes }) : { notes: sectionBody(document.body, 'Notes') }),
-    ...(typeof duration === 'number' ? { duration } : {}),
-    ...(typeof videoUrl === 'string' ? { videoUrl } : {}),
-  };
 }
 
 export function isSafeSessionMarkdownPath(filePath: string): boolean {
