@@ -1,21 +1,13 @@
 import { env } from 'cloudflare:workers';
-import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { authenticateRequest } from '../src/auth/bearer-auth';
 import worker from '../src/index';
 import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
 import { credentialBearingVideoUrl } from './helpers';
+import { createApiHarness } from './api-harness';
 
-const issuer = 'https://auth.example.test';
-const jwksUrl = `${issuer}/api/auth/jwks`;
-const audience = 'keiko-dojo-api';
-const keyId = 'keiko-test-key';
+const { issuer, jwksUrl, audience, testEnv, tokenFor, call } = createApiHarness();
 const allowRateLimit = { limit: async (_input: { key: string }) => ({ success: true }) };
-const testEnv = Object.assign(Object.create(env), {
-  SESSION_READ_LIMITER: allowRateLimit,
-  SESSION_WRITE_LIMITER: allowRateLimit,
-  BACKUP_WRITE_LIMITER: allowRateLimit,
-}) as Env;
 const testSession = {
   id: 'test-session-1',
   date: '2026-10-16',
@@ -27,179 +19,7 @@ const testSession = {
   duration: 90,
 };
 
-let privateKey: CryptoKey;
-let publicJwk: JWK;
-let originalFetch: typeof fetch;
-
-async function tokenFor(
-  userId: string,
-  options: {
-    aud?: string;
-    scope?: string;
-    expired?: boolean;
-    issuedAtOffsetSeconds?: number;
-    subject?: string;
-    appUserId?: string;
-  } = {}
-): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  const issuedAt = options.expired
-    ? now - 600
-    : now + (options.issuedAtOffsetSeconds ?? 0);
-  return new SignJWT({
-    appUserId: options.appUserId ?? userId,
-    scope: options.scope ?? 'sessions:read sessions:write',
-  })
-    .setProtectedHeader({ alg: 'EdDSA', kid: keyId })
-    .setSubject(options.subject ?? userId)
-    .setIssuer(issuer)
-    .setAudience(options.aud ?? audience)
-    .setIssuedAt(issuedAt)
-    .setExpirationTime(options.expired ? now - 300 : issuedAt + 300)
-    .sign(privateKey);
-}
-
-async function call(
-  path: string,
-  userId: string,
-  init: RequestInit = {},
-  tokenOptions: Parameters<typeof tokenFor>[1] = {},
-  requestEnv: Env = testEnv
-): Promise<Response> {
-  const headers = new Headers(init.headers);
-  headers.set('authorization', `Bearer ${await tokenFor(userId, tokenOptions)}`);
-  if (init.body !== undefined) headers.set('content-type', 'application/json');
-  return worker.fetch(
-    new Request(`https://keiko.example.test${path}`, {
-      ...init,
-      headers,
-      body: init.body,
-    }),
-    requestEnv
-  );
-}
-
-beforeAll(async () => {
-  originalFetch = globalThis.fetch;
-  const keys = await generateKeyPair('EdDSA', { crv: 'Ed25519' });
-  privateKey = keys.privateKey;
-  publicJwk = {
-    ...(await exportJWK(keys.publicKey)),
-    alg: 'EdDSA',
-    kid: keyId,
-    use: 'sig',
-  };
-  vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
-    const url = new URL(input instanceof Request ? input.url : input.toString());
-    if (url.href === jwksUrl) return Response.json({ keys: [publicJwk] });
-    if (url.href === `${issuer}/jwks-failure`) {
-      return new Response('not found', { status: 404 });
-    }
-    if (url.href === `${issuer}/jwks-network-failure`) {
-      throw new TypeError('fetch failed');
-    }
-    throw new Error(`Unexpected fetch: ${url.href}`);
-  });
-});
-
-afterAll(() => {
-  vi.stubGlobal('fetch', originalFetch);
-});
-
 describe('Keiko session API', () => {
-  it('returns the GitHub installation callback to the MatMetrics dashboard', async () => {
-    const callbackEnv = Object.assign(Object.create(testEnv), {
-      ENVIRONMENT: 'production',
-      MATMETRICS_FRONTEND_URL: 'https://matmetrics.example.test',
-    }) as Env;
-    const response = await worker.fetch(
-      new Request('https://keiko.example.test/v1/backups/github-installation/callback?state=invalid'),
-      callbackEnv
-    );
-
-    expect(response.status).toBe(302);
-    const location = new URL(response.headers.get('location')!);
-    expect(location.origin).toBe(callbackEnv.MATMETRICS_FRONTEND_URL);
-    expect(location.pathname).toBe('/');
-    expect(location.searchParams.get('githubBackup')).toBe('failed');
-  });
-
-  it('queues only selected-repository GitHub operations and scopes job access to its owner', async () => {
-    const userId = `github-operation-${crypto.randomUUID()}`;
-    await env.DB.prepare(
-      `INSERT INTO github_installations
-       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).bind(userId, 731, 'CyanAutomation', 'matmetrics', 88, new Date().toISOString()).run();
-
-    const arbitraryRepository = await call('/v1/github/health', userId, {
-      method: 'POST', body: JSON.stringify({ owner: 'attacker', repo: 'elsewhere' }),
-    }, { scope: 'github:read' });
-    expect(arbitraryRepository.status).toBe(400);
-
-    const queued = await call('/v1/github/health', userId, {
-      method: 'POST', body: '{}',
-    }, { scope: 'github:read' });
-    expect(queued.status).toBe(202);
-    const job = await queued.json() as { id: string; type: string; status: string };
-    expect(job).toMatchObject({ type: 'github-health', status: 'queued' });
-
-    const anotherUser = await call(`/v1/github/jobs/${job.id}`, `${userId}-other`, {}, { scope: 'github:read' });
-    expect(anotherUser.status).toBe(404);
-    const owner = await call(`/v1/github/jobs/${job.id}`, userId, {}, { scope: 'github:read' });
-    expect(owner.status).toBe(200);
-    expect(await owner.json()).toMatchObject({ id: job.id, type: 'github-health', status: 'queued' });
-    await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
-  });
-
-  it('queues a full Markdown sync without creating a D1 snapshot job', async () => {
-    const userId = `github-sync-${crypto.randomUUID()}`;
-    await env.DB.prepare(
-      `INSERT INTO github_installations
-       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).bind(userId, 732, 'CyanAutomation', 'matmetrics', 88, new Date().toISOString()).run();
-    const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
-    const operationEnv = Object.assign(Object.create(testEnv), {
-      BACKUP_QUEUE: { send },
-    }) as Env;
-
-    try {
-      const response = await call('/v1/github/sync-all', userId, {
-        method: 'POST', body: '{}',
-      }, { scope: 'github:write' }, operationEnv);
-
-      expect(response.status).toBe(202);
-      const job = await response.json() as { id: string; type: string; status: string };
-      expect(job).toMatchObject({ type: 'github-sync-all', status: 'queued' });
-      expect(send).toHaveBeenCalledWith(
-        { kind: 'github-session-sync', userId, operationId: job.id },
-        { delaySeconds: 0 }
-      );
-      expect(await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'backup_snapshots'").first())
-        .toBeNull();
-      expect(await env.DB.prepare('SELECT type, status FROM github_operation_jobs WHERE id = ?').bind(job.id).first())
-        .toMatchObject({ type: 'github-sync-all', status: 'queued' });
-    } finally {
-      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE user_id = ?').bind(userId).run();
-      await env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId).run();
-      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
-    }
-  });
-
-  it('rejects unsafe Log Doctor paths and requires explicit apply confirmation', async () => {
-    const userId = `github-fix-validation-${crypto.randomUUID()}`;
-    const unsafePath = await call('/v1/github/log-doctor/fix', userId, {
-      method: 'POST', body: JSON.stringify({ mode: 'dry-run', paths: ['data/2026/10/../../secrets.md'] }),
-    }, { scope: 'github:write' });
-    expect(unsafePath.status).toBe(400);
-
-    const unconfirmedApply = await call('/v1/github/log-doctor/fix', userId, {
-      method: 'POST', body: JSON.stringify({ mode: 'apply', paths: ['data/2026/10/20261024-matmetrics-session-1.md'] }),
-    }, { scope: 'github:write' });
-    expect(unconfirmedApply.status).toBe(400);
-  });
-
   it('requires a Keiko-only audience, subject, expiry, and operation scope', async () => {
     const wrongAudience = await call('/v1/sessions', 'user-a', {}, {
       aud: 'matmetrics-api',
@@ -402,33 +222,6 @@ describe('Keiko session API', () => {
     expect(await response.json()).toMatchObject({
       error: { message: 'Invalid videoUrl: credentials are not allowed' },
     });
-  });
-
-  it('isolates GitHub Markdown sync status by the authenticated user', async () => {
-    const unauthorized = await call('/v1/backups/status', 'backup-user', {}, {
-      scope: 'sessions:read',
-    });
-    expect(unauthorized.status).toBe(403);
-
-    const otherStatus = await call('/v1/backups/status', 'other-user', {}, {
-      scope: 'backups:read',
-    });
-    expect(await otherStatus.json()).toMatchObject({
-      configured: false,
-      pending: false,
-      lastSyncedAt: null,
-    });
-  });
-
-  it('removes D1 restore endpoints and stored snapshot tables', async () => {
-    const restore = await call('/v1/backups/snapshot-id/restore', 'restore-user', {
-      method: 'POST', body: JSON.stringify({ confirm: true }),
-    }, { scope: 'backups:write' });
-    expect(restore.status).toBe(405);
-    const tables = await env.DB.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('backup_snapshots', 'restore_activity', 'backup_jobs')"
-    ).all<{ name: string }>();
-    expect(tables.results).toEqual([]);
   });
 
   it('coalesces successful session mutations and queues one delayed GitHub sync', async () => {

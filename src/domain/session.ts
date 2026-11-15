@@ -15,7 +15,17 @@ export function isSessionCategory(value: string): value is SessionCategory {
   return SESSION_CATEGORIES.some((category) => category === value);
 }
 
-export function isEffortLevel(value: unknown): value is EffortLevel {
+export function isValidSessionDate(value: string): boolean {
+  const match = ISO_DATE_PATTERN.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText] = match;
+  const date = new Date(Date.UTC(Number(yearText), Number(monthText) - 1, Number(dayText)));
+  return date.getUTCFullYear() === Number(yearText) &&
+    date.getUTCMonth() === Number(monthText) - 1 &&
+    date.getUTCDate() === Number(dayText);
+}
+
+function isEffortLevel(value: unknown): value is EffortLevel {
   return (
     typeof value === 'number' &&
     Number.isInteger(value) &&
@@ -93,24 +103,13 @@ function validateDate(
       error: 'Invalid date: expected YYYY-MM-DD format',
     };
   }
-  const match = ISO_DATE_PATTERN.exec(value);
-  if (!match) {
+  if (!ISO_DATE_PATTERN.test(value)) {
     return {
       ok: false,
       error: 'Invalid date: expected YYYY-MM-DD format',
     };
   }
-
-  const [, yearText, monthText, dayText] = match;
-  const year = Number(yearText);
-  const month = Number(monthText);
-  const day = Number(dayText);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  if (
-    parsed.getUTCFullYear() !== year ||
-    parsed.getUTCMonth() !== month - 1 ||
-    parsed.getUTCDate() !== day
-  ) {
+  if (!isValidSessionDate(value)) {
     return {
       ok: false,
       error: 'Invalid date: must be a real calendar date',

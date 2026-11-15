@@ -190,41 +190,80 @@ async function getJob(request: Request, env: Env, jobId: string, requestId: stri
   return job ? jsonResponse(jobResponse(job)) : jsonError(requestId, 404, 'not_found', 'GitHub job not found');
 }
 
-export async function handleGitHubOperationRequest(
+type BranchOperation = {
+  scope: 'github:read';
+  type: 'github-health' | 'log-doctor-scan';
+  invalidRequestMessage: string;
+};
+
+const BRANCH_OPERATIONS: Record<string, BranchOperation> = {
+  '/v1/github/health': {
+    scope: 'github:read',
+    type: 'github-health',
+    invalidRequestMessage: 'Invalid health check request',
+  },
+  '/v1/github/log-doctor': {
+    scope: 'github:read',
+    type: 'log-doctor-scan',
+    invalidRequestMessage: 'Invalid Log Doctor scan request',
+  },
+};
+
+async function createBranchOperation(
+  request: Request,
+  env: Env,
+  requestId: string,
+  operation: BranchOperation
+): Promise<Response> {
+  const principal = await authenticateRequest(request, env, operation.scope);
+  const body = await bodyObject(request, requestId);
+  if (body instanceof Response) return body;
+  const branch = readBranch(body);
+  if (branch === null || !exactKeys(body, ['branch'])) {
+    return jsonError(requestId, 400, 'bad_request', operation.invalidRequestMessage);
+  }
+  return enqueueOperation(env, principal.userId, operation.type, branch ? { branch } : {}, requestId);
+}
+
+async function createLogDoctorFix(
+  request: Request,
+  env: Env,
+  requestId: string
+): Promise<Response> {
+  const principal = await authenticateRequest(request, env, 'github:write');
+  const body = await bodyObject(request, requestId);
+  if (body instanceof Response) return body;
+  const payload = validateFixPayload(body);
+  if (!payload) return jsonError(requestId, 400, 'bad_request', 'Invalid Log Doctor fix request');
+  return enqueueOperation(env, principal.userId, 'log-doctor-fix', payload, requestId);
+}
+
+async function dispatchGitHubOperationRequest(
   request: Request,
   env: Env,
   requestId: string
 ): Promise<Response> {
   const url = new URL(request.url);
+  if (url.pathname === '/v1/github/sync-all' && request.method === 'POST') {
+    return createSyncJob(request, env, requestId);
+  }
+  const jobMatch = url.pathname.match(/^\/v1\/github\/jobs\/([A-Za-z0-9_-]{1,100})$/);
+  if (jobMatch && request.method === 'GET') return getJob(request, env, jobMatch[1]!, requestId);
+  const branchOperation = request.method === 'POST' ? BRANCH_OPERATIONS[url.pathname] : undefined;
+  if (branchOperation) return createBranchOperation(request, env, requestId, branchOperation);
+  if (url.pathname === '/v1/github/log-doctor/fix' && request.method === 'POST') {
+    return createLogDoctorFix(request, env, requestId);
+  }
+  return jsonError(requestId, 405, 'method_not_allowed', 'Method not allowed');
+}
+
+export async function handleGitHubOperationRequest(
+  request: Request,
+  env: Env,
+  requestId: string
+): Promise<Response> {
   try {
-    if (url.pathname === '/v1/github/sync-all' && request.method === 'POST') return await createSyncJob(request, env, requestId);
-    const jobMatch = url.pathname.match(/^\/v1\/github\/jobs\/([A-Za-z0-9_-]{1,100})$/);
-    if (jobMatch && request.method === 'GET') return await getJob(request, env, jobMatch[1]!, requestId);
-    if (url.pathname === '/v1/github/health' && request.method === 'POST') {
-      const principal = await authenticateRequest(request, env, 'github:read');
-      const body = await bodyObject(request, requestId);
-      if (body instanceof Response) return body;
-      const branch = readBranch(body);
-      if (branch === null || !exactKeys(body, ['branch'])) return jsonError(requestId, 400, 'bad_request', 'Invalid health check request');
-      return await enqueueOperation(env, principal.userId, 'github-health', branch ? { branch } : {}, requestId);
-    }
-    if (url.pathname === '/v1/github/log-doctor' && request.method === 'POST') {
-      const principal = await authenticateRequest(request, env, 'github:read');
-      const body = await bodyObject(request, requestId);
-      if (body instanceof Response) return body;
-      const branch = readBranch(body);
-      if (branch === null || !exactKeys(body, ['branch'])) return jsonError(requestId, 400, 'bad_request', 'Invalid Log Doctor scan request');
-      return await enqueueOperation(env, principal.userId, 'log-doctor-scan', branch ? { branch } : {}, requestId);
-    }
-    if (url.pathname === '/v1/github/log-doctor/fix' && request.method === 'POST') {
-      const principal = await authenticateRequest(request, env, 'github:write');
-      const body = await bodyObject(request, requestId);
-      if (body instanceof Response) return body;
-      const payload = validateFixPayload(body);
-      if (!payload) return jsonError(requestId, 400, 'bad_request', 'Invalid Log Doctor fix request');
-      return await enqueueOperation(env, principal.userId, 'log-doctor-fix', payload, requestId);
-    }
-    return jsonError(requestId, 405, 'method_not_allowed', 'Method not allowed');
+    return await dispatchGitHubOperationRequest(request, env, requestId);
   } catch (error) {
     if (error instanceof AuthFailure) return authFailureResponse(error, requestId);
     throw error;
