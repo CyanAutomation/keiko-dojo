@@ -29,6 +29,12 @@ jobs:
           cache: npm
       - run: npm install --global npm@11.6.2
       - run: npm ci
+      - name: Check OpenAPI compatibility with main
+        run: |
+          git fetch origin main --depth=1
+          git show FETCH_HEAD:openapi.yaml > /tmp/keiko-main-openapi.yaml
+          npm exec -- redocly diff /tmp/keiko-main-openapi.yaml openapi.yaml --fail-on major --check-version
+      - run: npm run contract:check
       - run: npm run security:dependencies
       - run: npm test
       - run: npm run cf-typegen:check
