@@ -5,6 +5,7 @@ import {
   validateSessionId,
 } from '../domain/session';
 import {
+  IdempotencyKeyReuseError,
   InvalidSessionCursorError,
   SessionAlreadyExistsError,
   InvalidSessionError,
@@ -12,6 +13,7 @@ import {
   SessionRevisionConflictError,
   SessionService,
 } from '../application/session-service';
+import { isValidIdempotencyKey } from '../domain/idempotency';
 import type { SessionRecord } from '../domain/session';
 import { authFailureResponse } from './auth-errors';
 import { jsonError, jsonResponse } from './responses';
@@ -250,17 +252,54 @@ async function createSession(
   service: SessionService,
   requestId: string
 ): Promise<Response> {
+  const logIdempotencyOutcome = (outcome: string) => {
+    console.log({ event: 'session_create_idempotency', requestId, outcome });
+  };
+  const idempotencyKey = request.headers.get('Idempotency-Key');
+  if (idempotencyKey !== null && !isValidIdempotencyKey(idempotencyKey)) {
+    logIdempotencyOutcome('invalid_key');
+    return jsonError(
+      requestId,
+      400,
+      'bad_request',
+      'Idempotency-Key must contain 1 to 128 ASCII letters, digits, periods, underscores, tildes, or hyphens'
+    );
+  }
+
   const body = await readJsonObject(request);
-  if (!body.ok) return bodyFailureResponse(body.status, requestId);
+  if (!body.ok) {
+    if (idempotencyKey !== null) logIdempotencyOutcome('validation_failure');
+    return bodyFailureResponse(body.status, requestId);
+  }
   try {
-    return recordResponse(await service.create(userId, body.value), userId, 201);
+    return recordResponse(
+      await service.create(
+        userId,
+        body.value,
+        idempotencyKey ?? undefined,
+        idempotencyKey === null ? undefined : logIdempotencyOutcome
+      ),
+      userId,
+      201
+    );
   } catch (error) {
+    if (error instanceof IdempotencyKeyReuseError) {
+      return jsonError(
+        requestId,
+        409,
+        'idempotency_key_reuse',
+        'Idempotency-Key was already used with a different session payload'
+      );
+    }
     if (error instanceof SessionAlreadyExistsError) {
+      if (idempotencyKey !== null) logIdempotencyOutcome('session_conflict');
       return jsonError(requestId, 409, 'session_conflict', 'Session ID already exists');
     }
     if (error instanceof InvalidSessionError) {
+      if (idempotencyKey !== null) logIdempotencyOutcome('validation_failure');
       return jsonError(requestId, 400, error.code, error.message);
     }
+    if (idempotencyKey !== null) logIdempotencyOutcome('database_failure');
     throw error;
   }
 }

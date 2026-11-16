@@ -8,6 +8,7 @@ beforeEach(async () => {
   }
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
   await env.DB.batch([
+    env.DB.prepare('DELETE FROM session_create_idempotency'),
     env.DB.prepare('DELETE FROM github_session_sync_state'),
     env.DB.prepare('DELETE FROM github_synced_session_files'),
     env.DB.prepare('DELETE FROM github_operation_jobs'),

@@ -30,6 +30,39 @@ as the starting parity fixture set.
 Validation failures return HTTP 400 with `error.code = "invalid_session"` and
 the canonical validation message in `error.message`.
 
+## Idempotent creates
+
+`POST /v1/sessions` accepts an optional `Idempotency-Key`. A key must contain
+1–128 ASCII letters, digits, periods, underscores, tildes, or hyphens
+(`^[A-Za-z0-9._~-]{1,128}$`). Clients should use a UUID v4 for each logical
+create and keep it unchanged across retries. The key identifies an operation;
+it is not an authentication credential. Keiko scopes it to the verified
+Better Auth user ID, never to a caller-supplied account field.
+
+Keiko validates and normalizes the session before computing a SHA-256
+fingerprint over canonical JSON. Object keys are sorted; array order is kept;
+validated session fields, including normalized techniques and URLs, determine
+the fingerprint. When `id` is absent or null, it is omitted from the
+fingerprint, and Keiko checks the ledger before generating the stored ID.
+Invalid payloads do not create ledger entries.
+
+The first valid request returns HTTP 201 with revision 1. A retry using the
+same key and equivalent payload returns the original creation result and ETag,
+even if the live session has since changed or been deleted. The current HTTP
+request gets a new request ID. A key reused with a different validated payload
+returns HTTP 409 with `error.code = "idempotency_key_reuse"`; a different key
+that collides with an existing session ID retains `session_conflict`.
+
+The session insert and idempotency ledger insert execute in one D1 batch
+transaction. The database's `(user_id, idempotency_key)` primary key arbitrates
+concurrent requests. A failed batch leaves neither a session nor a successful
+ledger result, including trigger-created GitHub sync work. Replays do not write
+the sessions table and therefore do not trigger another GitHub sync.
+
+Successful key records and their immutable revision-1 results are retained
+indefinitely. No expiry or cleanup job is configured, so an old offline retry
+cannot silently become a new create.
+
 ## Revisions
 
 Every stored record has a server-managed integer revision. Single-record reads
