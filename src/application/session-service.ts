@@ -4,6 +4,17 @@ import type {
 } from '../domain/session';
 import { validateSessionPayload } from '../domain/session';
 
+export type IdempotentSessionCreate = {
+  idempotencyKey: string;
+  requestFingerprint: string;
+  generatedId: boolean;
+};
+
+export type IdempotentSessionCreateResult = {
+  record: SessionRecord;
+  outcome: 'created' | 'replayed';
+};
+
 export type SessionFilters = {
   from?: string;
   to?: string;
@@ -40,6 +51,11 @@ export interface SessionRepository {
   list(userId: string, filters: SessionFilters): Promise<SessionPage>;
   get(userId: string, id: string): Promise<SessionRecord | null>;
   create(userId: string, session: JudoSession): Promise<SessionRecord>;
+  createIdempotent(
+    userId: string,
+    session: JudoSession,
+    options: IdempotentSessionCreate
+  ): Promise<IdempotentSessionCreateResult>;
   update(
     userId: string,
     session: JudoSession,
@@ -59,6 +75,13 @@ export class SessionAlreadyExistsError extends Error {
   constructor() {
     super('Session already exists');
     this.name = 'SessionAlreadyExistsError';
+  }
+}
+
+export class IdempotencyKeyReuseError extends Error {
+  constructor() {
+    super('Idempotency-Key was already used with a different session payload');
+    this.name = 'IdempotencyKeyReuseError';
   }
 }
 
@@ -103,13 +126,42 @@ export class SessionService {
 
   create(
     userId: string,
-    payload: Record<string, unknown>
+    payload: Record<string, unknown>,
+    idempotencyKey?: string,
+    onIdempotencyOutcome?: (outcome: 'created' | 'replayed' | 'key_conflict') => void
   ): Promise<SessionRecord> {
-    const validation = validateSessionPayload(payload, {
-      generateIdWhenMissing: true,
+    const generatedId = idempotencyKey !== undefined &&
+      (payload.id === undefined || payload.id === null);
+    const validationPayload = generatedId
+      ? { ...payload, id: 'pending-idempotent-session' }
+      : payload;
+    const validation = validateSessionPayload(validationPayload, {
+      generateIdWhenMissing: idempotencyKey === undefined,
     });
     if (!validation.ok) throw new InvalidSessionError(validation.error);
-    return this.repository.create(userId, validation.session);
+    if (idempotencyKey === undefined) {
+      return this.repository.create(userId, validation.session);
+    }
+
+    const fingerprintPayload = generatedId
+      ? (({ id: _id, ...sessionWithoutId }) => sessionWithoutId)(validation.session)
+      : validation.session;
+    return fingerprintSessionPayload(fingerprintPayload).then(async (requestFingerprint) => {
+      try {
+        const result = await this.repository.createIdempotent(userId, validation.session, {
+          idempotencyKey,
+          requestFingerprint,
+          generatedId,
+        });
+        onIdempotencyOutcome?.(result.outcome);
+        return result.record;
+      } catch (error) {
+        if (error instanceof IdempotencyKeyReuseError) {
+          onIdempotencyOutcome?.('key_conflict');
+        }
+        throw error;
+      }
+    });
   }
 
   update(
@@ -136,4 +188,24 @@ export class SessionService {
   ): Promise<void> {
     return this.repository.delete(userId, id, expectedRevision);
   }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  return `{${entries.map(([key, entry]) =>
+    `${JSON.stringify(key)}:${canonicalJson(entry)}`
+  ).join(',')}}`;
+}
+
+async function fingerprintSessionPayload(session: Omit<JudoSession, 'id'> | JudoSession): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(canonicalJson(session))
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
 }

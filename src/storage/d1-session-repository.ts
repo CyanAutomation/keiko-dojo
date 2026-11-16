@@ -1,5 +1,6 @@
 import {
   isJsonObject,
+  generateSessionId,
   validateSessionPayload,
   type JudoSession,
   type SessionRecord,
@@ -7,9 +8,11 @@ import {
 import type { AnalyticsSummary } from '../application/session-service';
 import {
   InvalidSessionCursorError,
+  IdempotencyKeyReuseError,
   SessionAlreadyExistsError,
   SessionNotFoundError,
   SessionRevisionConflictError,
+  type IdempotentSessionCreateResult,
   type SessionFilters,
   type SessionPage,
   type SessionRepository,
@@ -20,6 +23,12 @@ type SessionRow = {
   payload: string;
   revision: number;
   session_date: string;
+};
+
+type SessionCreateIdempotencyRow = {
+  request_fingerprint: string;
+  session_id: string;
+  result_json: string;
 };
 
 type SessionCursor = { date: string; id: string };
@@ -252,6 +261,126 @@ export class D1SessionRepository implements SessionRepository {
     if (result.meta.changes === 0) throw new SessionAlreadyExistsError();
     await this.wakeGitHubSync(userId);
     return { session, revision: 1 };
+  }
+
+  async createIdempotent(
+    userId: string,
+    sessionDraft: JudoSession,
+    options: {
+      idempotencyKey: string;
+      requestFingerprint: string;
+      generatedId: boolean;
+    }
+  ): Promise<IdempotentSessionCreateResult> {
+    const existing = await this.findIdempotencyResult(userId, options.idempotencyKey);
+    if (existing) {
+      return {
+        record: this.replayIdempotencyResult(existing, options.requestFingerprint),
+        outcome: 'replayed',
+      };
+    }
+
+    // Do not assign a server ID until after the ledger lookup. A retry with a
+    // missing request ID can therefore match the original fingerprint first.
+    const session = options.generatedId
+      ? { ...sessionDraft, id: generateSessionId() }
+      : sessionDraft;
+    const now = new Date().toISOString();
+    const record: SessionRecord = { session, revision: 1 };
+    const sessionInsert = this.db.prepare(
+      `INSERT INTO sessions
+         (user_id, id, session_date, category, effort, payload, revision, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+    ).bind(
+      userId,
+      session.id,
+      session.date,
+      session.category,
+      session.effort,
+      JSON.stringify(session),
+      now,
+      now
+    );
+    const idempotencyInsert = this.db.prepare(
+      `INSERT INTO session_create_idempotency
+         (user_id, idempotency_key, request_fingerprint, session_id, result_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(
+      userId,
+      options.idempotencyKey,
+      options.requestFingerprint,
+      session.id,
+      JSON.stringify(record),
+      now
+    );
+
+    try {
+      // D1 batch runs these statements in one transaction. The unique ledger
+      // key serializes competing creates; any failed statement rolls back the
+      // session insert and its GitHub-sync trigger effects as well.
+      await this.db.batch([sessionInsert, idempotencyInsert]);
+    } catch (error) {
+      const concurrentResult = await this.findIdempotencyResult(
+        userId,
+        options.idempotencyKey
+      );
+      if (concurrentResult) {
+        return {
+          record: this.replayIdempotencyResult(
+            concurrentResult,
+            options.requestFingerprint
+          ),
+          outcome: 'replayed',
+        };
+      }
+
+      const conflictingSession = await this.db.prepare(
+        'SELECT id FROM sessions WHERE user_id = ? AND id = ?'
+      ).bind(userId, session.id).first<{ id: string }>();
+      if (conflictingSession) throw new SessionAlreadyExistsError();
+      throw error;
+    }
+
+    await this.wakeGitHubSync(userId);
+    return { record, outcome: 'created' };
+  }
+
+  private findIdempotencyResult(
+    userId: string,
+    idempotencyKey: string
+  ): Promise<SessionCreateIdempotencyRow | null> {
+    return this.db.prepare(
+      `SELECT request_fingerprint, session_id, result_json
+       FROM session_create_idempotency
+       WHERE user_id = ? AND idempotency_key = ?`
+    ).bind(userId, idempotencyKey).first<SessionCreateIdempotencyRow>();
+  }
+
+  private replayIdempotencyResult(
+    row: SessionCreateIdempotencyRow,
+    requestFingerprint: string
+  ): SessionRecord {
+    if (row.request_fingerprint !== requestFingerprint) {
+      throw new IdempotencyKeyReuseError();
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.result_json);
+    } catch {
+      throw new Error('Stored idempotent session result is invalid');
+    }
+    if (!isJsonObject(parsed) || parsed.revision !== 1 || !isJsonObject(parsed.session)) {
+      throw new Error('Stored idempotent session result is invalid');
+    }
+    const validation = validateSessionPayload(parsed.session, {
+      routeId: row.session_id,
+      generateIdWhenMissing: false,
+    });
+    if (!validation.ok || parsed.session.id !== row.session_id) {
+      throw new Error('Stored idempotent session result is invalid');
+    }
+    return { session: validation.session, revision: 1 };
   }
 
   async update(
