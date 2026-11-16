@@ -562,6 +562,8 @@ export interface paths {
                 /** @description Redirect to the configured MatMetrics origin with a generic result. */
                 302: {
                     headers: {
+                        /** @description Absolute redirect URL containing only the generic callback result. */
+                        Location?: string;
                         [name: string]: unknown;
                     };
                     content?: never;

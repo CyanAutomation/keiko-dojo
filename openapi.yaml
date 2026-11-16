@@ -402,6 +402,12 @@ paths:
       responses:
         '302':
           description: Redirect to the configured MatMetrics origin with a generic result.
+          headers:
+            Location:
+              description: Absolute redirect URL containing only the generic callback result.
+              schema:
+                type: string
+                format: uri
   /v1/github/health:
     post:
       summary: Queue a GitHub App connection check
