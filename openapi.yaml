@@ -1,13 +1,14 @@
 openapi: 3.1.0
 info:
   title: Keiko Dojo API
-  version: 1.0.0
+  version: 1.1.0
   description: >-
     User-scoped Judo session API. Bearer tokens must be EdDSA JWTs issued by
     Better Auth for audience keiko-dojo-api, with a maximum five-minute
     lifetime, matching sub and appUserId claims, and the scope required by the
-    operation. Client-supplied account IDs and GitHub repository names never
-    determine the data scope.
+    operation. Every response includes X-Request-Id; error envelopes repeat the
+    identifier in requestId. Client-supplied account IDs and GitHub repository
+    names never determine the data scope.
 servers:
   - url: https://keiko-dojo.example.com
     description: Replace with the deployed Keiko API origin.
@@ -80,7 +81,7 @@ paths:
           name: cursor
           schema:
             type: string
-          description: Opaque keyset cursor returned by the previous page.
+          description: Opaque keyset cursor returned by the previous page; clients must not inspect or construct it. Maximum encoded length is 512 characters.
       responses:
         '200':
           description: Stable date-descending, ID-descending page of sessions.
@@ -272,6 +273,8 @@ paths:
           $ref: '#/components/responses/InsufficientScope'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
         default:
           $ref: '#/components/responses/InternalError'
   /v1/backups/status:
@@ -306,6 +309,10 @@ paths:
           $ref: '#/components/responses/InsufficientScope'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+        default:
+          $ref: '#/components/responses/InternalError'
   /v1/backups/github-installation:
     get:
       summary: Read the GitHub backup connection
@@ -313,12 +320,20 @@ paths:
       responses:
         '200':
           description: Connection status without installation tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GitHubInstallationResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/InsufficientScope'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+        default:
+          $ref: '#/components/responses/InternalError'
     post:
       summary: Start GitHub App installation
       description: Requires backups:write. Returns a one-time, user-bound installation URL.
@@ -332,12 +347,28 @@ paths:
       responses:
         '201':
           description: One-time installation URL and expiration.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expiresAt]
+                properties:
+                  url: { type: string, format: uri }
+                  expiresAt: { type: string, format: date-time }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/InsufficientScope'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/InternalError'
     delete:
       summary: Disconnect GitHub backup access
       description: Requires backups:write. Keiko stops minting installation tokens immediately.
@@ -350,6 +381,10 @@ paths:
           $ref: '#/components/responses/InsufficientScope'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+        default:
+          $ref: '#/components/responses/InternalError'
   /v1/backups/github-installation/callback:
     get:
       security: []
@@ -367,6 +402,12 @@ paths:
       responses:
         '302':
           description: Redirect to the configured MatMetrics origin with a generic result.
+          headers:
+            Location:
+              description: Absolute redirect URL containing only the generic callback result.
+              schema:
+                type: string
+                format: uri
   /v1/github/health:
     post:
       summary: Queue a GitHub App connection check
@@ -389,8 +430,15 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/InsufficientScope' }
-        '409': { description: No GitHub App repository is connected. }
+        '409':
+          description: No GitHub App repository is connected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/InternalError' }
   /v1/github/sync-all:
     post:
       summary: Queue a full D1-to-GitHub Markdown sync
@@ -411,9 +459,15 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/InsufficientScope' }
-        '409': { description: No GitHub App repository is connected. }
+        '409':
+          description: No GitHub App repository is connected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
-        '503': { description: GitHub operation queue is unavailable. }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/InternalError' }
   /v1/github/log-doctor:
     post:
       summary: Queue a selected-repository Markdown scan
@@ -436,8 +490,15 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/InsufficientScope' }
-        '409': { description: No GitHub App repository is connected. }
+        '409':
+          description: No GitHub App repository is connected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/InternalError' }
   /v1/github/log-doctor/fix:
     post:
       summary: Queue a Log Doctor preview or confirmed fix
@@ -475,8 +536,15 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/InsufficientScope' }
-        '409': { description: No GitHub App repository is connected. }
+        '409':
+          description: No GitHub App repository is connected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        default: { $ref: '#/components/responses/InternalError' }
   /v1/github/jobs/{jobId}:
     get:
       summary: Read a GitHub operation job
@@ -496,6 +564,8 @@ paths:
         '403': { $ref: '#/components/responses/InsufficientScope' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/AuthUnavailable' }
+        default: { $ref: '#/components/responses/InternalError' }
   /mcp:
     post:
       summary: Stateless MCP endpoint
@@ -512,6 +582,10 @@ paths:
           $ref: '#/components/responses/InsufficientScope'
         '429':
           $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
+        default:
+          $ref: '#/components/responses/InternalError'
 components:
   securitySchemes:
     bearerAuth:
@@ -636,8 +710,26 @@ components:
           properties:
             nextCursor:
               type: [string, 'null']
+              description: Opaque cursor for the next request, or null when the page is final. Non-null values are at most 512 characters.
             hasMore:
               type: boolean
+              description: True exactly when nextCursor contains another page cursor.
+    GitHubInstallationResponse:
+      type: object
+      required: [connected, installation]
+      properties:
+        connected:
+          type: boolean
+        installation:
+          oneOf:
+            - type: object
+              required: [owner, repository, repositoryId, grantedAt]
+              properties:
+                owner: { type: string }
+                repository: { type: string }
+                repositoryId: { type: integer, minimum: 1 }
+                grantedAt: { type: string, format: date-time }
+            - type: 'null'
     GitHubOperationJob:
       type: object
       required: [id, type, status, attempts, createdAt, updatedAt]
@@ -748,7 +840,13 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     NotFound:
-      description: Session does not exist in the authenticated user's account.
+      description: Requested resource does not exist in the authenticated user's account.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: A required service or operation queue is temporarily unavailable.
       content:
         application/json:
           schema:
@@ -778,7 +876,7 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     InternalError:
-      description: Unexpected internal error. The response includes a request ID.
+      description: Unexpected error, unsupported route, or method failure. The response includes a request ID.
       content:
         application/json:
           schema:

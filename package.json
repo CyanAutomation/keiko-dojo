@@ -13,6 +13,9 @@
     "deploy": "wrangler deploy",
     "deploy:production": "wrangler deploy --env production",
     "test": "vitest run",
+    "contract:lint": "redocly lint --extends minimal openapi.yaml",
+    "contract:generate": "npm exec --yes --package=openapi-typescript@7.13.0 --package=typescript@5.9.3 -- openapi-typescript openapi.yaml --output contracts/keiko-api.generated.ts",
+    "contract:check": "npm run contract:lint && npm run contract:generate && git diff --exit-code -- contracts/keiko-api.generated.ts",
     "security:dependencies": "npm audit --audit-level=high",
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types",
@@ -26,6 +29,7 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.6.0",
+    "@redocly/cli": "2.79.0",
     "@types/node": "^26.6.6",
     "fallow": "3.42.0",
     "typescript": "7.0.2",
