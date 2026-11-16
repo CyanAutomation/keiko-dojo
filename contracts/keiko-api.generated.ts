@@ -359,6 +359,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["InsufficientScope"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["AuthUnavailable"];
                 default: components["responses"]["InternalError"];
             };
         };
@@ -414,6 +415,8 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["InsufficientScope"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["AuthUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         put?: never;
@@ -456,6 +459,8 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["InsufficientScope"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["AuthUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         put?: never;
@@ -490,9 +495,13 @@ export interface paths {
                         };
                     };
                 };
+                400: components["responses"]["BadRequest"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["InsufficientScope"];
+                413: components["responses"]["PayloadTooLarge"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["ServiceUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         /**
@@ -518,6 +527,8 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["InsufficientScope"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["AuthUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         options?: never;
@@ -610,9 +621,14 @@ export interface paths {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
                 };
+                413: components["responses"]["PayloadTooLarge"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["ServiceUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         delete?: never;
@@ -664,16 +680,14 @@ export interface paths {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
-                };
-                429: components["responses"]["RateLimited"];
-                /** @description GitHub operation queue is unavailable. */
-                503: {
-                    headers: {
-                        [name: string]: unknown;
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
                     };
-                    content?: never;
                 };
+                413: components["responses"]["PayloadTooLarge"];
+                429: components["responses"]["RateLimited"];
+                503: components["responses"]["ServiceUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         delete?: never;
@@ -727,9 +741,14 @@ export interface paths {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
                 };
+                413: components["responses"]["PayloadTooLarge"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["ServiceUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         delete?: never;
@@ -795,9 +814,14 @@ export interface paths {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
                 };
+                413: components["responses"]["PayloadTooLarge"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["ServiceUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         delete?: never;
@@ -841,6 +865,8 @@ export interface paths {
                 403: components["responses"]["InsufficientScope"];
                 404: components["responses"]["NotFound"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["AuthUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         put?: never;
@@ -883,6 +909,8 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["InsufficientScope"];
                 429: components["responses"]["RateLimited"];
+                503: components["responses"]["AuthUnavailable"];
+                default: components["responses"]["InternalError"];
             };
         };
         delete?: never;
@@ -1051,8 +1079,17 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description Session does not exist in the authenticated user's account. */
+        /** @description Requested resource does not exist in the authenticated user's account. */
         NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description A required service or operation queue is temporarily unavailable. */
+        ServiceUnavailable: {
             headers: {
                 [name: string]: unknown;
             };
@@ -1096,7 +1133,7 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description Unexpected internal error. The response includes a request ID. */
+        /** @description Unexpected error, unsupported route, or method failure. The response includes a request ID. */
         InternalError: {
             headers: {
                 [name: string]: unknown;
