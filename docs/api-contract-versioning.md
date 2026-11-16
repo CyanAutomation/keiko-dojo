@@ -45,6 +45,15 @@ The lint uses Redocly to validate OpenAPI syntax, references, and supported stru
 
 ## Contract inventory from Phase 2A audit
 
-The session collection and item handlers agree with the documented routes, filters, revision metadata, ETags, and 400/404/409/412/428/413/415/429/503 behaviors. The analytics summary and GitHub job response schemas are represented. The audit found the GitHub installation read response and installation-start response were undocumented; schemas are now explicit. Cursor length and opaque/hasMore semantics are now stated. Error envelopes include a safe code, message, and request ID; rate limiting includes `Retry-After`.
+| API area | Audit result |
+| --- | --- |
+| `/v1/sessions`, `/v1/sessions/{id}` | Paths, filters, canonical session data, numeric revisions, ETags, conditional reads/writes, and the implemented 400/404/409/412/413/415/428/429 responses were covered. Cursor limits and opaque `nextCursor`/`hasMore` semantics are now explicit. |
+| `/v1/analytics/summary`, `/v1/backups/status` | Success schemas and required scopes were covered. Authentication, rate-limit, service-unavailable, and default error responses are now explicit. |
+| `/v1/backups/github-installation` | The GET connection schema and POST installation URL schema were missing and are now defined. Invalid/oversized body and service failure responses are documented. |
+| `/v1/backups/github-installation/callback` | The unauthenticated, one-time state callback and generic redirect behavior were covered. Redirect results intentionally do not expose account identifiers or installation tokens. |
+| `/v1/github/health`, `/v1/github/sync-all`, `/v1/github/log-doctor`, `/v1/github/log-doctor/fix` | Accepted bodies, queued job schemas, scopes, and core error statuses were covered. The 409 error envelopes, oversized-body responses, service failures, and default error responses were incomplete and are now described. A missing GitHub connection currently uses HTTP 409 with error code `not_found`; this wire behavior is preserved. |
+| `/v1/github/jobs/{jobId}`, `/mcp` | Success schemas/responses, subject scoping, and scopes were covered. Service-unavailable and default error responses are now explicit. |
+
+Every response is assigned an `X-Request-Id` by the Worker wrapper; JSON error envelopes repeat it as `requestId`. Error envelopes carry a safe code and message, and rate limiting includes `Retry-After`. The default response covers other error statuses, including method and route errors.
 
 Backup callback redirects intentionally return a generic success/failure result to the configured MatMetrics origin. They do not expose account identifiers or installation tokens. Authentication scopes and subject-derived user scoping are described at each protected operation and in the API-level security description.
