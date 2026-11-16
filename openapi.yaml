@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Keiko Dojo API
-  version: 1.0.0
+  version: 1.1.0
   description: >-
     User-scoped Judo session API. Bearer tokens must be EdDSA JWTs issued by
     Better Auth for audience keiko-dojo-api, with a maximum five-minute
@@ -80,7 +80,7 @@ paths:
           name: cursor
           schema:
             type: string
-          description: Opaque keyset cursor returned by the previous page.
+          description: Opaque keyset cursor returned by the previous page; clients must not inspect or construct it. Maximum encoded length is 512 characters.
       responses:
         '200':
           description: Stable date-descending, ID-descending page of sessions.
@@ -313,6 +313,10 @@ paths:
       responses:
         '200':
           description: Connection status without installation tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GitHubInstallationResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -332,6 +336,14 @@ paths:
       responses:
         '201':
           description: One-time installation URL and expiration.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expiresAt]
+                properties:
+                  url: { type: string, format: uri }
+                  expiresAt: { type: string, format: date-time }
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -636,8 +648,26 @@ components:
           properties:
             nextCursor:
               type: [string, 'null']
+              description: Opaque cursor for the next request, or null when the page is final. Non-null values are at most 512 characters.
             hasMore:
               type: boolean
+              description: True exactly when nextCursor contains another page cursor.
+    GitHubInstallationResponse:
+      type: object
+      required: [connected, installation]
+      properties:
+        connected:
+          type: boolean
+        installation:
+          oneOf:
+            - type: object
+              required: [owner, repository, repositoryId, grantedAt]
+              properties:
+                owner: { type: string }
+                repository: { type: string }
+                repositoryId: { type: integer, minimum: 1 }
+                grantedAt: { type: string, format: date-time }
+            - type: 'null'
     GitHubOperationJob:
       type: object
       required: [id, type, status, attempts, createdAt, updatedAt]
