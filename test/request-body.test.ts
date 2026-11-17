@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readJsonBodyLimited } from '../src/http/request-body';
 
+// The reader is shared by GitHub operations and MCP handlers; route-level 400 behavior is covered in api.integration.test.ts.
 describe('readJsonBodyLimited', () => {
   it('parses valid JSON at the byte limit', async () => {
     const body = '{"ok":true}';

@@ -24,31 +24,74 @@ describe('backup HTTP routes', () => {
     expect(location.searchParams.get('githubBackup')).toBe('failed');
   });
 
+  // Contract: openapi.yaml, GET /v1/backups/status; status and installation are subject-scoped.
   it('scopes backup status to the authenticated user and required permission', async () => {
     const userId = `backup-user-${crypto.randomUUID()}`;
-    const unauthorizedToken = await tokenFor(userId, { scope: 'sessions:read' });
-    const unauthorized = await handleBackupRequest(
-      new Request('https://keiko.example.test/v1/backups/status', {
-        headers: { authorization: `Bearer ${unauthorizedToken}` },
-      }),
-      testEnv,
-      'backup-status-forbidden'
-    );
-    expect(unauthorized.status).toBe(403);
+    const otherUserId = `${userId}-other`;
+    const now = '2026-10-26T12:00:00.000Z';
+    const currentNextSyncAt = '2026-10-26T12:01:00.000Z';
+    const otherNextSyncAt = '2026-10-26T12:02:00.000Z';
+    const currentOwner = 'current-owner';
+    const currentRepository = 'current-repository';
+    const otherOwner = 'other-owner';
+    const otherRepository = 'other-repository';
 
-    const statusToken = await tokenFor(userId, { scope: 'backups:read' });
-    const response = await handleBackupRequest(
-      new Request('https://keiko.example.test/v1/backups/status', {
-        headers: { authorization: `Bearer ${statusToken}` },
-      }),
-      testEnv,
-      'backup-status-owner'
-    );
-    expect(await response.json()).toMatchObject({
-      configured: false,
-      pending: false,
-      lastSyncedAt: null,
-    });
+    try {
+      for (const [owner, repository, installationId, repositoryId, subject, nextSyncAt, lastSyncedAt, lastError] of [
+        [currentOwner, currentRepository, 811, 881, userId, currentNextSyncAt, '2026-10-26T11:00:00.000Z', 'current-error'],
+        [otherOwner, otherRepository, 812, 882, otherUserId, otherNextSyncAt, '2026-10-26T10:00:00.000Z', 'other-error'],
+      ] as const) {
+        await env.DB.prepare(
+          `INSERT INTO github_installations
+           (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(subject, installationId, owner, repository, repositoryId, now).run();
+        await env.DB.prepare(
+          `INSERT INTO github_session_sync_state
+           (user_id, repository_id, generation, completed_generation, full_sync_required,
+            next_sync_at, last_synced_at, last_error)
+           VALUES (?, ?, 2, 1, 0, ?, ?, ?)`
+        ).bind(subject, repositoryId, nextSyncAt, lastSyncedAt, lastError).run();
+        await env.DB.prepare(
+          `INSERT INTO github_session_sync_items (user_id, session_id, generation)
+           VALUES (?, ?, 2)`
+        ).bind(subject, `${subject}-session`).run();
+      }
+
+      const unauthorizedToken = await tokenFor(userId, { scope: 'sessions:read' });
+      const unauthorized = await handleBackupRequest(
+        new Request('https://keiko.example.test/v1/backups/status', {
+          headers: { authorization: `Bearer ${unauthorizedToken}` },
+        }),
+        testEnv,
+        'backup-status-forbidden'
+      );
+      expect(unauthorized.status).toBe(403);
+
+      const statusToken = await tokenFor(userId, { scope: 'backups:read' });
+      const response = await handleBackupRequest(
+        new Request('https://keiko.example.test/v1/backups/status', {
+          headers: { authorization: `Bearer ${statusToken}` },
+        }),
+        testEnv,
+        'backup-status-owner'
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        configured: true,
+        installation: { owner: currentOwner, repository: currentRepository },
+        pending: true,
+        nextSyncAt: currentNextSyncAt,
+        lastSyncedAt: '2026-10-26T11:00:00.000Z',
+        error: 'current-error',
+      });
+    } finally {
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_session_sync_items WHERE user_id IN (?, ?)').bind(userId, otherUserId),
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id IN (?, ?)').bind(userId, otherUserId),
+        env.DB.prepare('DELETE FROM github_installations WHERE user_id IN (?, ?)').bind(userId, otherUserId),
+      ]);
+    }
   });
 
   it('keeps removed D1 restore endpoints unavailable', async () => {
