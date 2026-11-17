@@ -7,6 +7,7 @@ export type ApiErrorCode =
   | 'rate_limited'
   | 'not_found'
   | 'session_conflict'
+  | 'idempotency_key_reuse'
   | 'revision_conflict'
   | 'precondition_required'
   | 'payload_too_large'
