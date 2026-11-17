@@ -30,6 +30,10 @@ as the starting parity fixture set.
 Validation failures return HTTP 400 with `error.code = "invalid_session"` and
 the canonical validation message in `error.message`.
 
+Malformed JSON or `Content-Length` framing returns HTTP 400 with
+`error.code = "bad_request"`. Request bodies larger than 64 KiB return HTTP
+413 with `error.code = "payload_too_large"`.
+
 ## Idempotent creates
 
 `POST /v1/sessions` accepts an optional `Idempotency-Key`. A key must contain

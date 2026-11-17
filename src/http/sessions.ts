@@ -17,6 +17,7 @@ import { isValidIdempotencyKey } from '../domain/idempotency';
 import type { SessionRecord } from '../domain/session';
 import { authFailureResponse } from './auth-errors';
 import { jsonError, jsonResponse } from './responses';
+import { readJsonBodyLimited } from './request-body';
 
 const MAX_BODY_BYTES = 64 * 1024;
 const DEFAULT_PAGE_SIZE = 50;
@@ -35,47 +36,12 @@ async function readJsonObject(request: Request): Promise<BodyResult> {
     .toLowerCase();
   if (contentType !== 'application/json') return { ok: false, status: 415 };
 
-  const contentLength = request.headers.get('content-length');
-  if (contentLength && Number(contentLength) > MAX_BODY_BYTES) {
-    return { ok: false, status: 413 };
+  const parsed = await readJsonBodyLimited(request, MAX_BODY_BYTES);
+  if (!parsed.ok) {
+    return { ok: false, status: parsed.reason === 'too_large' ? 413 : 400 };
   }
-  if (!request.body) return { ok: false, status: 400 };
-
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let byteLength = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      byteLength += value.byteLength;
-      if (byteLength > MAX_BODY_BYTES) {
-        await reader.cancel();
-        return { ok: false, status: 413 };
-      }
-      chunks.push(value);
-    }
-  } catch {
-    return { ok: false, status: 400 };
-  } finally {
-    reader.releaseLock();
-  }
-
-  const bytes = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-  } catch {
-    return { ok: false, status: 400 };
-  }
-  return isJsonObject(parsed)
-    ? { ok: true, value: parsed }
+  return isJsonObject(parsed.value)
+    ? { ok: true, value: parsed.value }
     : { ok: false, status: 400 };
 }
 
