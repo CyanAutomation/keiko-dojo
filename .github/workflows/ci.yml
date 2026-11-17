@@ -35,6 +35,9 @@ jobs:
           git show FETCH_HEAD:openapi.yaml > /tmp/keiko-main-openapi.yaml
           npm exec -- redocly diff /tmp/keiko-main-openapi.yaml openapi.yaml --fail-on major --check-version
       - run: npm run contract:check
+      - name: Report full dependency audit
+        continue-on-error: true
+        run: npm run security:dependencies:all
       - run: npm run security:dependencies
       - run: npm test
       - run: npm run cf-typegen:check
