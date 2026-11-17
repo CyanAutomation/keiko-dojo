@@ -692,6 +692,22 @@ describe('Keiko session API', () => {
     expect(await mcp.json()).toMatchObject({ error: { code: 'payload_too_large' } });
   });
 
+  // Contract: docs/session-contract.md, Validation and normalization; malformed bodies are bad_request.
+  it('rejects a malformed Content-Length before creating a session', async () => {
+    const userId = `malformed-content-length-${crypto.randomUUID()}`;
+    const sessionId = `malformed-content-length-${crypto.randomUUID()}`;
+    const response = await call('/v1/sessions', userId, {
+      method: 'POST',
+      headers: { 'content-length': 'not-a-number' },
+      body: JSON.stringify({ ...testSession, id: sessionId }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: 'bad_request' } });
+    expect(await env.DB.prepare('SELECT id FROM sessions WHERE user_id = ? AND id = ?')
+      .bind(userId, sessionId).first()).toBeNull();
+  });
+
   it('authenticates MCP requests before parsing their body', async () => {
     const response = await worker.fetch(
       new Request('https://keiko.example.test/mcp', {
@@ -851,30 +867,13 @@ describe('Keiko session API', () => {
     }
   );
 
-  it('reports a non-200 JWKS response as authentication unavailable', async () => {
+  // Contract: docs/decisions/0002-identity-and-revocation.md, Key management and revocation.
+  it.each([
+    ['a non-200 response', 'jwks-failure'],
+    ['a transport failure', 'jwks-network-failure'],
+  ])('reports JWKS %s as authentication unavailable', async (_failure, jwksPath) => {
     const unavailableEnv = Object.assign(Object.create(testEnv), {
-      AUTH_JWKS_URL: `${issuer}/jwks-failure`,
-    }) as Env;
-    const response = await call(
-      '/v1/sessions?limit=1',
-      'user-a',
-      {},
-      { scope: 'sessions:read' },
-      unavailableEnv
-    );
-
-    expect(response.status).toBe(503);
-    expect(await response.json()).toMatchObject({
-      error: {
-        code: 'authentication_unavailable',
-        message: 'Authentication service unavailable',
-      },
-    });
-  });
-
-  it('reports JWKS transport failures as authentication unavailable', async () => {
-    const unavailableEnv = Object.assign(Object.create(testEnv), {
-      AUTH_JWKS_URL: `${issuer}/jwks-network-failure`,
+      AUTH_JWKS_URL: `${issuer}/${jwksPath}`,
     }) as Env;
     const response = await call(
       '/v1/sessions?limit=1',

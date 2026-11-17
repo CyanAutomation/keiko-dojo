@@ -197,11 +197,13 @@ describe('GitHub App selected-repository backup adapter', () => {
       BACKUP_WRITE_LIMITER: allowRateLimit,
     }) as Env;
     const priorFetch = globalThis.fetch;
+    const githubRequests: string[] = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
       const url = input instanceof Request ? input.url : String(input);
       if (url === `${testAuthIssuer}/api/auth/jwks`) {
         return Response.json({ keys: [authPublicJwk] });
       }
+      githubRequests.push(url);
       throw new Error(`Unexpected fetch: ${url}`);
     });
 
@@ -217,6 +219,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       expect(await response.json()).toMatchObject({
         error: { code: 'internal_error', message: 'GitHub App is not configured' },
       });
+      expect(githubRequests).toEqual([]);
       const states = await env.DB.prepare(
         'SELECT state_hash FROM github_installation_states WHERE user_id = ?'
       ).bind(userId).all();
@@ -226,24 +229,8 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
-  it('rejects a placeholder App ID before making GitHub API requests', async () => {
-    const previousAppId = appEnv.GITHUB_APP_ID;
-    const priorFetch = globalThis.fetch;
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
-    Reflect.set(appEnv, 'GITHUB_APP_ID', 'replace-with-github-app-id');
-
-    try {
-      await expect(verifySelectedRepositoryInstallation(appEnv, 731))
-        .rejects.toThrow('GitHub App is not configured');
-      expect(fetchMock).not.toHaveBeenCalled();
-    } finally {
-      Reflect.set(appEnv, 'GITHUB_APP_ID', previousAppId);
-      vi.stubGlobal('fetch', priorFetch);
-    }
-  });
-
-  it('sends a stable User-Agent header on every GitHub API request', async () => {
+  // GitHub REST requires a User-Agent; a release-version change must not invalidate this check.
+  it('includes the Keiko product identity in every GitHub API User-Agent', async () => {
     const priorFetch = globalThis.fetch;
     const requests: Array<{ url: string; headers: Headers }> = [];
     vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -271,7 +258,7 @@ describe('GitHub App selected-repository backup adapter', () => {
         repository_id: 88,
       });
       expect(requests).toHaveLength(3);
-      expect(requests.every(({ headers }) => headers.get('user-agent') === 'Keiko-Dojo/0.1')).toBe(true);
+      expect(requests.every(({ headers }) => /^Keiko-Dojo\/\S+$/.test(headers.get('user-agent') ?? ''))).toBe(true);
     } finally {
       vi.stubGlobal('fetch', priorFetch);
     }
