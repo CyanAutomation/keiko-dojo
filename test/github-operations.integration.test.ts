@@ -55,21 +55,56 @@ describe('GitHub operation routes', () => {
     }
   });
 
+  // Contract: openapi.yaml, POST /v1/github/health and /v1/github/log-doctor.
   it('rejects malformed branch-operation requests before queuing work', async () => {
+    const userId = `invalid-branch-${crypto.randomUUID()}`;
+    const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const operationEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 813, 'CyanAutomation', 'branch-validation', 883, new Date().toISOString()).run();
+
     const invalidBodies = [
       { branch: '' },
       { branch: 'main', repository: 'another-repository' },
       { branch: 42 },
     ];
 
-    for (const path of ['/v1/github/health', '/v1/github/log-doctor']) {
-      for (const body of invalidBodies) {
-        const response = await callOperation(path, `invalid-branch-${crypto.randomUUID()}`, 'github:read', {
-          method: 'POST', body: JSON.stringify(body),
-        });
-        expect(response.status).toBe(400);
+    try {
+      for (const path of ['/v1/github/health', '/v1/github/log-doctor']) {
+        for (const body of invalidBodies) {
+          const response = await callOperation(path, userId, 'github:read', {
+            method: 'POST', body: JSON.stringify(body),
+          }, operationEnv);
+          expect(response.status).toBe(400);
+          expect(await response.json()).toMatchObject({ error: { code: 'bad_request' } });
+        }
       }
+      expect(send).not.toHaveBeenCalled();
+      expect(await env.DB.prepare('SELECT id FROM github_operation_jobs WHERE user_id = ?').bind(userId).all())
+        .toMatchObject({ results: [] });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
     }
+  });
+
+  // Contract: openapi.yaml, POST /v1/github/health returns 400 for malformed requests.
+  it('maps a malformed Content-Length to a public bad-request response', async () => {
+    const response = await callOperation('/v1/github/health', `invalid-length-${crypto.randomUUID()}`, 'github:read', {
+      method: 'POST',
+      headers: { 'content-length': 'not-a-number' },
+      body: '{}',
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { code: 'bad_request', message: 'Invalid JSON body' },
+    });
   });
 
   it('queues a full Markdown sync without creating a D1 snapshot job', async () => {
@@ -106,16 +141,38 @@ describe('GitHub operation routes', () => {
     }
   });
 
-  it('rejects unsafe Log Doctor paths and requires explicit apply confirmation', async () => {
+  // Contract: docs/operations.md, GitHub Markdown sync; fixes must be path-safe and explicitly confirmed.
+  it('rejects unsafe Log Doctor paths and requires explicit apply confirmation before queuing work', async () => {
     const userId = `github-fix-validation-${crypto.randomUUID()}`;
-    const unsafePath = await callOperation('/v1/github/log-doctor/fix', userId, 'github:write', {
-      method: 'POST', body: JSON.stringify({ mode: 'dry-run', paths: ['data/2026/10/../../secrets.md'] }),
-    });
-    expect(unsafePath.status).toBe(400);
+    const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const operationEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 814, 'CyanAutomation', 'fix-validation', 884, new Date().toISOString()).run();
 
-    const unconfirmedApply = await callOperation('/v1/github/log-doctor/fix', userId, 'github:write', {
-      method: 'POST', body: JSON.stringify({ mode: 'apply', paths: ['data/2026/10/20261024-matmetrics-session-1.md'] }),
-    });
-    expect(unconfirmedApply.status).toBe(400);
+    try {
+      const unsafePath = await callOperation('/v1/github/log-doctor/fix', userId, 'github:write', {
+        method: 'POST', body: JSON.stringify({ mode: 'dry-run', paths: ['data/2026/10/../../secrets.md'] }),
+      }, operationEnv);
+      expect(unsafePath.status).toBe(400);
+      expect(await unsafePath.json()).toMatchObject({ error: { code: 'bad_request' } });
+
+      const unconfirmedApply = await callOperation('/v1/github/log-doctor/fix', userId, 'github:write', {
+        method: 'POST', body: JSON.stringify({ mode: 'apply', paths: ['data/2026/10/20261024-matmetrics-session-1.md'] }),
+      }, operationEnv);
+      expect(unconfirmedApply.status).toBe(400);
+      expect(await unconfirmedApply.json()).toMatchObject({ error: { code: 'bad_request' } });
+
+      expect(send).not.toHaveBeenCalled();
+      expect(await env.DB.prepare('SELECT id FROM github_operation_jobs WHERE user_id = ?').bind(userId).all())
+        .toMatchObject({ results: [] });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
   });
 });
