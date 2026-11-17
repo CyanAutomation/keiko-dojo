@@ -142,6 +142,39 @@ For an application storage rollback, pause writes and verify the complete
 Markdown session set before routing the account back to MatMetrics. This does
 not restore Keiko D1.
 
+## Phase 2B idempotency migration and rollout
+
+Migration `0008_session_create_idempotency.sql` is additive. It creates the
+durable, user-scoped create ledger; it does not rewrite session rows, revisions,
+GitHub sync state, or existing data. Successful entries have no expiry and no
+cleanup job.
+
+Before a release, review and run `npm run check:migrations` against local D1,
+then inspect the table definition and composite primary key with:
+
+```sh
+npx wrangler d1 execute keiko-dojo-local --local --command "PRAGMA table_info(session_create_idempotency)"
+npx wrangler d1 execute keiko-dojo-local --local --command "PRAGMA index_list(session_create_idempotency)"
+```
+
+For an approved production release, apply migration 0008 first, verify the
+table and primary key, deploy the compatible Keiko Worker, then deploy the
+MatMetrics client that sends keys. Older MatMetrics clients remain compatible
+because the header is optional. Do not deploy a new MatMetrics client while
+Keiko is still silently ignoring the key.
+
+If the Worker or MatMetrics release must be rolled back after applying 0008,
+leave the additive table and its rows in place. An older Worker ignores the
+ledger table, and old MatMetrics callers omit the header. Do not drop the table
+or attempt to reverse the migration automatically; preserve it for a later
+forward deployment.
+
+To investigate an ambiguous create, correlate the HTTP `requestId` with the
+structured `session_create_idempotency` outcome log. If a D1 inspection is
+needed, use the authenticated user's verified ID and the key supplied by the
+client to inspect the matching ledger row. Do not add raw keys, session
+payloads, or user IDs to routine Worker logs.
+
 ## Monitoring
 
 Worker request logs contain the request ID, environment, method, normalized

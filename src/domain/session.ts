@@ -59,13 +59,17 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MAX_SESSION_ID_LENGTH = 100;
 
+export function generateSessionId(): string {
+  return `session-${Date.now()}-${crypto.randomUUID()}`;
+}
+
 export function validateSessionId(
   value: unknown,
   generateWhenMissing: boolean
 ): { ok: true; value: string } | { ok: false; error: string } {
   if (value === undefined || value === null) {
     return generateWhenMissing
-      ? { ok: true, value: `session-${Date.now()}-${crypto.randomUUID()}` }
+      ? { ok: true, value: generateSessionId() }
       : { ok: false, error: 'Missing required field: id' };
   }
 
