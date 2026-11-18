@@ -274,7 +274,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       }
       return Response.json({
         message: 'private provider detail that must not enter logs',
-      }, { status: 403 });
+      }, { status: 403, headers: { 'x-github-request-id': 'GH-7f6e5d4c3b2a1' } });
     });
 
     try {
@@ -299,13 +299,220 @@ describe('GitHub App selected-repository backup adapter', () => {
 
       expect(errorLog).toHaveBeenCalledWith('github_session_sync_failed', {
         phase: 'session_contents',
+        operation: 'contents_get',
+        githubRequestId: 'GH-7f6e5d4c3b2a1',
+        responseStatus: 403,
         causeName: 'GitHubAppApiError',
         causeCode: null,
         status: 403,
         reason: 'other',
         apiErrorCategory: 'forbidden',
+        errorSummary: 'GitHub App API request failed',
       });
       expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private provider detail');
+    } finally {
+      errorLog.mockRestore();
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('logs transport diagnostics without exposing GitHub URLs, session paths, or query secrets', async () => {
+    const priorFetch = globalThis.fetch;
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const privateUrl = 'https://api.github.com/repos/maki/judo-notes/contents/data/2026/10/20261024-matmetrics-safe-diagnostic-session.md?token=private-token-value';
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      expect(init?.method ?? 'GET').toBe('GET');
+      throw new Error(
+        `Failed to fetch ${privateUrl} for data/2026/10/20261024-matmetrics-safe-diagnostic-session.md with Bearer private-bearer-value`,
+        { cause: Object.assign(new Error('socket failure'), { code: 'ECONNRESET' }) }
+      );
+    });
+
+    try {
+      await expect(syncGitHubSessionMarkdown(appEnv, {
+        user_id: 'safe-transport-diagnostic',
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      }, [{
+        id: 'safe-diagnostic-session',
+        session_date: '2026-10-24',
+        category: 'Technical',
+        effort: 3,
+        payload: JSON.stringify({
+          id: 'safe-diagnostic-session', date: '2026-10-24', effort: 3,
+          category: 'Technical', techniques: ['Uchi mata'],
+        }),
+        revision: 1,
+        updated_at: '2026-10-24T00:00:00.000Z',
+      }])).rejects.toThrow();
+
+      expect(errorLog).toHaveBeenCalledWith('github_session_sync_failed', expect.objectContaining({
+        phase: 'session_contents',
+        operation: 'contents_get',
+        causeName: 'Error',
+        causeCode: 'ECONNRESET',
+        reason: 'network_error',
+        errorSummary: 'Failed to fetch [url] for [session-path] with Bearer [redacted]',
+      }));
+      const logs = JSON.stringify(errorLog.mock.calls);
+      expect(logs).not.toContain('api.github.com');
+      expect(logs).not.toContain('safe-diagnostic-session');
+      expect(logs).not.toContain('private-token-value');
+      expect(logs).not.toContain('private-bearer-value');
+    } finally {
+      errorLog.mockRestore();
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('redacts sensitive patterns that cross the error-summary truncation boundary', async () => {
+    const priorFetch = globalThis.fetch;
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const prefix = `${Array.from({ length: 12 }, () => `ghp_${'a'.repeat(36)}`).join(' ')} ${'x'.repeat(18)}`;
+    expect(prefix).toHaveLength(510);
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      throw new Error(`${prefix}https://private.example/secret?token=private-token`);
+    });
+
+    try {
+      await expect(syncGitHubSessionMarkdown(appEnv, {
+        user_id: 'boundary-redaction-diagnostic',
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      }, [{
+        id: 'boundary-redaction-session',
+        session_date: '2026-10-24',
+        category: 'Technical',
+        effort: 3,
+        payload: JSON.stringify({
+          id: 'boundary-redaction-session', date: '2026-10-24', effort: 3,
+          category: 'Technical', techniques: ['Uchi mata'],
+        }),
+        revision: 1,
+        updated_at: '2026-10-24T00:00:00.000Z',
+      }])).rejects.toThrow();
+
+      const sanitizedPrefix = `${Array.from({ length: 12 }, () => '[token]').join(' ')} ${'x'.repeat(18)}`;
+      expect(errorLog).toHaveBeenCalledWith('github_session_sync_failed', expect.objectContaining({
+        errorSummary: `${sanitizedPrefix}[url]`,
+      }));
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private.example');
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private-token');
+    } finally {
+      errorLog.mockRestore();
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('records the GitHub request ID for a failed contents write without logging its response body', async () => {
+    const priorFetch = globalThis.fetch;
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      if (init?.method === 'PUT') {
+        return Response.json({ message: 'Validation Failed: private provider detail' }, {
+          status: 422,
+          headers: { 'x-github-request-id': 'GH-put-request-123' },
+        });
+      }
+      return Response.json({ sha: 'current-file-sha', encoding: 'base64', content: encodeBase64Utf8('old content') }, {
+        headers: { 'x-github-request-id': 'GH-get-request-123' },
+      });
+    });
+
+    try {
+      await expect(syncGitHubSessionMarkdown(appEnv, {
+        user_id: 'safe-write-diagnostic',
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      }, [{
+        id: 'safe-write-session',
+        session_date: '2026-10-24',
+        category: 'Technical',
+        effort: 3,
+        payload: JSON.stringify({
+          id: 'safe-write-session', date: '2026-10-24', effort: 3,
+          category: 'Technical', techniques: ['Uchi mata'],
+        }),
+        revision: 1,
+        updated_at: '2026-10-24T00:00:00.000Z',
+      }])).rejects.toThrow();
+
+      expect(errorLog).toHaveBeenCalledWith('github_session_sync_failed', expect.objectContaining({
+        phase: 'session_contents',
+        operation: 'contents_put',
+        githubRequestId: 'GH-put-request-123',
+        responseStatus: 422,
+        causeName: 'GitHubAppApiError',
+        apiErrorCategory: 'validation_failed',
+        errorSummary: 'GitHub App API request failed',
+      }));
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private provider detail');
+    } finally {
+      errorLog.mockRestore();
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
+  it('summarizes malformed GitHub JSON without logging a response snippet', async () => {
+    const priorFetch = globalThis.fetch;
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      return new Response('private session payload must not appear', {
+        status: 200,
+        headers: { 'x-github-request-id': 'GH-invalid-json-123' },
+      });
+    });
+
+    try {
+      await expect(syncGitHubSessionMarkdown(appEnv, {
+        user_id: 'safe-json-diagnostic',
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      }, [{
+        id: 'safe-json-session',
+        session_date: '2026-10-24',
+        category: 'Technical',
+        effort: 3,
+        payload: JSON.stringify({
+          id: 'safe-json-session', date: '2026-10-24', effort: 3,
+          category: 'Technical', techniques: ['Uchi mata'],
+        }),
+        revision: 1,
+        updated_at: '2026-10-24T00:00:00.000Z',
+      }])).rejects.toThrow();
+
+      expect(errorLog).toHaveBeenCalledWith('github_session_sync_failed', expect.objectContaining({
+        operation: 'contents_get',
+        githubRequestId: 'GH-invalid-json-123',
+        responseStatus: 200,
+        causeName: 'SyntaxError',
+        errorSummary: 'invalid_response_json',
+      }));
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private session payload');
     } finally {
       errorLog.mockRestore();
       vi.stubGlobal('fetch', priorFetch);
