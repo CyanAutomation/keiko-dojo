@@ -2,6 +2,7 @@ import { env } from 'cloudflare:workers';
 import type { JWK } from 'jose';
 import { afterAll, beforeAll, vi } from 'vitest';
 import worker from '../src/index';
+import { createTrackedExecutionContext } from './execution-contexts';
 import {
   createTestAuthKeys,
   createTestToken,
@@ -11,6 +12,10 @@ import {
 } from './helpers';
 
 const allowRateLimit = { limit: async (_input: { key: string }) => ({ success: true }) };
+
+export function fetchWorker(request: Request, requestEnv: Env = env): Promise<Response> {
+  return worker.fetch(request, requestEnv, createTrackedExecutionContext());
+}
 
 export function createApiHarness() {
   const issuer = testAuthIssuer;
@@ -58,7 +63,7 @@ export function createApiHarness() {
     const headers = new Headers(init.headers);
     headers.set('authorization', `Bearer ${await tokenFor(userId, tokenOptions)}`);
     if (init.body !== undefined) headers.set('content-type', 'application/json');
-    return worker.fetch(
+    return fetchWorker(
       new Request(`https://keiko.example.test${path}`, {
         ...init,
         headers,

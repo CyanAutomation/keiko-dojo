@@ -4,10 +4,11 @@ import { authenticateRequest } from '../src/auth/bearer-auth';
 import worker from '../src/index';
 import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
 import { credentialBearingVideoUrl } from './helpers';
-import { createApiHarness } from './api-harness';
+import { createApiHarness, fetchWorker } from './api-harness';
 
 const { issuer, jwksUrl, audience, testEnv, tokenFor, call } = createApiHarness();
 const allowRateLimit = { limit: async (_input: { key: string }) => ({ success: true }) };
+let backgroundSessionSyncDispatchFinished = false;
 const testSession = {
   id: 'test-session-1',
   date: '2026-10-16',
@@ -521,6 +522,42 @@ describe('Keiko session API', () => {
     }
   });
 
+  it('returns before background sync dispatch finishes', async () => {
+    backgroundSessionSyncDispatchFinished = false;
+    const userId = `session-sync-wait-until-${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 932, 'CyanAutomation', 'matmetrics', 932, new Date().toISOString()).run();
+    let signalDispatchStarted!: () => void;
+    const dispatchStarted = new Promise<void>((resolve) => {
+      signalDispatchStarted = resolve;
+    });
+    const send = vi.fn(async () => {
+      signalDispatchStarted();
+      await new Promise<void>((resolve) => setTimeout(resolve, 75));
+      backgroundSessionSyncDispatchFinished = true;
+    });
+    const requestEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+
+    const response = await call('/v1/sessions', userId, {
+      method: 'POST',
+      body: JSON.stringify({ ...testSession, id: 'wait-until-sync-dispatch' }),
+    }, {}, requestEnv);
+
+    await dispatchStarted;
+    expect(response.status).toBe(201);
+    expect(send).toHaveBeenCalledOnce();
+    expect(backgroundSessionSyncDispatchFinished).toBe(false);
+  });
+
+  it('settles background sync dispatch before the next test starts', () => {
+    expect(backgroundSessionSyncDispatchFinished).toBe(true);
+  });
+
   it('keeps a successful D1 write successful when queue dispatch fails and retries it from cron', async () => {
     const userId = `session-sync-queue-failure-${crypto.randomUUID()}`;
     await env.DB.prepare(
@@ -709,7 +746,7 @@ describe('Keiko session API', () => {
   });
 
   it('authenticates MCP requests before parsing their body', async () => {
-    const response = await worker.fetch(
+    const response = await fetchWorker(
       new Request('https://keiko.example.test/mcp', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -731,7 +768,7 @@ describe('Keiko session API', () => {
       method: 'initialize',
       params: { protocolVersion: '2025-11-25' },
     };
-    const unauthorized = await worker.fetch(
+    const unauthorized = await fetchWorker(
       new Request('https://keiko.example.test/mcp', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -824,7 +861,7 @@ describe('Keiko session API', () => {
     const secretText = 'private-training-note-do-not-log';
     const bearerToken = await tokenFor('logging-user');
     try {
-      await worker.fetch(new Request('https://keiko.example.test/v1/sessions', {
+      await fetchWorker(new Request('https://keiko.example.test/v1/sessions', {
         method: 'POST',
         headers: {
           authorization: `Bearer ${bearerToken}`,
@@ -842,7 +879,7 @@ describe('Keiko session API', () => {
   });
 
   it('reports ready when D1 and auth configuration are available', async () => {
-    const response = await worker.fetch(
+    const response = await fetchWorker(
       new Request('https://keiko.example.test/readyz'),
       env
     );
@@ -855,7 +892,7 @@ describe('Keiko session API', () => {
     async (setting) => {
       const unavailableEnv = Object.create(env) as Env;
       Object.defineProperty(unavailableEnv, setting, { value: '' });
-      const response = await worker.fetch(
+      const response = await fetchWorker(
         new Request('https://keiko.example.test/readyz'),
         unavailableEnv
       );
@@ -896,7 +933,7 @@ describe('Keiko session API', () => {
     ['malformed compact token', 'not-a-jwt'],
     ['unsupported algorithm', 'eyJhbGciOiJIUzI1NiJ9.e30.AA'],
   ])('reports %s as an invalid access token', async (_description, token) => {
-    const response = await worker.fetch(
+    const response = await fetchWorker(
       new Request('https://keiko.example.test/v1/sessions?limit=1', {
         headers: { authorization: `Bearer ${token}` },
       }),
@@ -916,7 +953,7 @@ describe('Keiko session API', () => {
     const unavailableEnv = Object.assign(Object.create(testEnv), {
       DB: { prepare: () => { throw new Error('D1 unavailable'); } },
     }) as unknown as Env;
-    const response = await worker.fetch(
+    const response = await fetchWorker(
       new Request('https://keiko.example.test/readyz'),
       unavailableEnv
     );
