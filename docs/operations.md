@@ -2,22 +2,29 @@
 
 ## Current Production state
 
-The single-account Production cutover and GitHub-service move are complete.
-The Production Keiko Worker and MatMetrics app pass health, readiness, and
-session smoke checks. Production D1 contains all 38 sessions. The selected
-`CyanAutomation/matmetrics` repository has all 38 session files, and the
-Production Log Doctor scan found 38 valid files and no invalid files. The
-automatic GitHub Markdown sync implementation and migration 0007 are local
-changes and are not yet deployed. Until migration 0007 is applied, Production
-still uses the previous sync behavior and its old D1 snapshot tables remain;
-the migration drops those tables and requests a full repository reconciliation.
+The following snapshot was read from Production on 2026-11-18. Recheck Cloudflare
+before operational changes because runtime state changes independently of this
+document.
 
-MatMetrics Production serves `matmetrics-teal.vercel.app` and sends the
-allowlisted account to `https://keiko-dojo.scheimann.workers.dev`. The current
-Keiko Worker version is `5e2edcc7-d2f4-4a35-a434-6a164f5d199a`; the current
-READY Vercel Production deployment is
-`dpl_DD42r7ZcwB6EVQ8pW2ARX8SFLY8r` at commit
-`9846c37c1697362f32174754bb53a0e8627c985c`.
+- The latest deployed Keiko Worker version is
+  `a7c66220-8a1d-4326-b7e0-0366b87e68c3`, created 2026-10-25. It predates the
+  current `main` revision.
+- Production D1 has migrations `0001` through `0008` applied and 39 sessions.
+  The sync state is at generation 5 with `completed_generation = 0`,
+  `full_sync_required = 1`, `last_synced_at = NULL`, `last_error =
+  'github_sync_failed'`, two pending dirty items, and no synced-file manifest
+  rows. Its `next_sync_at` is stale.
+- Nine `github_session_sync_failed` events were observed between 21:00:32 and
+  22:17:31 UTC. They came from the `keiko-dojo-backups` queue and all reported
+  `phase = session_contents`, `causeName = Error`, and `reason = other`.
+  Existing Production logs do not expose enough detail to identify the
+  underlying exception. The safe diagnostic logging change is pending release.
+
+The automatic GitHub Markdown sync and migration 0007 are already present in
+Production; do not treat the earlier 38-session cutover notes below as the
+current sync state. MatMetrics Production serves `matmetrics-teal.vercel.app`
+and routes the allowlisted account to
+`https://keiko-dojo.scheimann.workers.dev`.
 
 Before retirement, the Staging D1 database held a duplicate 38-session dataset
 and no pending backup jobs. Both Staging queues had zero backlog. The Staging
@@ -126,11 +133,12 @@ registration have been deleted; the Production App is separate and untouched.
 
 ## Production cutover verification
 
-The existing account's 38 sessions were dry-run compared and imported. Session
-payloads and analytics matched the Markdown repository. The deployed MatMetrics
-app writes to Production only; authenticated create/read/delete returned
-201/200/204 and a follow-up read returned 404. The deployed MatMetrics gateway
-handles Keiko's bodyless 204 response.
+At the October 2026 cutover, 38 sessions were dry-run compared and imported.
+Session payloads and analytics matched the Markdown repository. The deployed
+MatMetrics app writes to Production only; authenticated create/read/delete
+returned 201/200/204 and a follow-up read returned 404. The deployed MatMetrics
+gateway handles Keiko's bodyless 204 response. Production now has 39 sessions;
+see the current-state snapshot above for sync health.
 
 Before the GitHub sync redesign, a manually requested Production snapshot
 completed at 20:15:49 UTC on 2026-10-25 and a second at 20:28:49 UTC. These are
@@ -157,11 +165,12 @@ npx wrangler d1 execute keiko-dojo-local --local --command "PRAGMA table_info(se
 npx wrangler d1 execute keiko-dojo-local --local --command "PRAGMA index_list(session_create_idempotency)"
 ```
 
-For an approved production release, apply migration 0008 first, verify the
-table and primary key, deploy the compatible Keiko Worker, then deploy the
-MatMetrics client that sends keys. Older MatMetrics clients remain compatible
-because the header is optional. Do not deploy a new MatMetrics client while
-Keiko is still silently ignoring the key.
+Production currently records migration 0008 as applied. Before a future
+release, verify the remote migration list and use the main-only **Deploy
+Production** workflow, which applies migrations before deploying the Worker.
+Older MatMetrics clients remain compatible because the idempotency header is
+optional. Do not deploy a new MatMetrics client while Keiko is still silently
+ignoring the key.
 
 If the Worker or MatMetrics release must be rolled back after applying 0008,
 leave the additive table and its rows in place. An older Worker ignores the
@@ -179,8 +188,21 @@ payloads, or user IDs to routine Worker logs.
 
 Worker request logs contain the request ID, environment, method, normalized
 path, status, and duration. They omit bearer tokens, cookies, and session
-payloads. Backup errors use stable error codes; GitHub API response bodies and
-credentials are not logged.
+payloads. GitHub sync failure events should include `phase`, the specific
+GitHub operation (`installation_token`, `contents_get`, `contents_put`, or
+`contents_delete`), GitHub request ID and response status when available,
+exception name, transport cause code, stable error category, and a bounded,
+redacted error summary. Never log GitHub response bodies, credentials, session
+IDs, file paths, or session payloads. Alert when a sync remains incomplete or
+`last_error` remains set for more than 15 minutes; inspect the operation and
+GitHub request ID before retrying or changing repository state.
+
+For this incident, deploy the diagnostic change and inspect one normal queue
+retry before manually starting another sync. Once the cause is fixed, review the
+managed stale paths that a full reconciliation would remove, then queue one
+full sync. Verify `full_sync_required = 0`, `completed_generation = generation`,
+`last_synced_at` is set, `last_error` is null, no dirty items remain, and the
+manifest contains one row for every current D1 session.
 
 MatMetrics continues to own training-plan insights and AI features. Do not send
 session data to an AI provider until the data-use policy is approved.
