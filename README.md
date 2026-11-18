@@ -33,23 +33,17 @@ server-to-server for a Keiko-only token for allowlisted accounts.
 ## Deployments
 
 Wrangler keeps a local development configuration and a `production` remote
-environment. The single-account Production cutover is complete: Production
-contains all 38 sessions, and the selected MatMetrics repository has a
-successful 38-session Markdown sync. The Log Doctor scan checked all 38
-training files successfully. Automatic, debounced GitHub Markdown sync and D1
-snapshot removal are implemented locally and take effect in Production after
-migration 0007 and the Worker deploy. MatMetrics Production routes the
-allowlisted account to the Production Keiko Worker. See
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for current deployment and
-environment-retirement status and [`docs/operations.md`](docs/operations.md)
-for GitHub Markdown sync operations and the Production rollout.
+environment. As of 2026-11-18, Production D1 has migrations 0001 through 0008
+and 39 sessions. The Worker is still on version
+`a7c66220-8a1d-4326-b7e0-0366b87e68c3` from 2026-10-25, and the initial GitHub
+Markdown reconciliation is incomplete. See
+[`docs/operations.md`](docs/operations.md) for the observed state, diagnosis,
+and recovery steps.
 
-Apply Production migrations before deploying a Worker change:
-
-```bash
-npm run migrate:production
-npm run deploy:production
-```
+Deploy Production from `main` using the GitHub Actions **Deploy Production**
+workflow. It runs the repository checks, applies Production migrations, then
+deploys the Worker. Do not run the production deploy command from a local or
+feature branch.
 
 Do not use MatMetrics' `matmetrics-data` D1 database for Keiko Dojo. D1 session
 queries use the Worker's binding API and parameterized statements; the D1

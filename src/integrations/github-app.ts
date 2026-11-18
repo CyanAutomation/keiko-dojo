@@ -62,12 +62,66 @@ function safeTransportDetails(error: unknown): {
       ? 'redirect_rejected'
       : message.includes('cache')
         ? 'cache_option'
-        : message.includes('network') || message.includes('fetch failed')
+        : message.includes('network') || message.includes('fetch failed') || message.includes('failed to fetch')
           ? 'network_error'
           : message.includes('url')
             ? 'invalid_url'
             : 'other',
   };
+}
+
+type GitHubSyncDiagnosticOperation =
+  | 'installation_token'
+  | 'contents_get'
+  | 'contents_put'
+  | 'contents_delete';
+
+type GitHubSyncDiagnostics = {
+  operation: GitHubSyncDiagnosticOperation;
+  githubRequestId: string | null;
+  responseStatus: number | null;
+};
+
+function beginGitHubSyncRequest(
+  diagnostics: GitHubSyncDiagnostics | undefined,
+  operation: GitHubSyncDiagnosticOperation
+): void {
+  if (!diagnostics) return;
+  diagnostics.operation = operation;
+  diagnostics.githubRequestId = null;
+  diagnostics.responseStatus = null;
+}
+
+function recordGitHubSyncResponse(
+  diagnostics: GitHubSyncDiagnostics | undefined,
+  response: Response
+): void {
+  if (!diagnostics) return;
+  const requestId = response.headers.get('x-github-request-id');
+  diagnostics.githubRequestId = requestId && /^[A-Za-z0-9:-]{1,128}$/.test(requestId)
+    ? requestId
+    : null;
+  diagnostics.responseStatus = response.status;
+}
+
+function safeErrorSummary(error: unknown): string | null {
+  if (!(error instanceof Error)) return null;
+  // JSON parser messages may include response snippets, so never log them verbatim.
+  if (error instanceof SyntaxError) return 'invalid_response_json';
+
+  const raw = error.message
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[url]')
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
+    .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+\b/gi, '[token]')
+    .replace(/\b(token|secret|private[_ -]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]')
+    .replace(/([?&][A-Za-z0-9_.-]+)=([^&\s]+)/g, '$1=[redacted]')
+    .replace(/data\/\d{4}\/\d{2}\/\d{8}-matmetrics-[A-Za-z0-9_-]{1,100}\.md/gi, '[session-path]')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
+    .replace(/\b[0-9a-f]{32,}\b/gi, '[identifier]')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const summary = raw.slice(0, 160);
+  return summary || null;
 }
 
 function required(value: string | undefined): string {
@@ -326,7 +380,8 @@ async function scopedContentsToken(
   installationId: number,
   repositoryName: string,
   permission: 'read' | 'write' = 'write',
-  userId = ''
+  userId = '',
+  diagnostics?: GitHubSyncDiagnostics
 ): Promise<string> {
   const cacheKey = JSON.stringify([userId, installationId, repositoryName, permission]);
   const now = Date.now();
@@ -340,12 +395,15 @@ async function scopedContentsToken(
   const entry: InstallationTokenCacheEntry = {};
   const pending = (async () => {
     const jwt = await appJwt(env);
-    const value = await responseJson<{ token: string; expires_at?: string }>(await githubFetch(
+    beginGitHubSyncRequest(diagnostics, 'installation_token');
+    const response = await githubFetch(
       `https://api.github.com/app/installations/${installationId}/access_tokens`,
       jwt,
       'POST',
       { repositories: [repositoryName], permissions: { contents: permission } }
-    ));
+    );
+    recordGitHubSyncResponse(diagnostics, response);
+    const value = await responseJson<{ token: string; expires_at?: string }>(response);
     const expiresAt = value.expires_at ? Date.parse(value.expires_at) : NaN;
     if (Number.isFinite(expiresAt) && expiresAt > Date.now() + TOKEN_REFRESH_MARGIN_MS) {
       entry.token = value.token;
@@ -790,11 +848,14 @@ async function writeSessionMarkdown(
   path: string,
   markdown: string,
   commitMessage: string,
-  cacheNamespace: string
+  cacheNamespace: string,
+  diagnostics: GitHubSyncDiagnostics
 ): Promise<void> {
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
   let sha: string | undefined;
+  beginGitHubSyncRequest(diagnostics, 'contents_get');
   const existing = await githubFetch(url, token, 'GET', undefined, cacheNamespace);
+  recordGitHubSyncResponse(diagnostics, existing);
   if (existing.ok) {
     const value = await responseJson<{ sha: string; content?: string; encoding?: string }>(existing);
     sha = value.sha;
@@ -808,11 +869,14 @@ async function writeSessionMarkdown(
   } else if (existing.status !== 404) {
     await responseJson(existing);
   }
-  await responseJson(await githubFetch(url, token, 'PUT', {
+  beginGitHubSyncRequest(diagnostics, 'contents_put');
+  const response = await githubFetch(url, token, 'PUT', {
     message: commitMessage,
     content: base64Utf8(markdown),
     ...(sha ? { sha } : {}),
-  }));
+  });
+  recordGitHubSyncResponse(diagnostics, response);
+  await responseJson(response);
 }
 
 async function deleteSessionMarkdown(
@@ -821,18 +885,24 @@ async function deleteSessionMarkdown(
   repository: string,
   path: string,
   commitMessage: string,
-  cacheNamespace: string
+  cacheNamespace: string,
+  diagnostics: GitHubSyncDiagnostics
 ): Promise<void> {
   if (!isSafeSessionMarkdownPath(path)) throw new Error('GitHub session path is invalid');
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
+  beginGitHubSyncRequest(diagnostics, 'contents_get');
   const existing = await githubFetch(url, token, 'GET', undefined, cacheNamespace);
+  recordGitHubSyncResponse(diagnostics, existing);
   if (existing.status === 404) return;
   const file = await responseJson<{ sha?: unknown }>(existing);
   if (typeof file.sha !== 'string') throw new Error('GitHub session file revision is missing');
-  await responseJson(await githubFetch(url, token, 'DELETE', {
+  beginGitHubSyncRequest(diagnostics, 'contents_delete');
+  const response = await githubFetch(url, token, 'DELETE', {
     message: commitMessage,
     sha: file.sha,
-  }));
+  });
+  recordGitHubSyncResponse(diagnostics, response);
+  await responseJson(response);
 }
 
 export function isKeikoSessionMarkdownPath(path: string): boolean {
@@ -862,9 +932,15 @@ export async function syncGitHubSessionMarkdown(
   );
 
   let phase = 'installation_token_request';
+  const diagnostics: GitHubSyncDiagnostics = {
+    operation: 'installation_token',
+    githubRequestId: null,
+    responseStatus: null,
+  };
   try {
     const token = await scopedContentsToken(
-      env, installation.installation_id, installation.repository_name, 'write', installation.user_id
+      env, installation.installation_id, installation.repository_name, 'write', installation.user_id,
+      diagnostics
     );
     phase = 'session_contents';
     for (const file of files) {
@@ -875,7 +951,8 @@ export async function syncGitHubSessionMarkdown(
         file.path,
         file.markdown,
         `Keiko Dojo backup session (${file.sessionDate}): ${file.id}`,
-        githubCacheScope(installation)
+        githubCacheScope(installation),
+        diagnostics
       );
     }
     phase = 'session_deletions';
@@ -886,7 +963,8 @@ export async function syncGitHubSessionMarkdown(
         installation.repository_name,
         path,
         'Keiko Dojo backup remove deleted session',
-        githubCacheScope(installation)
+        githubCacheScope(installation),
+        diagnostics
       );
     }
     return files.map(({ id, path, revision }) => ({ id, path, revision }));
@@ -894,11 +972,15 @@ export async function syncGitHubSessionMarkdown(
     const details = safeTransportDetails(error);
     console.error('github_session_sync_failed', {
       phase,
+      operation: diagnostics.operation,
+      githubRequestId: diagnostics.githubRequestId,
+      responseStatus: diagnostics.responseStatus,
       causeName: error instanceof Error ? error.name : null,
       causeCode: details.causeCode ?? null,
       status: error instanceof GitHubAppApiError ? error.status : null,
       reason: details.reason,
       apiErrorCategory: error instanceof GitHubAppApiError ? error.category : null,
+      errorSummary: safeErrorSummary(error),
     });
     throw error;
   }
