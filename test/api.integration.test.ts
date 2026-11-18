@@ -5,10 +5,10 @@ import worker from '../src/index';
 import { processGitHubSessionSyncMessage } from '../src/http/github-sync';
 import { credentialBearingVideoUrl } from './helpers';
 import { createApiHarness, fetchWorker } from './api-harness';
+import { waitForTrackedExecutionContexts } from './execution-contexts';
 
 const { issuer, jwksUrl, audience, testEnv, tokenFor, call } = createApiHarness();
 const allowRateLimit = { limit: async (_input: { key: string }) => ({ success: true }) };
-let backgroundSessionSyncDispatchFinished = false;
 const testSession = {
   id: 'test-session-1',
   date: '2026-10-16',
@@ -523,13 +523,14 @@ describe('Keiko session API', () => {
   });
 
   it('returns before background sync dispatch finishes', async () => {
-    backgroundSessionSyncDispatchFinished = false;
     const userId = `session-sync-wait-until-${crypto.randomUUID()}`;
+    const sessionId = 'wait-until-sync-dispatch';
     await env.DB.prepare(
       `INSERT INTO github_installations
        (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
        VALUES (?, ?, ?, ?, ?, ?)`
     ).bind(userId, 932, 'CyanAutomation', 'matmetrics', 932, new Date().toISOString()).run();
+    let backgroundSessionSyncDispatchFinished = false;
     let signalDispatchStarted!: () => void;
     const dispatchStarted = new Promise<void>((resolve) => {
       signalDispatchStarted = resolve;
@@ -543,19 +544,39 @@ describe('Keiko session API', () => {
       BACKUP_QUEUE: { send },
     }) as Env;
 
-    const response = await call('/v1/sessions', userId, {
-      method: 'POST',
-      body: JSON.stringify({ ...testSession, id: 'wait-until-sync-dispatch' }),
-    }, {}, requestEnv);
+    try {
+      const response = await call('/v1/sessions', userId, {
+        method: 'POST',
+        body: JSON.stringify({ ...testSession, id: sessionId }),
+      }, {}, requestEnv);
 
-    await dispatchStarted;
-    expect(response.status).toBe(201);
-    expect(send).toHaveBeenCalledOnce();
-    expect(backgroundSessionSyncDispatchFinished).toBe(false);
-  });
+      await dispatchStarted;
+      expect(response.status).toBe(201);
+      expect(send).toHaveBeenCalledOnce();
+      expect(backgroundSessionSyncDispatchFinished).toBe(false);
 
-  it('settles background sync dispatch before the next test starts', () => {
-    expect(backgroundSessionSyncDispatchFinished).toBe(true);
+      await waitForTrackedExecutionContexts();
+      expect(backgroundSessionSyncDispatchFinished).toBe(true);
+    } finally {
+      try {
+        await waitForTrackedExecutionContexts();
+      } finally {
+        await env.DB.batch([
+          env.DB.prepare(
+            'DELETE FROM session_create_idempotency WHERE user_id = ? AND session_id = ?'
+          ).bind(userId, sessionId),
+          env.DB.prepare(
+            'DELETE FROM github_session_sync_state WHERE user_id = ?'
+          ).bind(userId),
+          env.DB.prepare(
+            'DELETE FROM github_installations WHERE user_id = ?'
+          ).bind(userId),
+          env.DB.prepare(
+            'DELETE FROM sessions WHERE user_id = ? AND id = ?'
+          ).bind(userId, sessionId),
+        ]);
+      }
+    }
   });
 
   it('keeps a successful D1 write successful when queue dispatch fails and retries it from cron', async () => {
