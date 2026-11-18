@@ -109,7 +109,7 @@ function safeErrorSummary(error: unknown): string | null {
   // JSON parser messages may include response snippets, so never log them verbatim.
   if (error instanceof SyntaxError) return 'invalid_response_json';
 
-  const summary = error.message.slice(0, 512)
+  const raw = error.message
     .replace(/https?:\/\/[^\s"'<>]+/gi, '[url]')
     .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
     .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+\b/gi, '[token]')
@@ -120,7 +120,8 @@ function safeErrorSummary(error: unknown): string | null {
     .replace(/\b[0-9a-f]{32,}\b/gi, '[identifier]')
     .replace(/\s+/g, ' ')
     .trim();
-  return summary ? summary.slice(0, 160) : null;
+  const summary = raw.slice(0, 160);
+  return summary || null;
 }
 
 function required(value: string | undefined): string {
