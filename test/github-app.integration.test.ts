@@ -371,6 +371,51 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('redacts sensitive patterns that cross the error-summary truncation boundary', async () => {
+    const priorFetch = globalThis.fetch;
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const prefix = `${Array.from({ length: 12 }, () => `ghp_${'a'.repeat(36)}`).join(' ')} ${'x'.repeat(18)}`;
+    expect(prefix).toHaveLength(510);
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/app/installations/731/access_tokens')) {
+        return Response.json({ token: 'write-install-token' });
+      }
+      throw new Error(`${prefix}https://private.example/secret?token=private-token`);
+    });
+
+    try {
+      await expect(syncGitHubSessionMarkdown(appEnv, {
+        user_id: 'boundary-redaction-diagnostic',
+        installation_id: 731,
+        repository_owner: 'maki',
+        repository_name: 'judo-notes',
+        repository_id: 88,
+      }, [{
+        id: 'boundary-redaction-session',
+        session_date: '2026-10-24',
+        category: 'Technical',
+        effort: 3,
+        payload: JSON.stringify({
+          id: 'boundary-redaction-session', date: '2026-10-24', effort: 3,
+          category: 'Technical', techniques: ['Uchi mata'],
+        }),
+        revision: 1,
+        updated_at: '2026-10-24T00:00:00.000Z',
+      }])).rejects.toThrow();
+
+      const sanitizedPrefix = `${Array.from({ length: 12 }, () => '[token]').join(' ')} ${'x'.repeat(18)}`;
+      expect(errorLog).toHaveBeenCalledWith('github_session_sync_failed', expect.objectContaining({
+        errorSummary: `${sanitizedPrefix}[url]`,
+      }));
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private.example');
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain('private-token');
+    } finally {
+      errorLog.mockRestore();
+      vi.stubGlobal('fetch', priorFetch);
+    }
+  });
+
   it('records the GitHub request ID for a failed contents write without logging its response body', async () => {
     const priorFetch = globalThis.fetch;
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
