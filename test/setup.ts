@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { applyD1Migrations } from 'cloudflare:test';
-import { beforeEach } from 'vitest';
+import { afterEach, beforeEach } from 'vitest';
+import { waitForTrackedExecutionContexts } from './execution-contexts';
 
 beforeEach(async () => {
   if (!env.TEST_MIGRATIONS?.length) {
@@ -16,4 +17,8 @@ beforeEach(async () => {
     env.DB.prepare('DELETE FROM github_installations'),
     env.DB.prepare('DELETE FROM sessions'),
   ]);
+});
+
+afterEach(async () => {
+  await waitForTrackedExecutionContexts();
 });
