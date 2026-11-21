@@ -81,21 +81,23 @@ test('rejects missing credentials and a mismatched production account before mak
 });
 
 test('reports D1 access denial without logging the token or raw Cloudflare body', async () => {
-  const error = await assert.rejects(
+  await assert.rejects(
     verifyCloudflareCredentials({
       env: { CLOUDFLARE_API_TOKEN: 'secret-token', CLOUDFLARE_ACCOUNT_ID: accountId },
       config,
       fetchImpl: async () => response(null, 403),
     }),
-  );
-  assert.match(error.message, /D1 Read/);
-  assert.match(error.message, /7403/);
-  assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
+  , (error) => {
+    assert.match(error.message, /D1 Read/);
+    assert.match(error.message, /7403/);
+    assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
+    return true;
+  });
 });
 
 test('reports missing Worker deployment access with the scoped Worker permission', async () => {
   const calls = [];
-  const error = await assert.rejects(
+  await assert.rejects(
     verifyCloudflareCredentials({
       env: { CLOUDFLARE_API_TOKEN: 'secret-token', CLOUDFLARE_ACCOUNT_ID: accountId },
       config,
@@ -110,8 +112,10 @@ test('reports missing Worker deployment access with the scoped Worker permission
         return response(null, 403);
       },
     }),
-  );
-  assert.match(error.message, /Individual Workers Editor/);
-  assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
+  , (error) => {
+    assert.match(error.message, /Individual Workers Editor/);
+    assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
+    return true;
+  });
   assert.equal(calls.length, 3);
 });
