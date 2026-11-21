@@ -87,7 +87,7 @@ test('reports D1 access denial without logging the token or raw Cloudflare body'
       config,
       fetchImpl: async () => response(null, 403),
     }),
-  , (error) => {
+    (error) => {
     assert.match(error.message, /D1 Read/);
     assert.match(error.message, /7403/);
     assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
@@ -112,7 +112,7 @@ test('reports missing Worker deployment access with the scoped Worker permission
         return response(null, 403);
       },
     }),
-  , (error) => {
+    (error) => {
     assert.match(error.message, /Individual Workers Editor/);
     assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
     return true;
