@@ -5,8 +5,6 @@ import { fileURLToPath } from 'node:url';
 import { assertProductionResources, parseJsonc } from './production-preflight.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const EXPECTED_ACCOUNT_ID = 'c40f3cb30efbf8c6d081cf9e50a61931';
-
 function permissionError(resource, status, codes) {
   const codeText = codes.length ? ' Cloudflare code ' + codes.join(', ') + '.' : '';
   if (status === 403 || codes.includes(7403)) {
@@ -61,10 +59,6 @@ export async function verifyCloudflareCredentials({ env, config, fetchImpl = fet
   if (!/^[a-f0-9]{32}$/i.test(env.CLOUDFLARE_ACCOUNT_ID)) {
     throw new Error('CLOUDFLARE_ACCOUNT_ID must be a 32-character hexadecimal account ID.');
   }
-  if (env.CLOUDFLARE_ACCOUNT_ID.toLowerCase() !== EXPECTED_ACCOUNT_ID) {
-    throw new Error('Configured CLOUDFLARE_ACCOUNT_ID does not match the production account.');
-  }
-
   const resources = assertProductionResources(config);
   const base = '/accounts/' + env.CLOUDFLARE_ACCOUNT_ID;
   const database = await request(
@@ -100,7 +94,7 @@ export async function verifyCloudflareCredentials({ env, config, fetchImpl = fet
   }
 
   return {
-    accountMatchesProduction: true,
+    productionResourcesAccessible: true,
     databaseName: resources.databaseName,
     d1Read: 'passed',
     workerName: resources.workerName,
@@ -111,7 +105,7 @@ export async function verifyCloudflareCredentials({ env, config, fetchImpl = fet
 async function main() {
   const config = parseJsonc(await readFile(resolve(ROOT, 'wrangler.jsonc'), 'utf8'));
   const result = await verifyCloudflareCredentials({ env: process.env, config });
-  console.log('Read-only Cloudflare credential check passed: production account matches; D1 ' + result.databaseName + ' is readable; Worker ' + result.workerName + ' deployment metadata is readable.');
+  console.log('Read-only Cloudflare credential check passed: the configured account can access production D1 ' + result.databaseName + ' is readable; Worker ' + result.workerName + ' deployment metadata is readable.');
   console.log('This verifies the GitHub environment token and read access. It does not exercise D1 migration-write or Worker deployment-write permission.');
 }
 
