@@ -86,6 +86,10 @@ test('verifies the 100% deployed Worker version carries the reviewed release SHA
   });
   assert.throws(() => assertDeploymentMatchesRelease(deployments, 'b'.repeat(40)), /does not match/);
   assert.throws(() => assertDeploymentMatchesRelease([{ ...deployments[0], versions: [{ version_id: 'version-id', percentage: 50 }] }], sha), /100%/);
+  assert.throws(() => assertDeploymentMatchesRelease([{ ...deployments[0], versions: [
+    { version_id: 'version-one', percentage: 50 },
+    { version_id: 'version-two', percentage: 50 },
+  ] }], sha), /100%/);
 });
 
 test('accepts the configured production Worker and D1 resources', () => {
@@ -143,6 +147,7 @@ test('compares the D1 idempotency table schema independent of formatting', () =>
 test('verifies the configured D1, migration prefix, table schema, and active Worker through read-only requests', async () => {
   const migrationSql = 'CREATE TABLE session_create_idempotency (user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, PRIMARY KEY (user_id, idempotency_key));';
   const calls = [];
+  let deploymentVersions = [{ version_id: 'version-id', percentage: 100 }];
   const fetchImpl = async (url, options) => {
     calls.push({ url, options });
     let result;
@@ -154,7 +159,7 @@ test('verifies the configured D1, migration prefix, table schema, and active Wor
         { queue_name: 'keiko-dojo-backups-dlq' },
       ];
     } else if (url.endsWith('/workers/scripts/keiko-dojo/deployments')) {
-      result = { deployments: [{ versions: [{ version_id: 'version-id', percentage: 100 }] }] };
+      result = { deployments: [{ versions: deploymentVersions }] };
     } else {
       const sql = JSON.parse(options.body).sql;
       result = [{
@@ -167,38 +172,67 @@ test('verifies the configured D1, migration prefix, table schema, and active Wor
     return { ok: true, status: 200, json: async () => ({ success: true, result }) };
   };
 
-  const verified = await verifyProduction({
+  const preflightOptions = {
     env: { CLOUDFLARE_API_TOKEN: 'secret-token', CLOUDFLARE_ACCOUNT_ID: 'c'.repeat(32) },
     config,
     localNames: migrations,
     migrationSql,
     fetchImpl,
-  });
+  };
+  const verified = await verifyProduction(preflightOptions);
   assert.equal(verified.appliedMigrations, 8);
   assert.equal(verified.pendingMigrations, 1);
   assert.equal(calls.length, 5);
   assert.ok(calls.every(({ options }) => options.headers.Authorization === 'Bearer secret-token'));
   assert.deepEqual(calls.map(({ options }) => options.method ?? 'GET'), ['GET', 'GET', 'GET', 'POST', 'POST']);
   assert.ok(calls.slice(3).every(({ options }) => JSON.parse(options.body).sql.startsWith('SELECT')));
+
+  deploymentVersions = [
+    { version_id: 'version-one', percentage: 50 },
+    { version_id: 'version-two', percentage: 50 },
+  ];
+  await assert.rejects(verifyProduction(preflightOptions), /100% traffic/);
 });
 
-test('reports D1 permission denial without returning Cloudflare response bodies', async () => {
-  const fetchImpl = async (url) => url.includes('/queues?')
-    ? { ok: true, status: 200, json: async () => ({ success: true, result: [
-      { queue_name: 'keiko-dojo-backups' },
-      { queue_name: 'keiko-dojo-backups-dlq' },
-    ] }) }
-    : {
-        ok: false,
-        status: 403,
-        json: async () => ({ success: false, errors: [{ code: 7403, message: 'secret response body' }] }),
-      };
+test('reports D1 schema permission denial without returning Cloudflare response bodies', async () => {
+  const migrationSql = 'CREATE TABLE session_create_idempotency (user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, PRIMARY KEY (user_id, idempotency_key));';
+  const fetchImpl = async (url, options) => {
+    if (url.includes('/queues?')) {
+      return { ok: true, status: 200, json: async () => ({ success: true, result: [
+        { queue_name: 'keiko-dojo-backups' },
+        { queue_name: 'keiko-dojo-backups-dlq' },
+      ] }) };
+    }
+    if (url.endsWith('/d1/database/750315f8-ef51-4d6e-86ea-41b076ec9de8')) {
+      return { ok: true, status: 200, json: async () => ({ success: true, result: {
+        uuid: '750315f8-ef51-4d6e-86ea-41b076ec9de8',
+        name: 'keiko-dojo',
+      } }) };
+    }
+    if (url.endsWith('/workers/scripts/keiko-dojo/deployments')) {
+      return { ok: true, status: 200, json: async () => ({ success: true, result: {
+        deployments: [{ versions: [{ version_id: 'version-id', percentage: 100 }] }],
+      } }) };
+    }
+    const sql = JSON.parse(options.body).sql;
+    if (sql.includes('d1_migrations')) {
+      return { ok: true, status: 200, json: async () => ({ success: true, result: [{
+        success: true,
+        results: migrations.slice(0, 8).map((name) => ({ name })),
+      }] }) };
+    }
+    return {
+      ok: false,
+      status: 403,
+      json: async () => ({ success: false, errors: [{ code: 7403, message: 'secret response body' }] }),
+    };
+  };
   await assert.rejects(
     verifyProduction({
       env: { CLOUDFLARE_API_TOKEN: 'secret-token', CLOUDFLARE_ACCOUNT_ID: 'c'.repeat(32) },
       config,
       localNames: migrations,
-      migrationSql: 'CREATE TABLE session_create_idempotency (x TEXT);',
+      migrationSql,
       fetchImpl,
     }),
     (error) => error.message.includes('D1 Edit') && error.message.includes('7403') && !error.message.includes('secret response body') && !error.message.includes('secret-token'),

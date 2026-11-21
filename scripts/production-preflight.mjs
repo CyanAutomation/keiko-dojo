@@ -111,17 +111,21 @@ export function assertWorkflowRevision({ ref, sha, checkoutSha }) {
   return sha.toLowerCase();
 }
 
+function requireSingleFullTrafficVersion(active, message) {
+  const versions = active?.versions;
+  if (!active || !Array.isArray(versions) || versions.length !== 1 || !versions[0]?.version_id || versions[0].percentage !== 100) {
+    throw new Error(message);
+  }
+  return versions[0];
+}
+
 export function assertDeploymentMatchesRelease(deployments, sha) {
   const active = deployments?.[0];
-  const versions = active?.versions ?? [];
-  const trafficPercentage = versions.reduce((sum, version) => sum + version.percentage, 0);
-  if (!active || !versions[0]?.version_id || trafficPercentage !== 100) {
-    throw new Error('Unexpected Worker deployment state: production must have a version at 100% traffic.');
-  }
+  const version = requireSingleFullTrafficVersion(active, 'Unexpected Worker deployment state: production must have a version at 100% traffic.');
   if (active.annotations?.['workers/message'] !== `keiko-release-sha:${sha}`) {
     throw new Error('Deployed Worker version does not match the reviewed release SHA.');
   }
-  return { versionId: versions[0].version_id, trafficPercentage };
+  return { versionId: version.version_id, trafficPercentage: version.percentage };
 }
 
 export function assertMigrationHistory(localNames, appliedNames, { requireAll = false } = {}) {
@@ -238,9 +242,7 @@ export async function verifyProduction({ env, config, localNames, migrationSql, 
   }
   const entries = deployments?.deployments ?? [];
   const active = entries[0];
-  if (!active || !Array.isArray(active.versions) || active.versions.reduce((sum, version) => sum + version.percentage, 0) !== 100) {
-    throw new Error('Unexpected Worker deployment state: the production Worker must have a readable deployment at 100% traffic.');
-  }
+  requireSingleFullTrafficVersion(active, 'Unexpected Worker deployment state: the production Worker must have a readable deployment at 100% traffic.');
 
   let appliedRows;
   try {
@@ -255,7 +257,8 @@ export async function verifyProduction({ env, config, localNames, migrationSql, 
   let schemaRows;
   try {
     schemaRows = await queryDatabase(env.CLOUDFLARE_ACCOUNT_ID, resources.databaseId, env.CLOUDFLARE_API_TOKEN, "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_create_idempotency'", fetchImpl);
-  } catch {
+  } catch (error) {
+    if (error?.status) throw apiError('D1 schema', error.status, error.codes);
     throw new Error('Production idempotency schema could not be verified. Check D1 read access and migration 0008.');
   }
   assertIdempotencySchema(migrationSql, schemaRows[0]?.sql);
