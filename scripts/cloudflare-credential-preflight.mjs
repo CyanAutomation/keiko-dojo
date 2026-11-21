@@ -105,7 +105,7 @@ export async function verifyCloudflareCredentials({ env, config, fetchImpl = fet
 async function main() {
   const config = parseJsonc(await readFile(resolve(ROOT, 'wrangler.jsonc'), 'utf8'));
   const result = await verifyCloudflareCredentials({ env: process.env, config });
-  console.log('Read-only Cloudflare credential check passed: the configured account can access production D1 ' + result.databaseName + ' is readable; Worker ' + result.workerName + ' deployment metadata is readable.');
+  console.log('Read-only Cloudflare credential check passed: the configured account can read production D1 ' + result.databaseName + ' and Worker ' + result.workerName + ' deployment metadata.');
   console.log('This verifies the GitHub environment token and read access. It does not exercise D1 migration-write or Worker deployment-write permission.');
 }
 
