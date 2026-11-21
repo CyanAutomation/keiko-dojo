@@ -40,6 +40,7 @@ jobs:
         run: npm run security:dependencies:all
       - run: npm run security:dependencies
       - run: npm test
+      - run: npm run test:release-preflight
       - run: npm run cf-typegen:check
       - run: npm run typecheck
       - run: npm run check:migrations
