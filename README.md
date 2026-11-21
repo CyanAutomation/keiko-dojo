@@ -33,17 +33,20 @@ server-to-server for a Keiko-only token for allowlisted accounts.
 ## Deployments
 
 Wrangler keeps a local development configuration and a `production` remote
-environment. As of 2026-11-18, Production D1 has migrations 0001 through 0008
-and 39 sessions. The Worker is still on version
-`a7c66220-8a1d-4326-b7e0-0366b87e68c3` from 2026-10-25, and the initial GitHub
-Markdown reconciliation is incomplete. See
-[`docs/operations.md`](docs/operations.md) for the observed state, diagnosis,
-and recovery steps.
+environment. Read-only checks on 2026-11-21 confirmed Production D1 migrations
+0001 through 0008 and the idempotency table schema. The Worker remains on
+version `a7c66220-8a1d-4326-b7e0-0366b87e68c3` from 2026-10-25. Deployment run
+44420316195 failed with Cloudflare error 7403 during D1 access; the exact
+GitHub token policy remains an owner verification. See
+[`docs/operations.md`](docs/operations.md) for permissions, preflight, and
+release procedures.
 
 Deploy Production from `main` using the GitHub Actions **Deploy Production**
-workflow. It runs the repository checks, applies Production migrations, then
-deploys the Worker. Do not run the production deploy command from a local or
-feature branch.
+workflow. It runs the repository checks, performs a read-only resource and
+migration preflight, applies pending migrations, verifies the complete ledger,
+then deploys the Worker with the source SHA in its Cloudflare version message.
+The workflow verifies that version at 100% traffic before finishing. Do not run the production
+deploy command from a local or feature branch.
 
 Do not use MatMetrics' `matmetrics-data` D1 database for Keiko Dojo. D1 session
 queries use the Worker's binding API and parameterized statements; the D1

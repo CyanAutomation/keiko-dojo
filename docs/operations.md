@@ -2,18 +2,71 @@
 
 ## Current Production state
 
-The following snapshot was read from Production on 2026-11-18. Recheck Cloudflare
-before operational changes because runtime state changes independently of this
-document.
+Release facts below were rechecked read-only on 2026-11-21. The detailed sync
+state that follows is historical and was not queried again on that date.
 
 - The latest deployed Keiko Worker version is
-  `a7c66220-8a1d-4326-b7e0-0366b87e68c3`, created 2026-10-25. It predates the
-  current `main` revision.
-- Production D1 has migrations `0001` through `0008` applied and 39 sessions.
-  The sync state is at generation 5 with `completed_generation = 0`,
-  `full_sync_required = 1`, `last_synced_at = NULL`, `last_error =
-  'github_sync_failed'`, two pending dirty items, and no synced-file manifest
-  rows. Its `next_sync_at` is stale.
+  `a7c66220-8a1d-4326-b7e0-0366b87e68c3`, created 2026-10-25 and still at
+  100% traffic. It predates current `main` (`aa5ee1bc61254b93abe8d431844d1da031035dd`).
+- Production D1 `keiko-dojo` (`750315f8-ef51-4d6e-86ea-41b076ec9de8`) records
+  migrations `0001` through `0008`. A read-only schema query confirmed
+  `session_create_idempotency` matches migration 0008, including the composite
+  `(user_id, idempotency_key)` primary key. Session count was not rechecked.
+- Workflow run
+  [44420316195](https://github.com/CyanAutomation/keiko-dojo/actions/runs/44420316195)
+  passed its CI checks and failed on its first production D1 query with
+  Cloudflare code 7403; Worker deployment was skipped. The run had non-empty
+  token input and the expected account ID. The exact token policy is not
+  visible to repository automation, so its account scope and D1 permission
+  still require owner verification.
+- The connected Cloudflare identity could see the configured account, D1
+  database, migration ledger, and Worker deployment. This is not evidence
+  about the separate token stored in GitHub's `cloudflare` environment.
+- The Production Queue list contains `keiko-dojo-backups` and
+  `keiko-dojo-backups-dlq`; the primary queue reports one producer and one
+  consumer. Message backlog was not queried.
+- The protected deployment workflow now checks the configured account
+  resources, expected Queue names, Worker deployment, D1 migration prefix, and
+  migration 0008 schema before applying migrations. It verifies that all
+  checked-in migrations are recorded before Worker upload. These reads do not
+  prove D1 write or Worker script-edit access.
+- Use one account-scoped API token with `D1 Edit` and `Workers Scripts Edit`
+  permissions scoped to the Keiko Cloudflare account. The token must also be
+  allowed to read the D1 and Worker endpoints used by preflight. Do not use a
+  global API key or grant unrelated account permissions. If the token editor
+  separates read and edit scopes, add the corresponding read scopes for
+  preflight and edit scopes for migration/deployment.
+- The workflow's permission/resource map is:
+
+  | Operation | Cloudflare resource | Minimum permission |
+  | --- | --- | --- |
+  | Verify D1 database and read migration/schema state | Account D1 database `keiko-dojo` (`750315f8-ef51-4d6e-86ea-41b076ec9de8`) | D1 Read; D1 Edit also authorizes the query endpoints used by preflight |
+  | Apply pending D1 migrations | Same D1 database | D1 Edit (D1 write) |
+  | Verify Worker deployment status | Account Worker `keiko-dojo` | Workers Scripts Read; Workers Scripts Edit also authorizes deployment reads |
+  | Verify existing Queue names | Account Queues `keiko-dojo-backups` and `keiko-dojo-backups-dlq` | Queues Read or Workers Scripts Read; Workers Scripts Edit is also accepted by the API |
+  | Upload and deploy the Worker version | Account Worker `keiko-dojo` | Workers Scripts Edit |
+
+  Cloudflare's current Workers authorization guide says deploying a Worker
+  with existing D1/Queue bindings requires Worker Editor access; it does not
+  require separate access to each bound resource. Keiko's queue and
+  dead-letter resources must already exist. Do not grant Queue Edit or other
+  resource permissions for this deployment unless Cloudflare reports a
+  specific new requirement.
+- GitHub owner must verify `CLOUDFLARE_ACCOUNT_ID` in the protected
+  `cloudflare` environment and inspect the API token's account/resource
+  restrictions and permissions. Workflow automation can confirm only that the
+  variable and secret are present, then whether that token can read the target
+  resources.
+- Production deployment remains an explicit dispatch from `main` through the
+  protected GitHub environment. No production migration or deployment was run
+  for this assessment.
+
+Historical sync state from 2026-11-18 (not rechecked on 2026-11-21):
+
+- Production D1 had 39 sessions. The sync state was at generation 5 with
+  `completed_generation = 0`, `full_sync_required = 1`, `last_synced_at = NULL`,
+  `last_error = 'github_sync_failed'`, two pending dirty items, and no
+  synced-file manifest rows. Its `next_sync_at` was stale.
 - Nine `github_session_sync_failed` events were observed between 21:00:32 and
   22:17:31 UTC. They came from the `keiko-dojo-backups` queue and all reported
   `phase = session_contents`, `causeName = Error`, and `reason = other`.
@@ -35,6 +88,45 @@ the `GITHUB_APP_PRIVATE_KEY` secret; deleting it removed that Keiko-side secret.
 The Production Worker, D1 database, queues, GitHub App installation, and app
 registration remain present. The Staging GitHub App installation and
 registration have been deleted; the Production App is separate and untouched.
+
+## Production release procedure
+
+Use the protected `Deploy Production` workflow after the owner has verified
+the Cloudflare token policy:
+
+1. Confirm required Keiko CI and workflow-quality checks are green for the
+   reviewed `main` commit.
+2. Confirm the D1 ledger is the expected migration prefix and migration 0008
+   has the expected table schema. The read-only workflow preflight performs
+   these checks and identifies pending checked-in migrations.
+3. Verify the GitHub environment token is scoped to the Keiko Cloudflare
+   account and has D1 Edit and Workers Scripts Edit permissions. Read-only
+   preflight success does not establish write permission.
+4. Obtain the approval required by the protected GitHub environment, then
+   dispatch `Deploy Production` from `main`.
+5. Let the workflow apply forward-only D1 migrations, verify the full remote
+   migration ledger, then deploy the Worker with `keiko-release-sha:<commit>`
+   as its Cloudflare version message.
+6. Confirm the workflow's post-deploy read reports the expected Worker version
+   ID at 100% traffic and the same release SHA before smoke testing. The
+   Cloudflare deployment API exposes version IDs, annotations, and traffic
+   percentages independently of the workflow runner.
+7. Use an approved dedicated test account for keyed-create smoke tests. Verify
+   first create; same-key/same-payload replay; same-key/different-payload
+   `409 idempotency_key_reuse`; concurrent identical requests; replay after
+   update and after delete; failed request without a ledger row; keyless legacy
+   create; cross-user isolation; and no duplicate GitHub sync work on replay.
+   Never use real training sessions. Record account ID only in the protected
+   operator record, not in source logs or this document.
+8. Monitor Keiko errors, migration results, and GitHub sync health. Record the
+   workflow run, D1 ledger, Worker version ID, traffic percentage, smoke-test
+   result, and monitoring window.
+
+For rollback, route traffic back to the previously recorded Worker version and
+confirm 100% allocation and health. Do not edit or roll back an applied D1
+migration; use a forward-only compatibility migration if schema correction is
+needed. Record the rollback version and reason. Keep any MatMetrics account
+cutover decision separate from Keiko deployment.
 
 ## Environment setup
 
