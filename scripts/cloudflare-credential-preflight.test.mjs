@@ -17,7 +17,7 @@ function response(result, status = 200) {
     ok: status >= 200 && status < 300,
     status,
     json: async () => status >= 400
-      ? { success: false, errors: [{ code: 7403, message: 'sensitive Cloudflare body' }] }
+      ? { success: false, errors: [{ code: status === 403 ? 7403 : 1001, message: 'sensitive Cloudflare body' }] }
       : { success: true, result },
   };
 }
@@ -54,9 +54,9 @@ test('checks the configured account, reads D1, and reads the configured Worker w
     workerRead: 'passed',
   });
   assert.deepEqual(calls.map(({ url, options }) => [url.pathname, options.method ?? 'GET']), [
-    [databasePath, 'GET'],
-    [queryPath, 'POST'],
-    [workerPath, 'GET'],
+    ['/client/v4' + databasePath, 'GET'],
+    ['/client/v4' + queryPath, 'POST'],
+    ['/client/v4' + workerPath, 'GET'],
   ]);
   assert.equal(JSON.parse(calls[1].options.body).sql, 'SELECT 1 AS credential_check');
   assert.ok(calls.every(({ options }) => options.headers.Authorization === 'Bearer secret-token'));
