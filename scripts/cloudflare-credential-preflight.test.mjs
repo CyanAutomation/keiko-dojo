@@ -80,6 +80,17 @@ test('rejects missing credentials and malformed account IDs before making reques
   assert.equal(calls, 0);
 });
 
+test('fails when the configured account cannot access the production D1 database', async () => {
+  await assert.rejects(
+    verifyCloudflareCredentials({
+      env: { CLOUDFLARE_API_TOKEN: 'secret-token', CLOUDFLARE_ACCOUNT_ID: accountId },
+      config,
+      fetchImpl: async () => response(null, 404),
+    }),
+    /could not find the configured production D1 resource/,
+  );
+});
+
 test('reports D1 access denial without logging the token or raw Cloudflare body', async () => {
   await assert.rejects(
     verifyCloudflareCredentials({
@@ -88,11 +99,12 @@ test('reports D1 access denial without logging the token or raw Cloudflare body'
       fetchImpl: async () => response(null, 403),
     }),
     (error) => {
-    assert.match(error.message, /D1 Read/);
-    assert.match(error.message, /7403/);
-    assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
-    return true;
-  });
+      assert.match(error.message, /D1 Read/);
+      assert.match(error.message, /7403/);
+      assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
+      return true;
+    },
+  );
 });
 
 test('reports missing Worker deployment access with the scoped Worker permission', async () => {
@@ -113,9 +125,10 @@ test('reports missing Worker deployment access with the scoped Worker permission
       },
     }),
     (error) => {
-    assert.match(error.message, /Individual Workers Editor/);
-    assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
-    return true;
-  });
+      assert.match(error.message, /Individual Workers Editor/);
+      assert.doesNotMatch(error.message, /secret-token|sensitive Cloudflare body/);
+      return true;
+    },
+  );
   assert.equal(calls.length, 3);
 });
