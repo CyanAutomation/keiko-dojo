@@ -7,7 +7,7 @@ import { verifyCloudflareCredentials } from './cloudflare-credential-preflight.m
 
 const config = parseJsonc(await readFile(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
 const resources = assertProductionResources(config);
-const accountId = 'c40f3cb30efbf8c6d081cf9e50a61931';
+const accountId = 'c'.repeat(32);
 const databasePath = '/accounts/' + accountId + '/d1/database/' + resources.databaseId;
 const queryPath = databasePath + '/query';
 const workerPath = '/accounts/' + accountId + '/workers/scripts/' + resources.workerName + '/deployments';
@@ -47,7 +47,7 @@ test('checks the configured account, reads D1, and reads the configured Worker w
   });
 
   assert.deepEqual(result, {
-    accountMatchesProduction: true,
+    productionResourcesAccessible: true,
     databaseName: resources.databaseName,
     d1Read: 'passed',
     workerName: resources.workerName,
@@ -62,7 +62,7 @@ test('checks the configured account, reads D1, and reads the configured Worker w
   assert.ok(calls.every(({ options }) => options.headers.Authorization === 'Bearer secret-token'));
 });
 
-test('rejects missing credentials and a mismatched production account before making requests', async () => {
+test('rejects missing credentials and malformed account IDs before making requests', async () => {
   let calls = 0;
   const fetchImpl = async () => { calls += 1; return response({}); };
   await assert.rejects(
@@ -71,11 +71,11 @@ test('rejects missing credentials and a mismatched production account before mak
   );
   await assert.rejects(
     verifyCloudflareCredentials({
-      env: { CLOUDFLARE_API_TOKEN: 'secret-token', CLOUDFLARE_ACCOUNT_ID: 'd'.repeat(32) },
+      env: { CLOUDFLARE_API_TOKEN: 'secret-token', CLOUDFLARE_ACCOUNT_ID: 'not-an-account-id' },
       config,
       fetchImpl,
     }),
-    /does not match the production account/,
+    /32-character hexadecimal account ID/,
   );
   assert.equal(calls, 0);
 });
