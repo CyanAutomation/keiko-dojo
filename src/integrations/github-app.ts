@@ -549,16 +549,17 @@ export async function checkSelectedGitHubRepository(
 }
 
 export type GitHubSessionMarkdownFile = { path: string; sha: string; content: string };
+export type GitHubSessionMarkdownPath = { path: string; sha: string };
 
 const MAX_GITHUB_SESSION_FILES = 500;
 const MAX_GITHUB_MARKDOWN_BYTES = 1024 * 1024;
 const MAX_GITHUB_SESSION_SCAN_BYTES = 16 * 1024 * 1024;
 
-export async function listSelectedGitHubSessionMarkdown(
+async function selectedGitHubSessionMarkdownPaths(
   env: GitHubAppEnvironment,
   installation: GitHubInstallation,
   requestedBranch?: string
-): Promise<{ branch: string; files: GitHubSessionMarkdownFile[] }> {
+): Promise<{ token: string; branch: string; files: GitHubSessionMarkdownPath[] }> {
   const token = await scopedContentsToken(
     env, installation.installation_id, installation.repository_name, 'read', installation.user_id
   );
@@ -585,10 +586,31 @@ export async function listSelectedGitHubSessionMarkdown(
     throw new Error('GitHub repository has too many session files to scan');
   }
 
+  return { token, branch: resolved.branch, files: paths };
+}
+
+export async function listSelectedGitHubSessionMarkdownPaths(
+  env: GitHubAppEnvironment,
+  installation: GitHubInstallation,
+  requestedBranch?: string
+): Promise<{ branch: string; files: GitHubSessionMarkdownPath[] }> {
+  const { branch, files } = await selectedGitHubSessionMarkdownPaths(env, installation, requestedBranch);
+  return { branch, files };
+}
+
+export async function listSelectedGitHubSessionMarkdown(
+  env: GitHubAppEnvironment,
+  installation: GitHubInstallation,
+  requestedBranch?: string
+): Promise<{ branch: string; files: GitHubSessionMarkdownFile[] }> {
+  const { token, branch, files: paths } = await selectedGitHubSessionMarkdownPaths(
+    env, installation, requestedBranch
+  );
+
   const files: GitHubSessionMarkdownFile[] = [];
   let totalBytes = 0;
   for (const entry of paths) {
-    const query = new URLSearchParams({ ref: resolved.branch });
+    const query = new URLSearchParams({ ref: branch });
     const path = entry.path.split('/').map(encodeURIComponent).join('/');
     const content = await limitedResponseJson<{
       sha?: unknown;
@@ -616,7 +638,7 @@ export async function listSelectedGitHubSessionMarkdown(
     }
     files.push({ path: entry.path, sha: typeof content.sha === 'string' ? content.sha : entry.sha, content: decoded });
   }
-  return { branch: resolved.branch, files };
+  return { branch, files };
 }
 
 export async function updateSelectedGitHubMarkdown(
@@ -886,20 +908,25 @@ async function deleteSessionMarkdown(
   path: string,
   commitMessage: string,
   cacheNamespace: string,
-  diagnostics: GitHubSyncDiagnostics
+  diagnostics: GitHubSyncDiagnostics,
+  knownSha?: string
 ): Promise<void> {
   if (!isSafeSessionMarkdownPath(path)) throw new Error('GitHub session path is invalid');
   const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
-  beginGitHubSyncRequest(diagnostics, 'contents_get');
-  const existing = await githubFetch(url, token, 'GET', undefined, cacheNamespace);
-  recordGitHubSyncResponse(diagnostics, existing);
-  if (existing.status === 404) return;
-  const file = await responseJson<{ sha?: unknown }>(existing);
-  if (typeof file.sha !== 'string') throw new Error('GitHub session file revision is missing');
+  let sha = knownSha;
+  if (!sha) {
+    beginGitHubSyncRequest(diagnostics, 'contents_get');
+    const existing = await githubFetch(url, token, 'GET', undefined, cacheNamespace);
+    recordGitHubSyncResponse(diagnostics, existing);
+    if (existing.status === 404) return;
+    const file = await responseJson<{ sha?: unknown }>(existing);
+    if (typeof file.sha !== 'string') throw new Error('GitHub session file revision is missing');
+    sha = file.sha;
+  }
   beginGitHubSyncRequest(diagnostics, 'contents_delete');
   const response = await githubFetch(url, token, 'DELETE', {
     message: commitMessage,
-    sha: file.sha,
+    sha,
   });
   recordGitHubSyncResponse(diagnostics, response);
   await responseJson(response);
@@ -914,7 +941,8 @@ export async function syncGitHubSessionMarkdown(
   env: GitHubAppEnvironment,
   installation: GitHubInstallation,
   sessions: GitHubSessionRow[],
-  deletePaths: string[] = []
+  deletePaths: string[] = [],
+  deleteFileShas: ReadonlyMap<string, string> = new Map()
 ): Promise<Array<{ id: string; path: string; revision: number }>> {
   const files = sessions.map((row) => {
     const session = markdownSession(row);
@@ -930,6 +958,7 @@ export async function syncGitHubSessionMarkdown(
   const stalePaths = [...new Set(deletePaths)].filter((path) =>
     isKeikoSessionMarkdownPath(path) && !currentPaths.has(path)
   );
+  if (files.length === 0 && stalePaths.length === 0) return [];
 
   let phase = 'installation_token_request';
   const diagnostics: GitHubSyncDiagnostics = {
@@ -964,7 +993,8 @@ export async function syncGitHubSessionMarkdown(
         path,
         'Keiko Dojo backup remove deleted session',
         githubCacheScope(installation),
-        diagnostics
+        diagnostics,
+        deleteFileShas.get(path)
       );
     }
     return files.map(({ id, path, revision }) => ({ id, path, revision }));

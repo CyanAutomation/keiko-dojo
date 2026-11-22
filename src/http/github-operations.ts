@@ -160,6 +160,8 @@ async function createSyncJob(request: Request, env: Env, requestId: string): Pro
          repository_id = excluded.repository_id,
          generation = github_session_sync_state.generation + 1,
          full_sync_required = 1,
+         full_sync_cursor = 0,
+         full_sync_cursor_generation = NULL,
          next_sync_at = excluded.next_sync_at,
          dispatch_after = NULL,
          last_error = NULL`
