@@ -2,76 +2,52 @@
 
 ## Current Production state
 
-Release facts below were rechecked read-only on 2026-11-21. The detailed sync
-state that follows is historical and was not queried again on that date.
+This snapshot was read from Production on 2026-11-22. Recheck Cloudflare before
+operational changes because runtime state changes independently of this
+document.
 
-- The latest deployed Keiko Worker version is
-  `a7c66220-8a1d-4326-b7e0-0366b87e68c3`, created 2026-10-25 and still at
-  100% traffic. It predates current `main` (`aa5ee1bc61254b93abe8d431844d1da031035dd`).
-- Production D1 `keiko-dojo` (`750315f8-ef51-4d6e-86ea-41b076ec9de8`) records
-  migrations `0001` through `0008`. A read-only schema query confirmed
-  `session_create_idempotency` matches migration 0008, including the composite
-  `(user_id, idempotency_key)` primary key. Session count was not rechecked.
-- Workflow run
-  [44420316195](https://github.com/CyanAutomation/keiko-dojo/actions/runs/44420316195)
-  passed its CI checks and failed on its first production D1 query with
-  Cloudflare code 7403; Worker deployment was skipped. The run had non-empty
-  token input and the expected account ID. The exact token policy is not
-  visible to repository automation, so its account scope and D1 permission
-  still require owner verification.
-- The connected Cloudflare identity could see the configured account, D1
-  database, migration ledger, and Worker deployment. This is not evidence
-  about the separate token stored in GitHub's `cloudflare` environment.
-- The Production Queue list contains `keiko-dojo-backups` and
-  `keiko-dojo-backups-dlq`; the primary queue reports one producer and one
-  consumer. Message backlog was not queried.
-- The protected deployment workflow now checks the configured account
-  resources, expected Queue names, Worker deployment, D1 migration prefix, and
-  migration 0008 schema before applying migrations. It verifies that all
-  checked-in migrations are recorded before Worker upload. These reads do not
-  prove D1 write or Worker script-edit access.
-- Use one account-scoped API token with `D1 Edit` and `Workers Scripts Edit`
-  permissions scoped to the Keiko Cloudflare account. The token must also be
-  allowed to read the D1 and Worker endpoints used by preflight. Do not use a
-  global API key or grant unrelated account permissions. If the token editor
-  separates read and edit scopes, add the corresponding read scopes for
-  preflight and edit scopes for migration/deployment.
-- The workflow's permission/resource map is:
+- Production's latest Keiko Worker deployment is at 100% on version
+  `16ed3285-0a4e-4e82-aa48-1aa27a77dcce`, release SHA
+  `f4918e966bec8ad911cb570a02a9b4f4a88c10be`, created at 12:54 UTC.
+- Production D1 `keiko-dojo` (`750315f8-ef51-4d6e-86ea-41b076ec9de8`) has
+  migrations `0001` through `0008` applied and 39 sessions. Sync is incomplete:
+  generation 7, `completed_generation = 0`, `full_sync_required = 1`,
+  `last_synced_at = NULL`, `last_error = 'github_sync_failed'`, three dirty
+  items, and no synced-file manifest rows.
+- A 24-hour Observability query returned 186 `github_session_sync_failed`
+  events. Detailed events identify `phase = session_contents`,
+  `operation = contents_get`, and `Too many subrequests by single Worker
+  invocation`. This points to the full sync exceeding the per-invocation
+  subrequest limit, not a GitHub App permission failure. The primary queue had
+  one message and the dead-letter queue had 738. No messages were pulled,
+  purged, or redriven during diagnosis.
+- The Production keyed-create smoke test created and then deleted its synthetic
+  session. Its idempotency ledger row remains by design. Same-key replay and
+  changed-payload conflict remain unverified in Production. The temporary
+  `KEIKO_IDEMPOTENT_CREATE_ENABLED` flag is off.
+- The bounded full-sync fix and migration
+  `0009_github_full_sync_cursor.sql` are prepared on this branch. Production
+  still runs the pre-fix Worker and has not applied migration 0009. Keep the
+  sync and backup health gate closed until the new Worker is deployed and the
+  39-session manifest is verified.
 
-  | Operation | Cloudflare resource | Minimum permission |
-  | --- | --- | --- |
-  | Verify D1 database and read migration/schema state | Account D1 database `keiko-dojo` (`750315f8-ef51-4d6e-86ea-41b076ec9de8`) | D1 Read; D1 Edit also authorizes the query endpoints used by preflight |
-  | Apply pending D1 migrations | Same D1 database | D1 Edit (D1 write) |
-  | Verify Worker deployment status | Account Worker `keiko-dojo` | Workers Scripts Read; Workers Scripts Edit also authorizes deployment reads |
-  | Verify existing Queue names | Account Queues `keiko-dojo-backups` and `keiko-dojo-backups-dlq` | Queues Read or Workers Scripts Read; Workers Scripts Edit is also accepted by the API |
-  | Upload and deploy the Worker version | Account Worker `keiko-dojo` | Workers Scripts Edit |
+The protected `Deploy Production` workflow preflights the Cloudflare account,
+Worker, D1 schema and migration prefix, and both Queue resources before writes.
+Production deployment uses the protected GitHub `cloudflare` environment.
+The configured token permissions needed by the workflow are account-scoped:
 
-  Cloudflare's current Workers authorization guide says deploying a Worker
-  with existing D1/Queue bindings requires Worker Editor access; it does not
-  require separate access to each bound resource. Keiko's queue and
-  dead-letter resources must already exist. Do not grant Queue Edit or other
-  resource permissions for this deployment unless Cloudflare reports a
-  specific new requirement.
-- GitHub owner must verify `CLOUDFLARE_ACCOUNT_ID` in the protected
-  `cloudflare` environment and inspect the API token's account/resource
-  restrictions and permissions. Workflow automation can confirm only that the
-  variable and secret are present, then whether that token can read the target
-  resources.
-- Production deployment remains an explicit dispatch from `main` through the
-  protected GitHub environment. No production migration or deployment was run
-  for this assessment.
+| Operation | Cloudflare resource | Permission |
+| --- | --- | --- |
+| Read D1 migration/schema state | D1 database `keiko-dojo` (`750315f8-ef51-4d6e-86ea-41b076ec9de8`) | D1 Read |
+| Apply migrations | Same D1 database | D1 Edit |
+| Read Worker deployment status and upload/deploy a version | Worker `keiko-dojo` | Workers Scripts Edit |
+| List existing Queues and update the configured consumer | `keiko-dojo-backups` and `keiko-dojo-backups-dlq` | Queues Read and Queues Edit |
 
-Historical sync state from 2026-11-18 (not rechecked on 2026-11-21):
-
-- Production D1 had 39 sessions. The sync state was at generation 5 with
-  `completed_generation = 0`, `full_sync_required = 1`, `last_synced_at = NULL`,
-  `last_error = 'github_sync_failed'`, two pending dirty items, and no
-  synced-file manifest rows. Its `next_sync_at` was stale.
-- Nine `github_session_sync_failed` events were observed between 21:00:32 and
-  22:17:31 UTC. They came from the `keiko-dojo-backups` queue and all reported
-  `phase = session_contents`, `causeName = Error`, and `reason = other`.
-  Existing Production logs do not expose enough detail to identify the
-  underlying exception. The safe diagnostic logging change is pending release.
+The account ID must be `c40f3cb30efbf8c6d081cf9e50a61931`. The deployment
+token's value is not exposed to repository automation; the workflow can verify
+its account variable and exercise the target API, but cannot display the
+token's policy. Queue Edit is included because Wrangler's deploy operation
+updates the Queue consumer configuration. Do not grant broader account access.
 
 The automatic GitHub Markdown sync and migration 0007 are already present in
 Production; do not treat the earlier 38-session cutover notes below as the
@@ -97,11 +73,12 @@ the Cloudflare token policy:
 1. Confirm required Keiko CI and workflow-quality checks are green for the
    reviewed `main` commit.
 2. Confirm the D1 ledger is the expected migration prefix and migration 0008
-   has the expected table schema. The read-only workflow preflight performs
-   these checks and identifies pending checked-in migrations.
+   has the expected table schema. Review migration 0009 locally; the read-only
+   workflow preflight checks the remote ledger and identifies pending
+   checked-in migrations before applying it.
 3. Verify the GitHub environment token is scoped to the Keiko Cloudflare
-   account and has D1 Edit and Workers Scripts Edit permissions. Read-only
-   preflight success does not establish write permission.
+   account and has D1 Edit, Workers Scripts Edit, Queues Read, and Queues Edit.
+   Read-only preflight success does not establish write permission.
 4. Obtain the approval required by the protected GitHub environment, then
    dispatch `Deploy Production` from `main`.
 5. Let the workflow apply forward-only D1 migrations, verify the full remote
@@ -204,6 +181,13 @@ cutover decision separate from Keiko deployment.
 - Full reconciliation is capped at 500 sessions. The query reads at most 501
   rows before rejecting an oversized sync, records `session_limit_exceeded`,
   and stops automatic retries until a later session change or explicit sync.
+- Migration 0009 adds generation-scoped session and stale-path cursors. Full
+  reconciliations process at most 10 session files and 10 stale file deletions
+  per queue invocation, then enqueue the next bounded chunk. The stale-path
+  cursor is tied to the remote commit SHA so a cached tree listing cannot
+  restart deletion at the first path. The sync reads GitHub tree metadata first
+  and fetches file bodies only for the current chunk. Apply migration 0009
+  before deploying this Worker.
 - GitHub GET responses with ETags are revalidated on repeat requests using a
   bounded, short-lived per-isolate cache scoped to the Keiko user, installation,
   and repository. Installation tokens are also reused per isolate only when
@@ -289,12 +273,13 @@ IDs, file paths, or session payloads. Alert when a sync remains incomplete or
 `last_error` remains set for more than 15 minutes; inspect the operation and
 GitHub request ID before retrying or changing repository state.
 
-For this incident, deploy the diagnostic change and inspect one normal queue
-retry before manually starting another sync. Once the cause is fixed, review the
-managed stale paths that a full reconciliation would remove, then queue one
-full sync. Verify `full_sync_required = 0`, `completed_generation = generation`,
-`last_synced_at` is set, `last_error` is null, no dirty items remain, and the
-manifest contains one row for every current D1 session.
+For this incident, first apply migration 0009 and deploy the bounded sync fix.
+Then queue one full sync. Verify `full_sync_required = 0`,
+`completed_generation = generation`, `last_synced_at` is set, `last_error` is
+null, no dirty items remain, the manifest contains one row per current D1
+session, and the primary queue backlog drains. Inspect the DLQ separately
+before any redrive or purge; do not use old messages as a substitute for a fresh
+full-state reconciliation.
 
 MatMetrics continues to own training-plan insights and AI features. Do not send
 session data to an AI provider until the data-use policy is approved.

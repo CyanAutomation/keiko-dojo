@@ -815,6 +815,177 @@ describe('GitHub App selected-repository backup adapter', () => {
     }
   });
 
+  it('splits a full sync across queue invocations to stay below the subrequest limit', async () => {
+    const priorFetch = globalThis.fetch;
+    const userId = `bounded-full-sync-${crypto.randomUUID()}`;
+    const operationId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const remoteFiles = new Map<string, string>();
+    const staleTreeEtag = '"bounded-full-sync-tree"';
+    let conditionalTreeReads = 0;
+    const syncFailures: unknown[][] = [];
+    const syncFailureSpy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      syncFailures.push(args);
+    });
+    const continuations: Array<{ kind: 'github-session-sync'; userId: string; operationId?: string }> = [];
+    const queueSend = vi.fn(async (message: unknown) => {
+      continuations.push(message as { kind: 'github-session-sync'; userId: string; operationId?: string });
+    });
+    const syncEnv = Object.assign(Object.create(appEnv), {
+      BACKUP_QUEUE: { send: queueSend },
+    }) as Env;
+    let requestsThisInvocation = 0;
+    let maxRequestsInInvocation = 0;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestsThisInvocation += 1;
+      maxRequestsInInvocation = Math.max(maxRequestsInInvocation, requestsThisInvocation);
+      if (requestsThisInvocation > 50) throw new Error('Too many subrequests by single Worker invocation');
+
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+      if (url.endsWith('/app/installations/908/access_tokens')) {
+        const body = JSON.parse(String(init?.body)) as { permissions: { contents: string } };
+        return Response.json({
+          token: body.permissions.contents === 'read' ? 'read-token' : 'write-token',
+          expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+        });
+      }
+      if (url === 'https://api.github.com/repos/maki/judo-notes') {
+        return Response.json({ default_branch: 'main' });
+      }
+      if (url.endsWith('/git/ref/heads/main')) {
+        return Response.json({ object: { sha: 'd'.repeat(40) } });
+      }
+      if (url.endsWith('/git/trees/' + 'd'.repeat(40) + '?recursive=1')) {
+        const requestHeaders = new Headers(init?.headers);
+        if (requestHeaders.get('if-none-match') === staleTreeEtag) {
+          conditionalTreeReads += 1;
+          return new Response(null, { status: 304, headers: { etag: staleTreeEtag } });
+        }
+        return Response.json({
+          truncated: false,
+          tree: [...remoteFiles.keys()].map((path) => ({ type: 'blob', path, sha: `sha-${path}` })),
+        }, { headers: { etag: staleTreeEtag } });
+      }
+      if (url.includes('/contents/')) {
+        const path = decodeURIComponent(new URL(url).pathname.split('/contents/')[1] ?? '');
+        if (method === 'GET') {
+          const content = remoteFiles.get(path);
+          return content === undefined
+            ? new Response(null, { status: 404 })
+            : Response.json({ sha: `sha-${path}`, encoding: 'base64', content: encodeBase64Utf8(content) });
+        }
+        if (method === 'PUT') {
+          const payload = JSON.parse(String(init?.body)) as { content: string };
+          remoteFiles.set(path, Buffer.from(payload.content, 'base64').toString('utf8'));
+          return Response.json({ content: { sha: `sha-${path}` } });
+        }
+        if (method === 'DELETE') {
+          remoteFiles.delete(path);
+          return Response.json({ commit: { sha: 'delete-commit' } });
+        }
+      }
+      throw new Error(`Unexpected GitHub API request: ${url} (${method})`);
+    });
+
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 908, 'maki', 'judo-notes', 908, now).run();
+    await env.DB.prepare(
+      `INSERT INTO github_operation_jobs
+       (id, user_id, type, status, payload, created_at, updated_at)
+       VALUES (?, ?, 'github-sync-all', 'queued', '{}', ?, ?)`
+    ).bind(operationId, userId, now, now).run();
+    const statements = Array.from({ length: 30 }, (_, index) => {
+      const date = `2026-10-${String(index + 1).padStart(2, '0')}`;
+      const session = {
+        id: `bounded-session-${String(index).padStart(2, '0')}`,
+        date,
+        effort: 3,
+        category: 'Technical',
+        techniques: ['Uchi mata'],
+      };
+      return env.DB.prepare(
+        `INSERT INTO sessions
+         (user_id, id, session_date, category, effort, payload, revision, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      ).bind(userId, session.id, date, session.category, session.effort, JSON.stringify(session), now, now);
+    });
+    try {
+      for (let offset = 0; offset < statements.length; offset += 10) {
+        await env.DB.batch(statements.slice(offset, offset + 10));
+      }
+      for (let index = 0; index < 25; index += 1) {
+        const date = `2025-01-${String(index + 1).padStart(2, '0')}`;
+        const path = `data/2025/01/${date.replaceAll('-', '')}-matmetrics-stale-${String(index).padStart(2, '0')}.md`;
+        remoteFiles.set(path, `stale file ${index}`);
+      }
+      const laterSessionPath = 'data/2026/10/20261001-matmetrics-bounded-session-00.md';
+      await env.DB.prepare(
+        `INSERT INTO github_synced_session_files
+         (user_id, repository_id, session_id, path, revision) VALUES (?, ?, ?, ?, ?)`
+      ).bind(userId, 908, 'bounded-session-00', laterSessionPath, 1).run();
+      await env.DB.prepare(
+        'UPDATE github_session_sync_state SET full_sync_required = 1, next_sync_at = ? WHERE user_id = ?'
+      ).bind(new Date(0).toISOString(), userId).run();
+
+      const pending: Array<{
+        kind: 'github-session-sync';
+        userId: string;
+        operationId?: string;
+      }> = [{ kind: 'github-session-sync', userId, operationId }];
+      let invocations = 0;
+      while (pending.length > 0 && invocations < 10) {
+        const body = pending.shift()!;
+        requestsThisInvocation = 0;
+        const ack = vi.fn();
+        const retry = vi.fn();
+        await processGitHubSessionSyncMessage({ body, attempts: 1, ack, retry } as unknown as Message<{
+          kind: 'github-session-sync'; userId: string; operationId?: string;
+        }>, syncEnv);
+        expect(ack, JSON.stringify(syncFailures)).toHaveBeenCalledOnce();
+        expect(retry, JSON.stringify(syncFailures)).not.toHaveBeenCalled();
+        pending.push(...continuations.splice(0));
+        invocations += 1;
+        if (invocations === 1) {
+          expect(await env.DB.prepare(
+            `SELECT path FROM github_synced_session_files
+             WHERE user_id = ? AND repository_id = ? AND session_id = ?`
+          ).bind(userId, 908, 'bounded-session-00').first()).toMatchObject({ path: laterSessionPath });
+        }
+      }
+
+      expect(invocations).toBeGreaterThan(1);
+      expect(pending).toHaveLength(0);
+      expect(conditionalTreeReads).toBeGreaterThan(0);
+      expect(maxRequestsInInvocation).toBeLessThanOrEqual(50);
+      expect(remoteFiles.size).toBe(30);
+      expect(await env.DB.prepare(
+        'SELECT COUNT(*) AS count FROM github_synced_session_files WHERE user_id = ? AND repository_id = ?'
+      ).bind(userId, 908).first()).toMatchObject({ count: 30 });
+      expect(await env.DB.prepare(
+        'SELECT full_sync_required, generation, completed_generation FROM github_session_sync_state WHERE user_id = ?'
+      ).bind(userId).first()).toMatchObject({ full_sync_required: 0, generation: 30, completed_generation: 30 });
+      const job = await env.DB.prepare(
+        'SELECT status, result FROM github_operation_jobs WHERE id = ? AND user_id = ?'
+      ).bind(operationId, userId).first<{ status: string; result: string | null }>();
+      expect(job?.status).toBe('completed');
+      expect(JSON.parse(job?.result ?? '{}')).toMatchObject({ success: true, sessionCount: 30 });
+    } finally {
+      vi.stubGlobal('fetch', priorFetch);
+      syncFailureSpy.mockRestore();
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_operation_jobs WHERE id = ?').bind(operationId),
+        env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+        env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+      ]);
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
+
   it('bounds an over-limit full sync and does not retry the permanent limit error', async () => {
     const priorFetch = globalThis.fetch;
     const userId = `session-sync-limit-${crypto.randomUUID()}`;
