@@ -2,23 +2,35 @@
 
 ## Current Production state
 
-The following snapshot was read from Production on 2026-11-18. Recheck Cloudflare
-before operational changes because runtime state changes independently of this
-document.
+This snapshot was read from Production on 2026-11-22.
+Recheck Cloudflare before operational changes because runtime state changes
+independently of this document.
 
-- The latest deployed Keiko Worker version is
-  `a7c66220-8a1d-4326-b7e0-0366b87e68c3`, created 2026-10-25. It predates the
-  current `main` revision.
+- Production's latest Keiko Worker deployment is at 100% on version
+  `16ed3285-0a4e-4e82-aa48-1aa27a77dcce`, release SHA
+  `f4918e966bec8ad911cb570a02a9b4f4a88c10be`, created at 12:54 UTC.
 - Production D1 has migrations `0001` through `0008` applied and 39 sessions.
-  The sync state is at generation 5 with `completed_generation = 0`,
-  `full_sync_required = 1`, `last_synced_at = NULL`, `last_error =
-  'github_sync_failed'`, two pending dirty items, and no synced-file manifest
-  rows. Its `next_sync_at` is stale.
-- Nine `github_session_sync_failed` events were observed between 21:00:32 and
-  22:17:31 UTC. They came from the `keiko-dojo-backups` queue and all reported
-  `phase = session_contents`, `causeName = Error`, and `reason = other`.
-  Existing Production logs do not expose enough detail to identify the
-  underlying exception. The safe diagnostic logging change is pending release.
+  Sync is still incomplete: generation 7, `completed_generation = 0`,
+  `full_sync_required = 1`, `last_synced_at = NULL`,
+  `last_error = 'github_sync_failed'`, three dirty items, and no synced-file
+  manifest rows.
+- A 24-hour Observability query returned 186
+  `github_session_sync_failed` events. The detailed events identify
+  `phase = session_contents`, `operation = contents_get`, and the exception
+  summary `Too many subrequests by single Worker invocation`. The full sync
+  processes too many GitHub requests in one invocation; this is not evidence
+  of a missing GitHub App permission. At the same read, the primary queue had
+  one message and its dead-letter queue had 738. No messages were pulled,
+  purged, or redriven during diagnosis.
+- The production keyed-create smoke test created and then deleted its synthetic
+  session. Its idempotency ledger row remains by design. The same-key replay
+  and changed-payload conflict checks have not yet been verified in Production,
+  and the temporary `KEIKO_IDEMPOTENT_CREATE_ENABLED` flag is off.
+
+The bounded full-sync fix and migration `0009_github_full_sync_cursor.sql` are
+being prepared for release. Production still runs the pre-fix Worker and has
+not applied migration 0009. Keep the sync and backup health gate closed until
+the new Worker is deployed and the 39-session manifest is verified.
 
 The automatic GitHub Markdown sync and migration 0007 are already present in
 Production; do not treat the earlier 38-session cutover notes below as the
@@ -112,6 +124,11 @@ registration have been deleted; the Production App is separate and untouched.
 - Full reconciliation is capped at 500 sessions. The query reads at most 501
   rows before rejecting an oversized sync, records `session_limit_exceeded`,
   and stops automatic retries until a later session change or explicit sync.
+- Migration 0009 adds a generation-scoped full-sync cursor. Full reconciliations
+  process at most 10 session files and 10 stale file deletions per queue
+  invocation, then enqueue the next bounded chunk. The sync reads GitHub tree
+  metadata first and fetches file bodies only for the current chunk. Apply
+  migration 0009 before deploying this Worker.
 - GitHub GET responses with ETags are revalidated on repeat requests using a
   bounded, short-lived per-isolate cache scoped to the Keiko user, installation,
   and repository. Installation tokens are also reused per isolate only when
@@ -197,12 +214,13 @@ IDs, file paths, or session payloads. Alert when a sync remains incomplete or
 `last_error` remains set for more than 15 minutes; inspect the operation and
 GitHub request ID before retrying or changing repository state.
 
-For this incident, deploy the diagnostic change and inspect one normal queue
-retry before manually starting another sync. Once the cause is fixed, review the
-managed stale paths that a full reconciliation would remove, then queue one
-full sync. Verify `full_sync_required = 0`, `completed_generation = generation`,
-`last_synced_at` is set, `last_error` is null, no dirty items remain, and the
-manifest contains one row for every current D1 session.
+For this incident, first apply migration 0009 and deploy the bounded sync fix.
+Then queue one full sync. Verify `full_sync_required = 0`,
+`completed_generation = generation`, `last_synced_at` is set, `last_error` is
+null, no dirty items remain, the manifest contains one row per current D1
+session, and the primary queue backlog drains. Inspect the DLQ separately
+before any redrive or purge; do not use old messages as a substitute for a fresh
+full-state reconciliation.
 
 MatMetrics continues to own training-plan insights and AI features. Do not send
 session data to an AI provider until the data-use policy is approved.
