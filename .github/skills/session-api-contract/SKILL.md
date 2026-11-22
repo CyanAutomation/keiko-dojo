@@ -14,7 +14,11 @@ pagination, revisions, analytics, or the API documentation and fixtures.
 
 - `docs/session-contract.md` for field validation, ETags, pagination, and
   compatibility rules.
+- `docs/api-contract-versioning.md` for OpenAPI compatibility, semantic
+  versioning, generated types, and consumer pinning.
 - `openapi.yaml` for the public HTTP contract.
+- `contracts/keiko-api.generated.ts` as a generated artifact; do not edit it by
+  hand.
 - `docs/decisions/0003-session-api.md` for versioning and concurrency choices.
 - Relevant implementation in `src/domain/session.ts`,
   `src/application/session-service.ts`, `src/http/sessions.ts`, and
@@ -47,6 +51,8 @@ pagination, revisions, analytics, or the API documentation and fixtures.
 2. Update `openapi.yaml` and `docs/session-contract.md` in the same change.
    Update `contracts/validation/session-validation-fixtures.json` when
    MatMetrics parity examples or canonical validation outcomes change.
+   Follow `docs/api-contract-versioning.md` for compatibility and version
+   bumps, and run `npm run contract:check` when the OpenAPI contract changes.
 3. If persisted shape or query semantics change, add a forward-only SQL file
    under `migrations/`; do not edit migrations that may already have been
    applied.

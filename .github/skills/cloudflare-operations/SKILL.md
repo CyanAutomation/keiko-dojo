@@ -8,8 +8,8 @@ relatedSkills: [identity-and-tenant-security, github-markdown-sync]
 # Cloudflare Operations
 
 Use this skill when changing Wrangler bindings, Worker environments, D1
-migrations, queues, scheduled triggers, secrets, CI validation, or deployment
-and recovery procedures.
+queries or migrations, queues, scheduled triggers, secrets, CI validation, or
+deployment and recovery procedures.
 
 ## Read first
 
@@ -19,6 +19,8 @@ and recovery procedures.
 - `.github/workflows/ci.yml` and `package.json` for the checks and commands
   currently enforced by CI.
 - `docs/decisions/0001-runtime-and-data.md` for the Worker/D1 architecture.
+- `src/storage/d1-session-repository.ts` for the current D1 access pattern;
+  also read `identity-and-tenant-security` when changing tenant ownership.
 
 ## Environment boundaries
 
@@ -36,6 +38,9 @@ and recovery procedures.
   migration already applied to a remote database.
 - Use the Wrangler D1 binding for runtime access. The D1 administrative REST
   API is not part of the service runtime.
+- Bind untrusted values in SQL. Scope every tenant-owned read and write by the
+  verified user ID, including joins, upserts, and background work. Keep
+  session persistence behavior aligned with `session-api-contract`.
 
 ## Commands and checks
 

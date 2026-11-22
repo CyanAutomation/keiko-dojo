@@ -21,6 +21,9 @@ Each skill is in its own directory and uses a `SKILL.md` with YAML metadata.
 - For a public session payload or behavior change, start with
   `session-api-contract`; also use `identity-and-tenant-security` if ownership
   or authorization is involved.
+- For an OpenAPI compatibility change or generated contract update, use
+  `session-api-contract` and follow `docs/api-contract-versioning.md`. Add
+  `mcp-contract` when MCP protocol behavior or tool schemas also change.
 - For GitHub Markdown sync, use `github-markdown-sync`; use
   `cloudflare-operations` when a change also affects environment bindings or
   migrations.
@@ -39,6 +42,7 @@ Each skill is in its own directory and uses a `SKILL.md` with YAML metadata.
 - For deployment configuration or schema rollout, use `cloudflare-operations`.
 
 These skills complement the API and operational source of truth in
-`openapi.yaml`, `docs/session-contract.md`, `docs/operations.md`, and
-`docs/decisions/`. Read the relevant source documents when working on those
-areas; this index is navigation, not a replacement for them.
+`openapi.yaml`, `docs/api-contract-versioning.md`, `docs/session-contract.md`,
+`docs/operations.md`, and `docs/decisions/`. Read the relevant source documents
+when working on those areas; this index is navigation, not a replacement for
+them.

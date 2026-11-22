@@ -14,8 +14,8 @@ configuration, CI requirements, or automated deployment behavior.
 
 - All workflow files under `.github/workflows/`, including both `.yml` and
   `.yaml` files.
-- `.github/dependabot.yml` and
-  `.github/workflows/dependabot-auto-merge.yaml` for dependency update policy.
+- `.github/dependabot.yml` for dependency update policy, plus any workflow
+  that handles dependency pull requests or automated merges.
 - `package.json` for the package scripts invoked by automation.
 - `README.md` and `docs/operations.md` for deployment and migration procedure.
 - `cloudflare-operations` when a workflow changes Worker deployment, secrets,
