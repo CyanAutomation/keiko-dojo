@@ -559,7 +559,7 @@ async function selectedGitHubSessionMarkdownPaths(
   env: GitHubAppEnvironment,
   installation: GitHubInstallation,
   requestedBranch?: string
-): Promise<{ token: string; branch: string; files: GitHubSessionMarkdownPath[] }> {
+): Promise<{ token: string; branch: string; treeSha: string; files: GitHubSessionMarkdownPath[] }> {
   const token = await scopedContentsToken(
     env, installation.installation_id, installation.repository_name, 'read', installation.user_id
   );
@@ -586,16 +586,16 @@ async function selectedGitHubSessionMarkdownPaths(
     throw new Error('GitHub repository has too many session files to scan');
   }
 
-  return { token, branch: resolved.branch, files: paths };
+  return { token, branch: resolved.branch, treeSha: resolved.headSha, files: paths };
 }
 
 export async function listSelectedGitHubSessionMarkdownPaths(
   env: GitHubAppEnvironment,
   installation: GitHubInstallation,
   requestedBranch?: string
-): Promise<{ branch: string; files: GitHubSessionMarkdownPath[] }> {
-  const { branch, files } = await selectedGitHubSessionMarkdownPaths(env, installation, requestedBranch);
-  return { branch, files };
+): Promise<{ branch: string; treeSha: string; files: GitHubSessionMarkdownPath[] }> {
+  const { branch, treeSha, files } = await selectedGitHubSessionMarkdownPaths(env, installation, requestedBranch);
+  return { branch, treeSha, files };
 }
 
 export async function listSelectedGitHubSessionMarkdown(

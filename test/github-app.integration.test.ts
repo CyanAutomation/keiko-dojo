@@ -821,6 +821,12 @@ describe('GitHub App selected-repository backup adapter', () => {
     const operationId = crypto.randomUUID();
     const now = new Date().toISOString();
     const remoteFiles = new Map<string, string>();
+    const staleTreeEtag = '"bounded-full-sync-tree"';
+    let conditionalTreeReads = 0;
+    const syncFailures: unknown[][] = [];
+    const syncFailureSpy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      syncFailures.push(args);
+    });
     const continuations: Array<{ kind: 'github-session-sync'; userId: string; operationId?: string }> = [];
     const queueSend = vi.fn(async (message: unknown) => {
       continuations.push(message as { kind: 'github-session-sync'; userId: string; operationId?: string });
@@ -851,10 +857,15 @@ describe('GitHub App selected-repository backup adapter', () => {
         return Response.json({ object: { sha: 'd'.repeat(40) } });
       }
       if (url.endsWith('/git/trees/' + 'd'.repeat(40) + '?recursive=1')) {
+        const requestHeaders = new Headers(init?.headers);
+        if (requestHeaders.get('if-none-match') === staleTreeEtag) {
+          conditionalTreeReads += 1;
+          return new Response(null, { status: 304, headers: { etag: staleTreeEtag } });
+        }
         return Response.json({
           truncated: false,
           tree: [...remoteFiles.keys()].map((path) => ({ type: 'blob', path, sha: `sha-${path}` })),
-        });
+        }, { headers: { etag: staleTreeEtag } });
       }
       if (url.includes('/contents/')) {
         const path = decodeURIComponent(new URL(url).pathname.split('/contents/')[1] ?? '');
@@ -911,6 +922,11 @@ describe('GitHub App selected-repository backup adapter', () => {
         const path = `data/2025/01/${date.replaceAll('-', '')}-matmetrics-stale-${String(index).padStart(2, '0')}.md`;
         remoteFiles.set(path, `stale file ${index}`);
       }
+      const laterSessionPath = 'data/2026/10/20261001-matmetrics-bounded-session-00.md';
+      await env.DB.prepare(
+        `INSERT INTO github_synced_session_files
+         (user_id, repository_id, session_id, path, revision) VALUES (?, ?, ?, ?, ?)`
+      ).bind(userId, 908, 'bounded-session-00', laterSessionPath, 1).run();
       await env.DB.prepare(
         'UPDATE github_session_sync_state SET full_sync_required = 1, next_sync_at = ? WHERE user_id = ?'
       ).bind(new Date(0).toISOString(), userId).run();
@@ -929,14 +945,21 @@ describe('GitHub App selected-repository backup adapter', () => {
         await processGitHubSessionSyncMessage({ body, attempts: 1, ack, retry } as unknown as Message<{
           kind: 'github-session-sync'; userId: string; operationId?: string;
         }>, syncEnv);
-        expect(ack).toHaveBeenCalledOnce();
-        expect(retry).not.toHaveBeenCalled();
+        expect(ack, JSON.stringify(syncFailures)).toHaveBeenCalledOnce();
+        expect(retry, JSON.stringify(syncFailures)).not.toHaveBeenCalled();
         pending.push(...continuations.splice(0));
         invocations += 1;
+        if (invocations === 1) {
+          expect(await env.DB.prepare(
+            `SELECT path FROM github_synced_session_files
+             WHERE user_id = ? AND repository_id = ? AND session_id = ?`
+          ).bind(userId, 908, 'bounded-session-00').first()).toMatchObject({ path: laterSessionPath });
+        }
       }
 
       expect(invocations).toBeGreaterThan(1);
       expect(pending).toHaveLength(0);
+      expect(conditionalTreeReads).toBeGreaterThan(0);
       expect(maxRequestsInInvocation).toBeLessThanOrEqual(50);
       expect(remoteFiles.size).toBe(30);
       expect(await env.DB.prepare(
@@ -952,6 +975,7 @@ describe('GitHub App selected-repository backup adapter', () => {
       expect(JSON.parse(job?.result ?? '{}')).toMatchObject({ success: true, sessionCount: 30 });
     } finally {
       vi.stubGlobal('fetch', priorFetch);
+      syncFailureSpy.mockRestore();
       await env.DB.batch([
         env.DB.prepare('DELETE FROM github_operation_jobs WHERE id = ?').bind(operationId),
         env.DB.prepare('DELETE FROM github_session_sync_state WHERE user_id = ?').bind(userId),

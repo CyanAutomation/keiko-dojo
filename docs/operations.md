@@ -181,11 +181,13 @@ cutover decision separate from Keiko deployment.
 - Full reconciliation is capped at 500 sessions. The query reads at most 501
   rows before rejecting an oversized sync, records `session_limit_exceeded`,
   and stops automatic retries until a later session change or explicit sync.
-- Migration 0009 adds a generation-scoped full-sync cursor. Full reconciliations
-  process at most 10 session files and 10 stale file deletions per queue
-  invocation, then enqueue the next bounded chunk. The sync reads GitHub tree
-  metadata first and fetches file bodies only for the current chunk. Apply
-  migration 0009 before deploying this Worker.
+- Migration 0009 adds generation-scoped session and stale-path cursors. Full
+  reconciliations process at most 10 session files and 10 stale file deletions
+  per queue invocation, then enqueue the next bounded chunk. The stale-path
+  cursor is tied to the remote commit SHA so a cached tree listing cannot
+  restart deletion at the first path. The sync reads GitHub tree metadata first
+  and fetches file bodies only for the current chunk. Apply migration 0009
+  before deploying this Worker.
 - GitHub GET responses with ETags are revalidated on repeat requests using a
   bounded, short-lived per-isolate cache scoped to the Keiko user, installation,
   and repository. Installation tokens are also reused per isolate only when

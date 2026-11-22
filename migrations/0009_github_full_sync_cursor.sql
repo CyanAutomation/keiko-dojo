@@ -3,3 +3,9 @@ ALTER TABLE github_session_sync_state
 
 ALTER TABLE github_session_sync_state
   ADD COLUMN full_sync_cursor_generation INTEGER;
+
+ALTER TABLE github_session_sync_state
+  ADD COLUMN full_sync_delete_cursor TEXT;
+
+ALTER TABLE github_session_sync_state
+  ADD COLUMN full_sync_tree_sha TEXT;

@@ -15,6 +15,8 @@ type SyncState = {
   full_sync_required: number;
   full_sync_cursor: number;
   full_sync_cursor_generation: number | null;
+  full_sync_delete_cursor: string | null;
+  full_sync_tree_sha: string | null;
   next_sync_at: string;
   wake_enqueued: number;
   lease_token: string | null;
@@ -136,6 +138,8 @@ type SyncBatch = {
   deletePaths: string[];
   deleteFileShas: Map<string, string>;
   fullSyncCursor: number;
+  fullSyncDeleteCursor: string | null;
+  fullSyncTreeSha: string | null;
   hasMoreFullSync: boolean;
 };
 
@@ -145,7 +149,9 @@ async function loadSyncBatch(
   installation: Installation,
   generation: number,
   fullSync: boolean,
-  fullSyncCursor: number
+  fullSyncCursor: number,
+  fullSyncDeleteCursor: string | null,
+  fullSyncTreeSha: string | null
 ): Promise<SyncBatch | null> {
   if (fullSync) {
     const result = await env.DB.prepare(
@@ -161,7 +167,11 @@ async function loadSyncBatch(
     const staleFiles = remote.files.filter((file) =>
       isKeikoSessionMarkdownPath(file.path) && !expectedPaths.has(file.path)
     );
-    const filesToDelete = staleFiles.slice(0, MAX_FULL_SYNC_DELETIONS_PER_BATCH);
+    const activeDeleteCursor = fullSyncTreeSha === remote.treeSha ? fullSyncDeleteCursor : null;
+    const staleFilesAfterCursor = activeDeleteCursor
+      ? staleFiles.filter((file) => file.path.localeCompare(activeDeleteCursor) > 0)
+      : staleFiles;
+    const filesToDelete = staleFilesAfterCursor.slice(0, MAX_FULL_SYNC_DELETIONS_PER_BATCH);
     return {
       fullSync: true,
       rows,
@@ -169,7 +179,10 @@ async function loadSyncBatch(
       deletePaths: filesToDelete.map((file) => file.path),
       deleteFileShas: new Map(filesToDelete.map((file) => [file.path, file.sha])),
       fullSyncCursor: cursor + rows.length,
-      hasMoreFullSync: cursor + rows.length < allRows.length || staleFiles.length > filesToDelete.length,
+      fullSyncDeleteCursor: filesToDelete.at(-1)?.path ?? activeDeleteCursor,
+      fullSyncTreeSha: remote.treeSha,
+      hasMoreFullSync: cursor + rows.length < allRows.length ||
+        staleFilesAfterCursor.length > filesToDelete.length,
     };
   }
 
@@ -198,6 +211,8 @@ async function loadSyncBatch(
       .map((file) => file.path),
     deleteFileShas: new Map(),
     fullSyncCursor: 0,
+    fullSyncDeleteCursor: null,
+    fullSyncTreeSha: null,
     hasMoreFullSync: false,
   };
 }
@@ -209,7 +224,7 @@ async function clearProcessedItems(
   batch: SyncBatch
 ): Promise<void> {
   const statements: D1PreparedStatement[] = [];
-  if (batch.fullSync) {
+  if (batch.fullSync && !batch.hasMoreFullSync) {
     statements.push(env.DB.prepare(
       'DELETE FROM github_session_sync_items WHERE user_id = ? AND generation <= ?'
     ).bind(userId, generation));
@@ -241,7 +256,7 @@ async function syncAndPersistBatch(
   await upsertSyncedFiles(env, userId, installation.repository_id,
     synced.map((file) => ({ session_id: file.id, path: file.path, revision: file.revision })),
     removedIds);
-  if (batch.fullSync) {
+  if (batch.fullSync && !batch.hasMoreFullSync) {
     await env.DB.prepare(
       `DELETE FROM github_synced_session_files
        WHERE user_id = ? AND repository_id = ?
@@ -267,6 +282,7 @@ async function finalizeSync(
     `UPDATE github_session_sync_state
      SET completed_generation = ?, full_sync_required = 0, last_synced_at = ?, last_error = NULL,
          full_sync_cursor = 0, full_sync_cursor_generation = NULL,
+         full_sync_delete_cursor = NULL, full_sync_tree_sha = NULL,
          wake_enqueued = 0, wake_enqueued_at = NULL,
          lease_token = NULL, lease_expires_at = NULL, dispatch_after = NULL
      WHERE user_id = ? AND generation = ? AND lease_token = ?
@@ -289,15 +305,18 @@ async function enqueueFullSyncContinuation(
   generation: number,
   leaseToken: string,
   cursor: number,
+  deleteCursor: string | null,
+  treeSha: string,
   operationId: string | undefined
 ): Promise<boolean> {
   const advanced = await env.DB.prepare(
     `UPDATE github_session_sync_state
      SET full_sync_cursor = ?, full_sync_cursor_generation = ?,
+         full_sync_delete_cursor = ?, full_sync_tree_sha = ?,
          lease_token = NULL, lease_expires_at = NULL,
          wake_enqueued = 0, wake_enqueued_at = NULL, dispatch_after = NULL
      WHERE user_id = ? AND generation = ? AND lease_token = ? AND full_sync_required = 1`
-  ).bind(cursor, generation, userId, generation, leaseToken).run();
+  ).bind(cursor, generation, deleteCursor, treeSha, userId, generation, leaseToken).run();
   if (advanced.meta.changes !== 1) {
     await env.DB.prepare(
       `UPDATE github_session_sync_state
@@ -360,6 +379,8 @@ type PreparedSync = {
   generation: number;
   fullSync: boolean;
   fullSyncCursor: number;
+  fullSyncDeleteCursor: string | null;
+  fullSyncTreeSha: string | null;
   leaseToken: string;
 };
 
@@ -370,7 +391,8 @@ async function readSyncContext(env: Env, userId: string): Promise<SyncContext> {
   ).bind(userId).first<Installation>();
   const state = await env.DB.prepare(
     `SELECT user_id, repository_id, generation, full_sync_required, next_sync_at,
-       full_sync_cursor, full_sync_cursor_generation, wake_enqueued, lease_token
+       full_sync_cursor, full_sync_cursor_generation, full_sync_delete_cursor,
+       full_sync_tree_sha, wake_enqueued, lease_token
      FROM github_session_sync_state WHERE user_id = ?`
   ).bind(userId).first<SyncState>();
   return { installation, state };
@@ -442,13 +464,16 @@ async function prepareSync(
     `UPDATE github_session_sync_state SET lease_token = ?, lease_expires_at = ?
      WHERE user_id = ? AND repository_id = ? AND generation = ?
        AND (lease_token IS NULL OR lease_expires_at <= ?)
-     RETURNING generation, full_sync_required, full_sync_cursor, full_sync_cursor_generation`
+     RETURNING generation, full_sync_required, full_sync_cursor, full_sync_cursor_generation,
+       full_sync_delete_cursor, full_sync_tree_sha`
   ).bind(leaseToken, leaseExpiresAt, userId, state.repository_id,
     state.generation, now.toISOString()).first<{
       generation: number;
       full_sync_required: number;
       full_sync_cursor: number;
       full_sync_cursor_generation: number | null;
+      full_sync_delete_cursor: string | null;
+      full_sync_tree_sha: string | null;
     }>();
   if (!claimed) {
     await handleUnavailableLease(env, message, userId, operationId);
@@ -462,6 +487,12 @@ async function prepareSync(
     fullSyncCursor: claimed.full_sync_cursor_generation === claimed.generation
       ? claimed.full_sync_cursor
       : 0,
+    fullSyncDeleteCursor: claimed.full_sync_cursor_generation === claimed.generation
+      ? claimed.full_sync_delete_cursor
+      : null,
+    fullSyncTreeSha: claimed.full_sync_cursor_generation === claimed.generation
+      ? claimed.full_sync_tree_sha
+      : null,
     leaseToken,
   };
 }
@@ -483,7 +514,14 @@ export async function processGitHubSessionSyncMessage(
     }
 
     const batch = await loadSyncBatch(
-      env, userId, prepared.installation, prepared.generation, prepared.fullSync, prepared.fullSyncCursor
+      env,
+      userId,
+      prepared.installation,
+      prepared.generation,
+      prepared.fullSync,
+      prepared.fullSyncCursor,
+      prepared.fullSyncDeleteCursor,
+      prepared.fullSyncTreeSha
     );
     if (!batch) {
       await completeNoop(env, userId, operationId, prepared.generation, prepared.leaseToken);
@@ -494,7 +532,14 @@ export async function processGitHubSessionSyncMessage(
     const synced = await syncAndPersistBatch(env, userId, prepared.installation, prepared.generation, batch);
     if (prepared.fullSync && batch.hasMoreFullSync) {
       const enqueued = await enqueueFullSyncContinuation(
-        env, userId, prepared.generation, prepared.leaseToken, batch.fullSyncCursor, operationId
+        env,
+        userId,
+        prepared.generation,
+        prepared.leaseToken,
+        batch.fullSyncCursor,
+        batch.fullSyncDeleteCursor,
+        batch.fullSyncTreeSha!,
+        operationId
       );
       if (enqueued) message.ack();
       else message.retry({ delaySeconds: 60 });
