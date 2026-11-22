@@ -2,34 +2,39 @@
 
 ## Current Production state
 
-This snapshot was read from Production on 2026-11-22. Recheck Cloudflare before
-operational changes because runtime state changes independently of this
-document.
+This snapshot was read from Production on 2026-11-22 through 18:12 UTC. Recheck
+Cloudflare before operational changes because runtime state changes
+independently of this document.
 
 - Production's latest Keiko Worker deployment is at 100% on version
-  `16ed3285-0a4e-4e82-aa48-1aa27a77dcce`, release SHA
-  `f4918e966bec8ad911cb570a02a9b4f4a88c10be`, created at 12:54 UTC.
+  `f766d86b-6831-431e-88bf-49732902af1d`, release SHA
+  `8688ccbc953dc74b825a3820cf9ebbb942825bed`, deployment
+  `264b8014-7385-4f19-8f9a-e0ecf941ab28`, created at 17:30 UTC.
 - Production D1 `keiko-dojo` (`750315f8-ef51-4d6e-86ea-41b076ec9de8`) has
-  migrations `0001` through `0008` applied and 39 sessions. Sync is incomplete:
-  generation 7, `completed_generation = 0`, `full_sync_required = 1`,
-  `last_synced_at = NULL`, `last_error = 'github_sync_failed'`, three dirty
-  items, and no synced-file manifest rows.
-- A 24-hour Observability query returned 186 `github_session_sync_failed`
-  events. Detailed events identify `phase = session_contents`,
-  `operation = contents_get`, and `Too many subrequests by single Worker
-  invocation`. This points to the full sync exceeding the per-invocation
-  subrequest limit, not a GitHub App permission failure. The primary queue had
-  one message and the dead-letter queue had 738. No messages were pulled,
-  purged, or redriven during diagnosis.
-- The Production keyed-create smoke test created and then deleted its synthetic
-  session. Its idempotency ledger row remains by design. Same-key replay and
-  changed-payload conflict remain unverified in Production. The temporary
-  `KEIKO_IDEMPOTENT_CREATE_ENABLED` flag is off.
-- The bounded full-sync fix and migration
-  `0009_github_full_sync_cursor.sql` are prepared on this branch. Production
-  still runs the pre-fix Worker and has not applied migration 0009. Keep the
-  sync and backup health gate closed until the new Worker is deployed and the
-  39-session manifest is verified.
+  migrations `0001` through `0009` applied and 39 sessions. The latest sync is
+  clean: generation 9 is complete, `full_sync_required = 0`, `last_error` is
+  null, there are no dirty items, and all 39 sessions have manifest entries
+  with no orphan paths.
+- The pre-release 24-hour Observability query returned 186
+  `github_session_sync_failed` events at `phase = session_contents`,
+  `operation = contents_get`, with `Too many subrequests by single Worker
+  invocation`. The bounded cursor implementation and migration 0009 are now
+  deployed; the full sync and a later smoke-record create/delete both drained
+  successfully. At 17:57 UTC the primary Queue had no backlog; the dead-letter
+  Queue had 732 messages. No messages were pulled, purged, or redriven. Keep
+  DLQ recovery separate until its messages have a reviewed deduplication plan.
+- The authorized Production keyed-create smoke created one synthetic session
+  through Keiko; D1 recorded its idempotency ledger row. The session was then
+  removed and the resulting GitHub sync completed. The ledger row remains by
+  design. Same-key replay and changed-payload `409 idempotency_key_reuse` remain
+  unverified in Production; the temporary
+  `KEIKO_IDEMPOTENT_CREATE_ENABLED` setting is now `false`.
+- MatMetrics Production was redeployed on `main` after the smoke with
+  `KEIKO_IDEMPOTENT_CREATE_ENABLED=false`. Deployment
+  `dpl_CmjbW2qhzuU3oVopVf4CKVqorsdB` is `READY` and serves
+  `matmetrics-teal.vercel.app`. The existing sensitive
+  `KEIKO_SESSION_CUTOVER_USER_IDS` variable was not changed; its value remains
+  undisclosed in this operator record.
 
 The protected `Deploy Production` workflow preflights the Cloudflare account,
 Worker, D1 schema and migration prefix, and both Queue resources before writes.
@@ -52,8 +57,9 @@ updates the Queue consumer configuration. Do not grant broader account access.
 The automatic GitHub Markdown sync and migration 0007 are already present in
 Production; do not treat the earlier 38-session cutover notes below as the
 current sync state. MatMetrics Production serves `matmetrics-teal.vercel.app`
-and routes the allowlisted account to
-`https://keiko-dojo.scheimann.workers.dev`.
+and routes the account used in the keyed-create smoke to
+`https://keiko-dojo.scheimann.workers.dev` while the temporary create flag was
+enabled. The flag is now false; the allowlist value was left unchanged.
 
 Before retirement, the Staging D1 database held a duplicate 38-session dataset
 and no pending backup jobs. Both Staging queues had zero backlog. The Staging
@@ -115,12 +121,14 @@ cutover decision separate from Keiko deployment.
   resources; the Staging bindings are removed from Wrangler and the deleted
   Worker no longer references them.
 - Vercel Production `KEIKO_API_BASE_URL` points to
-  `https://keiko-dojo.scheimann.workers.dev`;
+  `https://keiko-dojo.scheimann.workers.dev` and
   `MATMETRICS_AUTH_FRONTEND_ORIGIN` is
-  `https://matmetrics-teal.vercel.app`; and
-  `KEIKO_SESSION_CUTOVER_USER_IDS` contains only the existing account's Better
-  Auth user ID. These are Production settings. Keiko's `MATMETRICS_FRONTEND_URL`
-  and Auth/JWKS settings use the same Production MatMetrics origin.
+  `https://matmetrics-teal.vercel.app`. The sensitive
+  `KEIKO_SESSION_CUTOVER_USER_IDS` variable exists, but its value is not
+  disclosed here; it was not changed during the smoke. The temporary
+  `KEIKO_IDEMPOTENT_CREATE_ENABLED` setting is `false` after the test.
+  Keiko's `MATMETRICS_FRONTEND_URL` and Auth/JWKS settings use the same
+  Production MatMetrics origin.
 - The MatMetrics Vercel project has an Ignored Build Step that skips commits
   beginning `Keiko Dojo backup `, so routine Markdown backups do not rebuild
   Production. Other commits continue through the regular deployment path.
