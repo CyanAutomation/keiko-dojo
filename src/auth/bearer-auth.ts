@@ -122,25 +122,39 @@ export async function authenticateRequest(
   env: Pick<Env, 'AUTH_JWKS_URL' | 'AUTH_ISSUER' | 'AUTH_AUDIENCE' | 'SESSION_READ_LIMITER' | 'SESSION_WRITE_LIMITER' | 'BACKUP_WRITE_LIMITER' | 'ENVIRONMENT'>,
   requiredScope: RequiredScope
 ): Promise<AuthenticatedUser> {
+  const token = readBearerToken(request);
+  const payload = await verifyAccessToken(token, env);
+  const principal = validatePayload(payload, requiredScope);
+  if (isLocalEnvironment(env.ENVIRONMENT)) return principal;
+  await enforceRateLimit(principal.userId, limiterForScope(requiredScope, env));
+  return principal;
+}
+
+function readBearerToken(request: Request): string {
   const authorization = request.headers.get('authorization');
   const match = authorization?.match(/^Bearer ([A-Za-z0-9._~-]+)$/i);
   if (!match || match[1].length > 8192) {
     throw new AuthFailure('unauthorized', 'Authentication required');
   }
+  return match[1];
+}
 
+async function verifyAccessToken(
+  token: string,
+  env: Pick<Env, 'AUTH_JWKS_URL' | 'AUTH_ISSUER' | 'AUTH_AUDIENCE'>
+): Promise<JWTPayload> {
   const jwksUrl = readRequiredConfig(env.AUTH_JWKS_URL);
   const issuer = readRequiredConfig(env.AUTH_ISSUER);
   const audience = readRequiredConfig(env.AUTH_AUDIENCE);
-  let payload: JWTPayload;
   try {
-    const verified = await jwtVerify(match[1], remoteJwks(jwksUrl), {
+    const verified = await jwtVerify(token, remoteJwks(jwksUrl), {
       algorithms: ['EdDSA'],
       issuer,
       audience,
       maxTokenAge: '5m',
       clockTolerance: 5,
     });
-    payload = verified.payload;
+    return verified.payload;
   } catch (error) {
     if (error instanceof AuthFailure) throw error;
     if (isJwksUnavailable(error)) {
@@ -148,17 +162,26 @@ export async function authenticateRequest(
     }
     throw new AuthFailure('unauthorized', 'Invalid access token');
   }
+}
 
-  const principal = validatePayload(payload, requiredScope);
-  const environment = env.ENVIRONMENT as string;
-  if (environment === 'local' || environment === 'test') return principal;
-  const limiter = requiredScope === 'sessions:read' || requiredScope === 'backups:read' || requiredScope === 'github:read'
+function isLocalEnvironment(environment: string | undefined): boolean {
+  return environment === 'local' || environment === 'test';
+}
+
+function limiterForScope(
+  requiredScope: RequiredScope,
+  env: Pick<Env, 'SESSION_READ_LIMITER' | 'SESSION_WRITE_LIMITER' | 'BACKUP_WRITE_LIMITER'>
+) {
+  return requiredScope === 'sessions:read' || requiredScope === 'backups:read' || requiredScope === 'github:read'
     ? env.SESSION_READ_LIMITER
     : requiredScope === 'sessions:write'
       ? env.SESSION_WRITE_LIMITER
       : env.BACKUP_WRITE_LIMITER;
+}
+
+async function enforceRateLimit(userId: string, limiter: RateLimit): Promise<void> {
   try {
-    const result = await limiter.limit({ key: principal.userId });
+    const result = await limiter.limit({ key: userId });
     if (!result.success) {
       throw new AuthFailure('rate_limited', 'Too many requests');
     }
@@ -166,5 +189,4 @@ export async function authenticateRequest(
     if (error instanceof AuthFailure) throw error;
     throw new AuthFailure('unavailable', 'Rate limiting is unavailable');
   }
-  return principal;
 }

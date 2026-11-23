@@ -2,6 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { reportPreflightFailure } from './preflight-errors.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EXPECTED = {
@@ -12,63 +13,77 @@ const EXPECTED = {
   idempotencyMigration: '0008_session_create_idempotency.sql',
 };
 
-export function parseJsonc(source) {
-  let withoutComments = '';
-  let quote = '';
-  let escaped = false;
+function copyJsonStringCharacter(character, state) {
+  if (state.escaped) state.escaped = false;
+  else if (character === '\\') state.escaped = true;
+  else if (character === '"') state.inString = false;
+  return character;
+}
 
+function lineCommentEnd(source, start) {
+  const newline = source.indexOf('\n', start + 2);
+  return newline < 0 ? source.length : newline;
+}
+
+function blockComment(source, start) {
+  const close = source.indexOf('*/', start + 2);
+  const end = close < 0 ? source.length : close + 2;
+  return {
+    text: source.slice(start, end).replace(/[^\n]/g, ''),
+    nextIndex: end,
+  };
+}
+
+function transformJsoncOutsideString(source, index, operation) {
+  const character = source[index];
+  if (operation === 'comments' && character === '/' && source[index + 1] === '/') {
+    return { text: '', nextIndex: lineCommentEnd(source, index) - 1 };
+  }
+  if (operation === 'comments' && character === '/' && source[index + 1] === '*') {
+    const comment = blockComment(source, index);
+    return { text: comment.text, nextIndex: comment.nextIndex - 1 };
+  }
+  if (operation === 'trailing_commas' && character === ',' && isTrailingComma(source, index)) {
+    return { text: '', nextIndex: index };
+  }
+  return { text: character, nextIndex: index };
+}
+
+function transformJsonc(source, operation) {
+  let output = '';
+  const state = { inString: false, escaped: false };
   for (let index = 0; index < source.length; index += 1) {
     const character = source[index];
-    const next = source[index + 1];
-    if (quote) {
-      withoutComments += character;
-      if (escaped) escaped = false;
-      else if (character === '\\') escaped = true;
-      else if (character === quote) quote = '';
+    if (state.inString) {
+      output += copyJsonStringCharacter(character, state);
       continue;
     }
     if (character === '"') {
-      quote = character;
-      withoutComments += character;
-    } else if (character === '/' && next === '/') {
-      while (index < source.length && source[index] !== '\n') index += 1;
-      withoutComments += '\n';
-    } else if (character === '/' && next === '*') {
-      index += 2;
-      while (index < source.length && !(source[index] === '*' && source[index + 1] === '/')) {
-        if (source[index] === '\n') withoutComments += '\n';
-        index += 1;
-      }
-      index += 1;
-    } else {
-      withoutComments += character;
+      state.inString = true;
+      output += character;
+      continue;
     }
+    const transformed = transformJsoncOutsideString(source, index, operation);
+    output += transformed.text;
+    index = transformed.nextIndex;
   }
+  return output;
+}
 
-  let json = '';
-  quote = '';
-  escaped = false;
-  for (let index = 0; index < withoutComments.length; index += 1) {
-    const character = withoutComments[index];
-    if (quote) {
-      json += character;
-      if (escaped) escaped = false;
-      else if (character === '\\') escaped = true;
-      else if (character === quote) quote = '';
-      continue;
-    }
-    if (character === '"') {
-      quote = character;
-      json += character;
-    } else if (character === ',') {
-      let next = index + 1;
-      while (/\s/.test(withoutComments[next] ?? '')) next += 1;
-      if (withoutComments[next] !== '}' && withoutComments[next] !== ']') json += character;
-    } else {
-      json += character;
-    }
-  }
-  return JSON.parse(json);
+function nextNonWhitespaceIndex(source, start) {
+  let index = start;
+  while (/\s/.test(source[index] ?? '')) index += 1;
+  return index;
+}
+
+function isTrailingComma(source, index) {
+  const next = source[nextNonWhitespaceIndex(source, index + 1)];
+  return next === '}' || next === ']';
+}
+
+export function parseJsonc(source) {
+  const withoutComments = transformJsonc(source, 'comments');
+  return JSON.parse(transformJsonc(withoutComments, 'trailing_commas'));
 }
 
 export function assertProductionResources(config) {
@@ -164,14 +179,14 @@ export function assertIdempotencySchema(migrationSql, databaseSql) {
 
 function apiError(category, status, codes = []) {
   const code = codes.length ? ` Cloudflare code ${codes.join(', ')}.` : '';
-  if (category.startsWith('D1') && (codes.includes(7403) || status === 403)) {
-    return new Error(`D1 access denied.${code} Verify the account-scoped token includes D1 Edit and its account/resource scope includes the configured production D1 database.`);
-  }
-  if (category === 'Worker' && (status === 403 || codes.includes(7403))) {
-    return new Error(`Worker deployment status is not accessible.${code} Verify the token includes Workers Scripts Edit and is scoped to the configured production account.`);
-  }
-  if (category === 'Queue' && (status === 403 || codes.includes(7403))) {
-    return new Error(`Production Queue resources are not accessible.${code} Verify the token includes Workers Scripts Edit (or Queues Read) and is scoped to the configured production account.`);
+  const guidance = {
+    D1: ['D1 access denied.', ' Verify the account-scoped token includes D1 Edit and its account/resource scope includes the configured production D1 database.'],
+    Worker: ['Worker deployment status is not accessible.', ' Verify the token includes Workers Scripts Edit and is scoped to the configured production account.'],
+    Queue: ['Production Queue resources are not accessible.', ' Verify the token includes Workers Scripts Edit (or Queues Read) and is scoped to the configured production account.'],
+  };
+  const service = category.startsWith('D1') ? 'D1' : category;
+  if (guidance[service] && (status === 403 || codes.includes(7403))) {
+    return new Error(guidance[service][0] + code + guidance[service][1]);
   }
   if (status === 404) return new Error(`${category} production resource was not found. Verify the account ID and checked-in production resource configuration.`);
   return new Error(`${category} read-only preflight failed with HTTP ${status}.${code} Check Cloudflare account access, token permissions, and resource scope.`);
@@ -206,6 +221,36 @@ async function queryDatabase(accountId, databaseId, token, sql, fetchImpl) {
   return query.results;
 }
 
+async function readCloudflareResource(category, path, token, fetchImpl) {
+  try {
+    return await cloudflareRequest(path, token, fetchImpl);
+  } catch (error) {
+    if (error?.status) throw apiError(category, error.status, error.codes);
+    throw error;
+  }
+}
+
+async function readProductionDatabaseRows({ accountId, databaseId, token, sql, category, failureMessage, fetchImpl }) {
+  try {
+    return await queryDatabase(accountId, databaseId, token, sql, fetchImpl);
+  } catch (error) {
+    if (error?.status) throw apiError(category, error.status, error.codes);
+    throw new Error(failureMessage);
+  }
+}
+
+function requireProductionDatabase(database, resources) {
+  if (database.uuid !== resources.databaseId || database.name !== resources.databaseName) {
+    throw new Error('Unexpected database binding: the Cloudflare D1 resource does not match the production configuration.');
+  }
+}
+
+function requireProductionDeployment(deployments) {
+  const active = deployments?.deployments?.[0];
+  requireSingleFullTrafficVersion(active, 'Unexpected Worker deployment state: the production Worker must have a readable deployment at 100% traffic.');
+  return active;
+}
+
 export async function verifyProduction({ env, config, localNames, migrationSql, fetchImpl = fetch, requireAll = false }) {
   if (!env.CLOUDFLARE_API_TOKEN) throw new Error('Missing API token: set CLOUDFLARE_API_TOKEN in the protected cloudflare environment.');
   if (!env.CLOUDFLARE_ACCOUNT_ID) throw new Error('Missing account variable: set CLOUDFLARE_ACCOUNT_ID in the protected cloudflare environment.');
@@ -213,54 +258,42 @@ export async function verifyProduction({ env, config, localNames, migrationSql, 
   const resources = assertProductionResources(config);
   const base = `/accounts/${env.CLOUDFLARE_ACCOUNT_ID}`;
 
-  let queues;
-  try {
-    queues = await cloudflareRequest(`${base}/queues?per_page=500`, env.CLOUDFLARE_API_TOKEN, fetchImpl);
-  } catch (error) {
-    if (error?.status) throw apiError('Queue', error.status, error.codes);
-    throw error;
-  }
+  const queues = await readCloudflareResource(
+    'Queue', `${base}/queues?per_page=500`, env.CLOUDFLARE_API_TOKEN, fetchImpl
+  );
   assertQueueResources(queues, resources.queueNames);
 
-  let database;
-  try {
-    database = await cloudflareRequest(`${base}/d1/database/${resources.databaseId}`, env.CLOUDFLARE_API_TOKEN, fetchImpl);
-  } catch (error) {
-    if (error?.status) throw apiError('D1', error.status, error.codes);
-    throw error;
-  }
-  if (database.uuid !== resources.databaseId || database.name !== resources.databaseName) {
-    throw new Error('Unexpected database binding: the Cloudflare D1 resource does not match the production configuration.');
-  }
+  const database = await readCloudflareResource(
+    'D1', `${base}/d1/database/${resources.databaseId}`, env.CLOUDFLARE_API_TOKEN, fetchImpl
+  );
+  requireProductionDatabase(database, resources);
 
-  let deployments;
-  try {
-    deployments = await cloudflareRequest(`${base}/workers/scripts/${resources.workerName}/deployments`, env.CLOUDFLARE_API_TOKEN, fetchImpl);
-  } catch (error) {
-    if (error?.status) throw apiError('Worker', error.status, error.codes);
-    throw error;
-  }
-  const entries = deployments?.deployments ?? [];
-  const active = entries[0];
-  requireSingleFullTrafficVersion(active, 'Unexpected Worker deployment state: the production Worker must have a readable deployment at 100% traffic.');
+  const deployments = await readCloudflareResource(
+    'Worker', `${base}/workers/scripts/${resources.workerName}/deployments`, env.CLOUDFLARE_API_TOKEN, fetchImpl
+  );
+  const active = requireProductionDeployment(deployments);
 
-  let appliedRows;
-  try {
-    appliedRows = await queryDatabase(env.CLOUDFLARE_ACCOUNT_ID, resources.databaseId, env.CLOUDFLARE_API_TOKEN, 'SELECT name FROM d1_migrations ORDER BY name', fetchImpl);
-  } catch (error) {
-    if (error?.status) throw apiError('D1 migration history', error.status, error.codes);
-    throw new Error('Remote migration state unavailable. Verify D1 read access and that the production migration ledger exists.');
-  }
+  const appliedRows = await readProductionDatabaseRows({
+    accountId: env.CLOUDFLARE_ACCOUNT_ID,
+    databaseId: resources.databaseId,
+    token: env.CLOUDFLARE_API_TOKEN,
+    sql: 'SELECT name FROM d1_migrations ORDER BY name',
+    category: 'D1 migration history',
+    failureMessage: 'Remote migration state unavailable. Verify D1 read access and that the production migration ledger exists.',
+    fetchImpl,
+  });
   const appliedNames = appliedRows.map((row) => row.name);
   const migrationState = assertMigrationHistory(localNames, appliedNames, { requireAll });
 
-  let schemaRows;
-  try {
-    schemaRows = await queryDatabase(env.CLOUDFLARE_ACCOUNT_ID, resources.databaseId, env.CLOUDFLARE_API_TOKEN, "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_create_idempotency'", fetchImpl);
-  } catch (error) {
-    if (error?.status) throw apiError('D1 schema', error.status, error.codes);
-    throw new Error('Production idempotency schema could not be verified. Check D1 read access and migration 0008.');
-  }
+  const schemaRows = await readProductionDatabaseRows({
+    accountId: env.CLOUDFLARE_ACCOUNT_ID,
+    databaseId: resources.databaseId,
+    token: env.CLOUDFLARE_API_TOKEN,
+    sql: "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_create_idempotency'",
+    category: 'D1 schema',
+    failureMessage: 'Production idempotency schema could not be verified. Check D1 read access and migration 0008.',
+    fetchImpl,
+  });
   assertIdempotencySchema(migrationSql, schemaRows[0]?.sql);
   return { ...resources, appliedMigrations: migrationState.applied, pendingMigrations: migrationState.pending, activeDeployment: active };
 }
@@ -292,9 +325,5 @@ async function main() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error) => {
-    const message = error instanceof Error ? error.message : 'Unexpected preflight failure.';
-    console.error(`::error::${message}`);
-    process.exitCode = 1;
-  });
+  main().catch((error) => reportPreflightFailure(error, 'Unexpected preflight failure.'));
 }

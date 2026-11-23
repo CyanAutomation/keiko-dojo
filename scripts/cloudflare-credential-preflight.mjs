@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { reportPreflightFailure } from './preflight-errors.mjs';
 
 import { assertProductionResources, parseJsonc } from './production-preflight.mjs';
 
@@ -111,8 +112,6 @@ async function main() {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
-    const message = error instanceof Error ? error.message : 'Unexpected Cloudflare credential preflight failure.';
-    console.error('::error::' + message);
-    process.exitCode = 1;
+    reportPreflightFailure(error, 'Unexpected Cloudflare credential preflight failure.');
   });
 }

@@ -13,6 +13,7 @@ import {
   parseJsonc,
   verifyProduction,
 } from './production-preflight.mjs';
+import { formatPreflightError } from './preflight-errors.mjs';
 
 const config = {
   name: 'keiko-dojo-local',
@@ -55,6 +56,27 @@ test('parses JSONC comments and trailing commas without changing string values',
     url: 'https://example.test/a//b',
     list: [1, 2],
   });
+});
+
+test('preserves comment markers and escaped quotes inside JSON strings', () => {
+  assert.deepEqual(parseJsonc([
+    '{',
+    '  "url": "https://example.test/a//b",',
+    '  "quoted": "A quote: \\" and markers: /* keep */",',
+    '  /* multi-line',
+    '     comment */',
+    '  "items": [1, 2,],',
+    '}',
+  ].join('\n')), {
+    url: 'https://example.test/a//b',
+    quoted: 'A quote: " and markers: /* keep */',
+    items: [1, 2],
+  });
+});
+
+test('uses a safe fallback for non-Error preflight failures', () => {
+  assert.equal(formatPreflightError(new Error('read failed'), 'fallback'), 'read failed');
+  assert.equal(formatPreflightError({ secret: 'hidden' }, 'fallback'), 'fallback');
 });
 
 test('the checked-in production configuration selects the expected release resources', async () => {

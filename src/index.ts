@@ -10,6 +10,19 @@ import { processGitHubSessionSyncMessage } from './http/github-sync';
 import { handleGitHubOperationRequest, processGitHubOperationMessage } from './http/github-operations';
 import { handleMcpRequest } from './http/mcp';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isSessionSyncMessage(value: unknown): value is { kind: 'github-session-sync'; userId: string } {
+  return isRecord(value) && value.kind === 'github-session-sync' && typeof value.userId === 'string';
+}
+
+function isOperationMessage(value: unknown): value is { kind: 'github-operation'; jobId: string; userId: string } {
+  return isRecord(value) && value.kind === 'github-operation' &&
+    typeof value.jobId === 'string' && typeof value.userId === 'string';
+}
+
 function normalizedPath(pathname: string): string {
   return pathname.replace(/^\/v1\/sessions\/[^/]+$/, '/v1/sessions/:id');
 }
@@ -150,23 +163,14 @@ const worker = {
   async queue(batch: MessageBatch<unknown>, env: Env) {
     for (const message of batch.messages) {
       const value = message.body;
-      if (
-        value && typeof value === 'object' &&
-        'kind' in value && value.kind === 'github-session-sync' &&
-        'userId' in value && typeof value.userId === 'string'
-      ) {
+      if (isSessionSyncMessage(value)) {
         await processGitHubSessionSyncMessage(
           message as Message<{ kind: 'github-session-sync'; userId: string; operationId?: string }>,
           env
         );
         continue;
       }
-      if (
-        value && typeof value === 'object' &&
-        'kind' in value && value.kind === 'github-operation' &&
-        'jobId' in value && typeof value.jobId === 'string' &&
-        'userId' in value && typeof value.userId === 'string'
-      ) {
+      if (isOperationMessage(value)) {
         await processGitHubOperationMessage(
           message as Message<{ kind: 'github-operation'; jobId: string; userId: string }>,
           env

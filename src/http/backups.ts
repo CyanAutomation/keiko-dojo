@@ -76,6 +76,83 @@ async function beginGitHubInstallation(request: Request, env: Env, requestId: st
   return jsonResponse({ url: installUrl.href, expiresAt: expiresAt.toISOString() }, 201);
 }
 
+async function consumeInstallationState(env: Env, state: string, consumedAt: string): Promise<string | null> {
+  const pending = await env.DB.prepare(
+    `UPDATE github_installation_states SET consumed_at = ?
+     WHERE state_hash = ? AND consumed_at IS NULL AND expires_at > ?
+     RETURNING user_id`
+  ).bind(consumedAt, await hashState(state), consumedAt).first<{ user_id: string }>();
+  return pending?.user_id ?? null;
+}
+
+type VerifiedGitHubRepository = Awaited<ReturnType<typeof verifySelectedRepositoryInstallation>>;
+
+async function storeGitHubInstallation(
+  env: Env,
+  userId: string,
+  repository: VerifiedGitHubRepository,
+  grantedAt: string
+): Promise<void> {
+  const nextSyncAt = new Date(Date.now() + 60_000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL)
+       ON CONFLICT(user_id) DO UPDATE SET
+         installation_id = excluded.installation_id,
+         repository_owner = excluded.repository_owner,
+         repository_name = excluded.repository_name,
+         repository_id = excluded.repository_id,
+         granted_at = excluded.granted_at,
+         revoked_at = NULL`
+    ).bind(userId, repository.installation_id, repository.repository_owner,
+      repository.repository_name, repository.repository_id, grantedAt),
+    env.DB.prepare(
+      `INSERT INTO github_session_sync_state
+       (user_id, repository_id, generation, full_sync_required, next_sync_at)
+       VALUES (?, ?, 1, 1, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         repository_id = excluded.repository_id,
+         generation = github_session_sync_state.generation + 1,
+         full_sync_required = 1,
+         next_sync_at = excluded.next_sync_at,
+         wake_enqueued = 0,
+         wake_enqueued_at = NULL,
+         dispatch_after = NULL,
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         last_synced_at = NULL,
+         last_error = NULL`
+    ).bind(userId, repository.repository_id, nextSyncAt),
+    env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?').bind(userId),
+  ]);
+}
+
+async function dispatchInitialGitHubSync(env: Env, userId: string): Promise<void> {
+  try {
+    await dispatchGitHubSessionSync(env, userId);
+  } catch {
+    // The connection and initial-sync request are durable; cron will queue the
+    // sync if this wake-up cannot be sent.
+    console.error('github_initial_sync_dispatch_failed');
+  }
+}
+
+function logInstallationVerificationFailure(error: unknown): void {
+  if (!(error instanceof GitHubInstallationVerificationError)) return;
+  console.error('github_installation_verification_failed', {
+    phase: error.phase,
+    status: error.status ?? null,
+    causeName: error.causeName ?? null,
+    causeCode: error.causeCode ?? null,
+    reason: error.reason ?? null,
+    redirectOrigin: error.redirectOrigin ?? null,
+    redirectPath: error.redirectPath ?? null,
+    apiErrorCategory: error.apiErrorCategory ?? null,
+  });
+}
+
 async function completeGitHubInstallation(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const state = url.searchParams.get('state') ?? '';
@@ -85,73 +162,18 @@ async function completeGitHubInstallation(request: Request, env: Env): Promise<R
   }
   const installationId = Number(installationIdText);
   if (!Number.isSafeInteger(installationId)) return githubResultRedirect(env, 'failed');
-  const stateHash = await hashState(state);
+
   const consumedAt = new Date().toISOString();
-  const pending = await env.DB.prepare(
-    `UPDATE github_installation_states SET consumed_at = ?
-     WHERE state_hash = ? AND consumed_at IS NULL AND expires_at > ?
-     RETURNING user_id`
-  ).bind(consumedAt, stateHash, consumedAt).first<{ user_id: string }>();
-  if (!pending) return githubResultRedirect(env, 'failed');
+  const userId = await consumeInstallationState(env, state, consumedAt);
+  if (!userId) return githubResultRedirect(env, 'failed');
 
   try {
     const repository = await verifySelectedRepositoryInstallation(env, installationId);
-    const nextSyncAt = new Date(Date.now() + 60_000).toISOString();
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO github_installations
-         (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at, revoked_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL)
-         ON CONFLICT(user_id) DO UPDATE SET
-           installation_id = excluded.installation_id,
-           repository_owner = excluded.repository_owner,
-           repository_name = excluded.repository_name,
-           repository_id = excluded.repository_id,
-           granted_at = excluded.granted_at,
-           revoked_at = NULL`
-      ).bind(pending.user_id, repository.installation_id, repository.repository_owner,
-        repository.repository_name, repository.repository_id, consumedAt),
-      env.DB.prepare(
-        `INSERT INTO github_session_sync_state
-         (user_id, repository_id, generation, full_sync_required, next_sync_at)
-         VALUES (?, ?, 1, 1, ?)
-         ON CONFLICT(user_id) DO UPDATE SET
-           repository_id = excluded.repository_id,
-           generation = github_session_sync_state.generation + 1,
-           full_sync_required = 1,
-           next_sync_at = excluded.next_sync_at,
-           wake_enqueued = 0,
-           wake_enqueued_at = NULL,
-           dispatch_after = NULL,
-           lease_token = NULL,
-           lease_expires_at = NULL,
-           last_synced_at = NULL,
-           last_error = NULL`
-      ).bind(pending.user_id, repository.repository_id, nextSyncAt),
-      env.DB.prepare('DELETE FROM github_synced_session_files WHERE user_id = ?')
-        .bind(pending.user_id),
-    ]);
-    try {
-      await dispatchGitHubSessionSync(env, pending.user_id);
-    } catch {
-      // The connection and initial-sync request are durable; the cron
-      // dispatcher will queue the sync if this wake-up cannot be sent.
-      console.error('github_initial_sync_dispatch_failed');
-    }
+    await storeGitHubInstallation(env, userId, repository, consumedAt);
+    await dispatchInitialGitHubSync(env, userId);
     return githubResultRedirect(env, 'connected');
   } catch (error) {
-    if (error instanceof GitHubInstallationVerificationError) {
-      console.error('github_installation_verification_failed', {
-        phase: error.phase,
-        status: error.status ?? null,
-        causeName: error.causeName ?? null,
-        causeCode: error.causeCode ?? null,
-        reason: error.reason ?? null,
-        redirectOrigin: error.redirectOrigin ?? null,
-        redirectPath: error.redirectPath ?? null,
-        apiErrorCategory: error.apiErrorCategory ?? null,
-      });
-    }
+    logInstallationVerificationFailure(error);
     return githubResultRedirect(env, 'failed');
   }
 }

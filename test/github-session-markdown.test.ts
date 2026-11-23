@@ -125,6 +125,45 @@ describe('GitHub session Markdown', () => {
     expect(result.markdown).toContain('## Coach Cues\n\nKeep the sleeve grip.');
   });
 
+  it('does not treat a different fence marker inside a code block as its closing fence', () => {
+    const markdown = keikoMarkdown()
+      .replace(/^keikoBackupVersion: 1\nkeikoTextPayload: .*\n/mu, '')
+      .replace(
+        '## Session Description\n\nKept &lt;exactly&gt; as entered\n\n## Notes',
+        [
+          '## Session Description',
+          '',
+          'Example:',
+          '````markdown',
+          '~~~text',
+          '## Notes',
+          '~~~',
+          '````',
+          '',
+          'This remains part of the description.',
+          '',
+          '## Notes',
+        ].join('\n')
+      );
+
+    expect(parseSessionMarkdown(markdown)).toMatchObject({
+      ok: true,
+      session: {
+        description: [
+          'Example:',
+          '````markdown',
+          '~~~text',
+          '## Notes',
+          '~~~',
+          '````',
+          '',
+          'This remains part of the description.',
+        ].join('\n'),
+        notes: 'Use the inside grip next time.',
+      },
+    });
+  });
+
   it('does not re-escape text in legacy MatMetrics Markdown without a Keiko payload', () => {
     const markdown = keikoMarkdown().replace(
       /keikoBackupVersion: 1\nkeikoTextPayload: .*\n/,
@@ -237,6 +276,24 @@ describe('GitHub session Markdown', () => {
     expect(result.changed).toBe(false);
     expect(result.errors).toContain('Invalid Keiko backup text payload');
     expect(result.markdown).toBe(markdown);
+  });
+
+  it.each([
+    ['an array', []],
+    ['a payload without techniques', { description: 'missing techniques' }],
+    ['non-string techniques', { techniques: ['grip', 4] }],
+    ['a non-string description', { techniques: [], description: 4 }],
+    ['non-string notes', { techniques: [], notes: null }],
+  ])('rejects a Keiko text payload with %s', (_description, payload) => {
+    const markdown = keikoMarkdown().replace(
+      'keikoTextPayload: ' + JSON.stringify(JSON.stringify(originalText)),
+      'keikoTextPayload: ' + JSON.stringify(JSON.stringify(payload))
+    );
+
+    expect(parseSessionMarkdown(markdown)).toMatchObject({
+      ok: false,
+      errors: ['Invalid Keiko backup text payload'],
+    });
   });
 
   it.each([

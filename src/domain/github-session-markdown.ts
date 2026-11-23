@@ -96,56 +96,88 @@ function splitDocument(markdown: string): MarkdownDocument {
   return { frontmatter, body: normalized.slice(end + 5) };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isKeikoTextPayload(value: unknown): value is KeikoTextPayload {
+  return isRecord(value) &&
+    Array.isArray(value.techniques) &&
+    value.techniques.every((technique) => typeof technique === 'string') &&
+    (value.description === undefined || typeof value.description === 'string') &&
+    (value.notes === undefined || typeof value.notes === 'string');
+}
+
+function parseKeikoTextPayload(raw: string): KeikoTextPayload {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error('Invalid Keiko backup text payload');
+  }
+  if (!isKeikoTextPayload(value)) throw new Error('Invalid Keiko backup text payload');
+  return {
+    techniques: value.techniques,
+    ...(value.description === undefined ? {} : { description: value.description }),
+    ...(value.notes === undefined ? {} : { notes: value.notes }),
+  };
+}
+
 function recoverTextPayload(frontmatter: Frontmatter): KeikoTextPayload | undefined {
   const version = frontmatter.get('keikoBackupVersion');
+  const raw = frontmatter.get('keikoTextPayload');
   if (version === undefined) {
     if (frontmatter.has('keikoTextPayload')) throw new Error('Invalid Keiko backup text payload');
     return undefined;
   }
-  const raw = frontmatter.get('keikoTextPayload');
-  if (version !== 1 || typeof raw !== 'string') throw new Error('Invalid Keiko backup text payload');
-  let payload: unknown;
-  try {
-    payload = JSON.parse(raw) as unknown;
-  } catch {
+  if (version !== 1 || typeof raw !== 'string') {
     throw new Error('Invalid Keiko backup text payload');
   }
-  if (
-    !payload || typeof payload !== 'object' || Array.isArray(payload) ||
-    !('techniques' in payload) || !Array.isArray(payload.techniques) ||
-    !payload.techniques.every((value) => typeof value === 'string') ||
-    ('description' in payload && typeof payload.description !== 'string') ||
-    ('notes' in payload && typeof payload.notes !== 'string')
-  ) throw new Error('Invalid Keiko backup text payload');
-  const value = payload as Record<string, unknown>;
-  return {
-    techniques: value.techniques as string[],
-    ...(typeof value.description === 'string' ? { description: value.description } : {}),
-    ...(typeof value.notes === 'string' ? { notes: value.notes } : {}),
-  };
+  return parseKeikoTextPayload(raw);
 }
 
-function isFence(line: string): boolean {
-  const trimmed = line.trimStart();
-  return trimmed.startsWith('```') || trimmed.startsWith('~~~');
+type FenceState = { marker: '`' | '~'; length: number };
+
+function fenceAtLine(line: string): FenceState | undefined {
+  const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!match) return undefined;
+  const delimiter = match[1]!;
+  const marker = delimiter[0] as FenceState['marker'];
+  const info = match[2]!;
+  if (marker === '`' && info.includes('`')) return undefined;
+  return { marker, length: delimiter.length };
+}
+
+function advanceFence(line: string, current: FenceState | undefined): FenceState | undefined {
+  const candidate = fenceAtLine(line);
+  if (!current) return candidate;
+  if (!candidate || candidate.marker !== current.marker || candidate.length < current.length) {
+    return current;
+  }
+  const suffix = line.trimStart().slice(candidate.length);
+  return suffix.trim() === '' ? undefined : current;
 }
 
 function sectionBody(body: string, heading: string): string {
   const lines = body.replace(/\r\n?/g, '\n').split('\n');
-  let inFence = false;
+  let fence: FenceState | undefined;
   let start = -1;
   for (let i = 0; i < lines.length; i += 1) {
-    if (isFence(lines[i]!)) { inFence = !inFence; continue; }
-    if (!inFence && lines[i] === `## ${heading}`) { start = i + 1; break; }
+    const wasInFence = fence !== undefined;
+    fence = advanceFence(lines[i]!, fence);
+    if (wasInFence || fence) continue;
+    if (lines[i] === `## ${heading}`) { start = i + 1; break; }
   }
   if (start < 0) return '';
   if (lines[start] === '') start += 1;
-  inFence = false;
+  fence = undefined;
   const result: string[] = [];
   for (let i = start; i < lines.length; i += 1) {
     const line = lines[i]!;
-    if (isFence(line)) { inFence = !inFence; result.push(line); continue; }
-    if (!inFence && REQUIRED_SECTIONS.some((name) => name !== heading && line === `## ${name}`)) break;
+    const wasInFence = fence !== undefined;
+    fence = advanceFence(line, fence);
+    if (wasInFence || fence) { result.push(line); continue; }
+    if (REQUIRED_SECTIONS.some((name) => name !== heading && line === `## ${name}`)) break;
     result.push(line);
   }
   return result.join('\n').replace(/\n+$/, '');
@@ -171,10 +203,12 @@ function firstTitle(body: string): string | undefined {
 
 function validateRequiredSections(body: string): string[] {
   const found = new Set<string>();
-  let inFence = false;
+  let fence: FenceState | undefined;
   for (const line of body.replace(/\r\n?/g, '\n').split('\n')) {
-    if (isFence(line)) { inFence = !inFence; continue; }
-    if (!inFence && REQUIRED_SECTIONS.some((heading) => line === `## ${heading}`)) {
+    const wasInFence = fence !== undefined;
+    fence = advanceFence(line, fence);
+    if (wasInFence || fence) continue;
+    if (REQUIRED_SECTIONS.some((heading) => line === `## ${heading}`)) {
       found.add(line.slice(3));
     }
   }
@@ -185,11 +219,12 @@ function validateRequiredSections(body: string): string[] {
 function orderedBody(body: string): string {
   const lines = body.replace(/\r\n?/g, '\n').split('\n');
   const sectionIndexes = new Map<string, number>();
-  let inFence = false;
+  let fence: FenceState | undefined;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
-    if (isFence(line)) { inFence = !inFence; continue; }
-    if (inFence || !REQUIRED_SECTIONS.some((heading) => line === `## ${heading}`)) continue;
+    const wasInFence = fence !== undefined;
+    fence = advanceFence(line, fence);
+    if (wasInFence || fence || !REQUIRED_SECTIONS.some((heading) => line === `## ${heading}`)) continue;
     const heading = line.slice(3);
     if (sectionIndexes.has(heading)) throw new Error(`markdown contains a duplicate required section: ${heading}`);
     sectionIndexes.set(heading, index);
