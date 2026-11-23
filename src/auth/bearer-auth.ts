@@ -82,35 +82,45 @@ function isJwksUnavailable(error: unknown): boolean {
   );
 }
 
-function validatePayload(
-  payload: JWTPayload,
-  requiredScope: RequiredScope
-): AuthenticatedUser {
+function hasValidIdentity(
+  payload: JWTPayload
+): payload is JWTPayload & { sub: string; appUserId: string } {
   const appUserId = payload.appUserId;
-  if (
+  return !(
     typeof payload.sub !== 'string' ||
     payload.sub.length === 0 ||
     typeof appUserId !== 'string' ||
     appUserId.length === 0 ||
     payload.sub !== appUserId
-  ) {
-    throw new AuthFailure('unauthorized', 'Invalid access token');
-  }
+  );
+}
 
-  if (
+function hasValidLifetime(payload: JWTPayload): boolean {
+  return !(
     typeof payload.iat !== 'number' ||
     typeof payload.exp !== 'number' ||
     payload.exp <= payload.iat ||
     payload.exp - payload.iat > 300
-  ) {
+  );
+}
+
+function hasRequiredScope(payload: JWTPayload, requiredScope: RequiredScope): boolean {
+  if (typeof payload.scope !== 'string') return false;
+  const scopes = new Set(payload.scope.split(/\s+/).filter(Boolean));
+  return scopes.has(requiredScope);
+}
+
+function validatePayload(
+  payload: JWTPayload,
+  requiredScope: RequiredScope
+): AuthenticatedUser {
+  if (!hasValidIdentity(payload) || !hasValidLifetime(payload)) {
     throw new AuthFailure('unauthorized', 'Invalid access token');
   }
-
   if (typeof payload.scope !== 'string') {
     throw new AuthFailure('unauthorized', 'Invalid access token');
   }
-  const scopes = new Set(payload.scope.split(/\s+/).filter(Boolean));
-  if (!scopes.has(requiredScope)) {
+  if (!hasRequiredScope(payload, requiredScope)) {
     throw new AuthFailure('forbidden', 'The token does not grant this operation');
   }
 

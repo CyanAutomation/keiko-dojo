@@ -158,19 +158,20 @@ function advanceFence(line: string, current: FenceState | undefined): FenceState
   return suffix.trim() === '' ? undefined : current;
 }
 
-function sectionBody(body: string, heading: string): string {
-  const lines = body.replace(/\r\n?/g, '\n').split('\n');
+function sectionStart(lines: string[], heading: string): number {
   let fence: FenceState | undefined;
-  let start = -1;
   for (let i = 0; i < lines.length; i += 1) {
     const wasInFence = fence !== undefined;
     fence = advanceFence(lines[i]!, fence);
     if (wasInFence || fence) continue;
-    if (lines[i] === `## ${heading}`) { start = i + 1; break; }
+    if (lines[i] === `## ${heading}`) return i + 1;
   }
-  if (start < 0) return '';
+  return -1;
+}
+
+function readSectionBody(lines: string[], start: number, heading: string): string {
   if (lines[start] === '') start += 1;
-  fence = undefined;
+  let fence: FenceState | undefined;
   const result: string[] = [];
   for (let i = start; i < lines.length; i += 1) {
     const line = lines[i]!;
@@ -181,6 +182,12 @@ function sectionBody(body: string, heading: string): string {
     result.push(line);
   }
   return result.join('\n').replace(/\n+$/, '');
+}
+
+function sectionBody(body: string, heading: string): string {
+  const lines = body.replace(/\r\n?/g, '\n').split('\n');
+  const start = sectionStart(lines, heading);
+  return start < 0 ? '' : readSectionBody(lines, start, heading);
 }
 
 function extractTechniques(body: string): string[] {
