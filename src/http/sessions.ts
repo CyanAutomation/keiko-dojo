@@ -13,7 +13,7 @@ import {
   SessionRevisionConflictError,
   SessionService,
 } from '../application/session-service';
-import { isValidIdempotencyKey } from '../domain/idempotency';
+import { isValidIdempotencyKey, MAX_IDEMPOTENCY_KEY_LENGTH } from '../domain/idempotency';
 import type { SessionRecord } from '../domain/session';
 import { authFailureResponse } from './auth-errors';
 import { jsonError, jsonResponse } from './responses';
@@ -86,28 +86,46 @@ function parsePageSize(value: string | null): number | null {
   return Number.isSafeInteger(size) && size <= MAX_PAGE_SIZE ? size : null;
 }
 
-function readListFilters(url: URL) {
-  const limit = parsePageSize(url.searchParams.get('limit'));
-  if (limit === null) return null;
-
+function readDateRange(url: URL): { from?: string; to?: string } | null {
   const from = url.searchParams.get('from') ?? undefined;
   const to = url.searchParams.get('to') ?? undefined;
   if ((from && !isValidDate(from)) || (to && !isValidDate(to))) return null;
   if (from && to && from > to) return null;
+  return { from, to };
+}
 
+function readCategoryFilter(url: URL): string | undefined | null {
   const category = url.searchParams.get('category') ?? undefined;
   if (category && !isSessionCategory(category)) return null;
+  return category;
+}
 
+function readEffortFilter(url: URL): number | undefined | null {
   const rawEffort = url.searchParams.get('effort');
-  let effort: number | undefined;
-  if (rawEffort !== null) {
-    if (!/^[1-5]$/.test(rawEffort)) return null;
-    effort = Number(rawEffort);
-  }
+  if (rawEffort === null) return undefined;
+  if (!/^[1-5]$/.test(rawEffort)) return null;
+  return Number(rawEffort);
+}
 
+function readCursorFilter(url: URL): string | undefined | null {
   const cursor = url.searchParams.get('cursor') ?? undefined;
   if (cursor && cursor.length > 512) return null;
-  return { limit, from, to, category, effort, cursor };
+  return cursor;
+}
+
+function readListFilters(url: URL) {
+  const limit = parsePageSize(url.searchParams.get('limit'));
+  if (limit === null) return null;
+
+  const dateRange = readDateRange(url);
+  if (!dateRange) return null;
+  const category = readCategoryFilter(url);
+  if (category === null) return null;
+  const effort = readEffortFilter(url);
+  if (effort === null) return null;
+  const cursor = readCursorFilter(url);
+  if (cursor === null) return null;
+  return { limit, ...dateRange, category, effort, cursor };
 }
 
 async function parseExpectedRevision(request: Request, userId: string): Promise<
@@ -187,6 +205,32 @@ async function recordResponse(
   return jsonResponse({ data: record }, status, headers);
 }
 
+function createSessionErrorResponse(
+  error: unknown,
+  requestId: string,
+  idempotencyKey: string | null,
+  logIdempotencyOutcome: (outcome: string) => void
+): Response | undefined {
+  if (error instanceof IdempotencyKeyReuseError) {
+    return jsonError(
+      requestId,
+      409,
+      'idempotency_key_reuse',
+      'Idempotency-Key was already used with a different session payload'
+    );
+  }
+  if (error instanceof SessionAlreadyExistsError) {
+    if (idempotencyKey !== null) logIdempotencyOutcome('session_conflict');
+    return jsonError(requestId, 409, 'session_conflict', 'Session ID already exists');
+  }
+  if (error instanceof InvalidSessionError) {
+    if (idempotencyKey !== null) logIdempotencyOutcome('validation_failure');
+    return jsonError(requestId, 400, error.code, error.message);
+  }
+  if (idempotencyKey !== null) logIdempotencyOutcome('database_failure');
+  return undefined;
+}
+
 async function listSessions(
   url: URL,
   userId: string,
@@ -228,7 +272,7 @@ async function createSession(
       requestId,
       400,
       'bad_request',
-      'Idempotency-Key must contain 1 to 128 ASCII letters, digits, periods, underscores, tildes, or hyphens'
+      `Idempotency-Key must contain 1 to ${MAX_IDEMPOTENCY_KEY_LENGTH} ASCII letters, digits, periods, underscores, tildes, or hyphens`
     );
   }
 
@@ -249,23 +293,13 @@ async function createSession(
       201
     );
   } catch (error) {
-    if (error instanceof IdempotencyKeyReuseError) {
-      return jsonError(
-        requestId,
-        409,
-        'idempotency_key_reuse',
-        'Idempotency-Key was already used with a different session payload'
-      );
-    }
-    if (error instanceof SessionAlreadyExistsError) {
-      if (idempotencyKey !== null) logIdempotencyOutcome('session_conflict');
-      return jsonError(requestId, 409, 'session_conflict', 'Session ID already exists');
-    }
-    if (error instanceof InvalidSessionError) {
-      if (idempotencyKey !== null) logIdempotencyOutcome('validation_failure');
-      return jsonError(requestId, 400, error.code, error.message);
-    }
-    if (idempotencyKey !== null) logIdempotencyOutcome('database_failure');
+    const response = createSessionErrorResponse(
+      error,
+      requestId,
+      idempotencyKey,
+      logIdempotencyOutcome
+    );
+    if (response) return response;
     throw error;
   }
 }

@@ -181,6 +181,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function validateOptionalTextFields(
+  payload: Record<string, unknown>
+): { ok: true; value: Pick<JudoSession, 'description' | 'notes'> } | { ok: false; error: string } {
+  const description = payload.description;
+  if (description !== undefined && typeof description !== 'string') {
+    return { ok: false, error: 'Invalid description: expected a string' };
+  }
+  const notes = payload.notes;
+  if (notes !== undefined && typeof notes !== 'string') {
+    return { ok: false, error: 'Invalid notes: expected a string' };
+  }
+  return {
+    ok: true,
+    value: {
+      ...(description === undefined ? {} : { description }),
+      ...(notes === undefined ? {} : { notes }),
+    },
+  };
+}
+
+function validateDuration(
+  value: unknown
+): { ok: true; value?: number } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true };
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    return { ok: false, error: 'Invalid duration: expected a non-negative integer' };
+  }
+  return { ok: true, value };
+}
+
 export function validateSessionPayload(
   payload: Record<string, unknown>,
   options: { routeId?: string; generateIdWhenMissing: boolean }
@@ -211,27 +241,14 @@ export function validateSessionPayload(
   const techniquesResult = validateTechniques(payload.techniques);
   if (!techniquesResult.ok) return techniquesResult;
 
-  if (payload.description !== undefined && typeof payload.description !== 'string') {
-    return { ok: false, error: 'Invalid description: expected a string' };
-  }
-  if (payload.notes !== undefined && typeof payload.notes !== 'string') {
-    return { ok: false, error: 'Invalid notes: expected a string' };
-  }
+  const textFieldsResult = validateOptionalTextFields(payload);
+  if (!textFieldsResult.ok) return textFieldsResult;
 
   const videoUrlResult = validateVideoUrl(payload.videoUrl);
   if (!videoUrlResult.ok) return videoUrlResult;
 
-  if (
-    payload.duration !== undefined &&
-    (typeof payload.duration !== 'number' ||
-      !Number.isInteger(payload.duration) ||
-      payload.duration < 0)
-  ) {
-    return {
-      ok: false,
-      error: 'Invalid duration: expected a non-negative integer',
-    };
-  }
+  const durationResult = validateDuration(payload.duration);
+  if (!durationResult.ok) return durationResult;
 
   return {
     ok: true,
@@ -241,15 +258,12 @@ export function validateSessionPayload(
       effort: payload.effort,
       category: payload.category,
       techniques: techniquesResult.techniques,
-      ...(payload.description !== undefined
-        ? { description: payload.description }
-        : {}),
-      ...(payload.notes !== undefined ? { notes: payload.notes } : {}),
+      ...textFieldsResult.value,
       ...(videoUrlResult.value !== undefined
         ? { videoUrl: videoUrlResult.value }
         : {}),
-      ...(payload.duration !== undefined
-        ? { duration: payload.duration }
+      ...(durationResult.value !== undefined
+        ? { duration: durationResult.value }
         : {}),
     },
   };

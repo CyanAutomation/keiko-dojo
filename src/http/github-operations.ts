@@ -5,6 +5,7 @@ import {
   parseSessionMarkdown,
 } from '../domain/github-session-markdown';
 import { isJsonObject } from '../domain/session';
+import type { GitHubInstallation } from '../domain/github-installation';
 import {
   checkSelectedGitHubRepository,
   listSelectedGitHubSessionMarkdown,
@@ -34,14 +35,6 @@ type OperationJob = {
   created_at: string;
   updated_at: string;
 };
-type Installation = {
-  user_id: string;
-  installation_id: number;
-  repository_owner: string;
-  repository_name: string;
-  repository_id: number;
-};
-
 const MAX_FIX_FILES = 25;
 
 async function bodyObject(request: Request, requestId: string): Promise<Record<string, unknown> | Response> {
@@ -84,11 +77,11 @@ function jobResponse(job: OperationJob): Record<string, unknown> {
   };
 }
 
-async function connectedInstallation(userId: string, env: Env): Promise<Installation | null> {
+async function connectedInstallation(userId: string, env: Env): Promise<GitHubInstallation | null> {
   return env.DB.prepare(
     `SELECT user_id, installation_id, repository_owner, repository_name, repository_id
      FROM github_installations WHERE user_id = ? AND revoked_at IS NULL`
-  ).bind(userId).first<Installation>();
+  ).bind(userId).first<GitHubInstallation>();
 }
 
 async function enqueueOperation(
@@ -122,19 +115,27 @@ async function enqueueOperation(
   return jsonResponse(job ? jobResponse(job) : { id, type, status: 'queued', createdAt: now, updatedAt: now, attempts: 0 }, 202);
 }
 
+function validFixPaths(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_FIX_FILES) return false;
+  return value.every((path) => typeof path === 'string' && isSafeSessionMarkdownPath(path)) &&
+    new Set(value).size === value.length;
+}
+
+function validFixOptions(options: unknown): boolean {
+  if (options === undefined) return true;
+  return isJsonObject(options) &&
+    exactKeys(options, ['normalizeFrontmatter', 'enforceSectionOrder', 'preserveUserContent']) &&
+    Object.values(options).every((value) => value === true);
+}
+
 function validateFixPayload(body: Record<string, unknown>): GitHubFixPayload | null {
   const branch = readBranch(body);
   if (branch === null || !exactKeys(body, ['branch', 'mode', 'paths', 'confirmApply', 'options'])) return null;
   if (body.mode !== 'dry-run' && body.mode !== 'apply') return null;
-  if (!Array.isArray(body.paths) || body.paths.length < 1 || body.paths.length > MAX_FIX_FILES ||
-      !body.paths.every((path) => typeof path === 'string' && isSafeSessionMarkdownPath(path))) return null;
-  if (new Set(body.paths).size !== body.paths.length) return null;
+  if (!validFixPaths(body.paths)) return null;
   if (body.mode === 'apply' ? body.confirmApply !== true : body.confirmApply === true) return null;
-  if (body.options !== undefined) {
-    if (!isJsonObject(body.options) || !exactKeys(body.options, ['normalizeFrontmatter', 'enforceSectionOrder', 'preserveUserContent']) ||
-        Object.values(body.options).some((value) => value !== true)) return null;
-  }
-  return { ...(branch ? { branch } : {}), mode: body.mode, paths: body.paths as string[] };
+  if (!validFixOptions(body.options)) return null;
+  return { ...(branch ? { branch } : {}), mode: body.mode, paths: body.paths };
 }
 
 async function createSyncJob(request: Request, env: Env, requestId: string): Promise<Response> {
@@ -290,7 +291,7 @@ function simpleDiff(path: string, original: string, updated: string): string {
 
 async function runFix(
   env: Env,
-  installation: Installation,
+  installation: GitHubInstallation,
   payload: GitHubFixPayload
 ): Promise<Record<string, unknown>> {
   const listed = await listSelectedGitHubSessionMarkdown(env, installation, payload.branch);
@@ -334,7 +335,7 @@ async function runFix(
 
 async function processOperation(
   job: OperationJob,
-  installation: Installation,
+  installation: GitHubInstallation,
   env: Env
 ): Promise<unknown> {
   const payload = JSON.parse(job.payload) as Record<string, unknown>;

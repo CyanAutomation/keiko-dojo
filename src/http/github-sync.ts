@@ -1,5 +1,6 @@
 import type { GitHubSessionSyncMessage } from '../application/github-session-sync-queue';
 import { dispatchGitHubSessionSync } from '../application/github-session-sync-queue';
+import type { GitHubInstallation } from '../domain/github-installation';
 import {
   githubSessionMarkdownPathForRow,
   isKeikoSessionMarkdownPath,
@@ -20,13 +21,6 @@ type SyncState = {
   next_sync_at: string;
   wake_enqueued: number;
   lease_token: string | null;
-};
-type Installation = {
-  user_id: string;
-  installation_id: number;
-  repository_owner: string;
-  repository_name: string;
-  repository_id: number;
 };
 type SyncItem = { session_id: string; generation: number };
 type SyncedFile = { session_id: string; path: string; revision: number };
@@ -146,7 +140,7 @@ type SyncBatch = {
 async function loadSyncBatch(
   env: Env,
   userId: string,
-  installation: Installation,
+  installation: GitHubInstallation,
   generation: number,
   fullSync: boolean,
   fullSyncCursor: number,
@@ -242,7 +236,7 @@ async function clearProcessedItems(
 async function syncAndPersistBatch(
   env: Env,
   userId: string,
-  installation: Installation,
+  installation: GitHubInstallation,
   generation: number,
   batch: SyncBatch
 ): Promise<Array<{ id: string; path: string; revision: number }>> {
@@ -372,9 +366,9 @@ async function handleSyncFailure(
   }
 }
 
-type SyncContext = { installation: Installation | null; state: SyncState | null };
+type SyncContext = { installation: GitHubInstallation | null; state: SyncState | null };
 type PreparedSync = {
-  installation: Installation;
+  installation: GitHubInstallation;
   repositoryId: number;
   generation: number;
   fullSync: boolean;
@@ -388,7 +382,7 @@ async function readSyncContext(env: Env, userId: string): Promise<SyncContext> {
   const installation = await env.DB.prepare(
     `SELECT user_id, installation_id, repository_owner, repository_name, repository_id
      FROM github_installations WHERE user_id = ? AND revoked_at IS NULL`
-  ).bind(userId).first<Installation>();
+  ).bind(userId).first<GitHubInstallation>();
   const state = await env.DB.prepare(
     `SELECT user_id, repository_id, generation, full_sync_required, next_sync_at,
        full_sync_cursor, full_sync_cursor_generation, full_sync_delete_cursor,
@@ -403,7 +397,7 @@ async function handleMissingSyncContext(
   message: Message<GitHubSessionSyncMessage>,
   userId: string,
   operationId: string | undefined,
-  installation: Installation | null
+  installation: GitHubInstallation | null
 ): Promise<void> {
   if (operationId) {
     await setOperationStatus(env, operationId, userId, 'failed', undefined,

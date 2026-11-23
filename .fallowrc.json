@@ -1,4 +1,8 @@
 {
   "$schema": "./node_modules/fallow/schema.json",
-  "ignorePatterns": ["worker-configuration.d.ts"]
+  "ignorePatterns": ["worker-configuration.d.ts"],
+  "ignoreBinaries": ["openapi-typescript"],
+  "duplicates": {
+    "ignore": ["contracts/keiko-api.generated.ts"]
+  }
 }
