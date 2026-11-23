@@ -1,5 +1,6 @@
 import type { GitHubSessionSyncMessage } from '../application/github-session-sync-queue';
 import { dispatchGitHubSessionSync } from '../application/github-session-sync-queue';
+import { updateGitHubSyncOperationStatus } from '../application/github-operation-jobs';
 import type { GitHubInstallation } from '../domain/github-installation';
 import {
   githubSessionMarkdownPathForRow,
@@ -75,25 +76,6 @@ async function upsertSyncedFiles(
   if (statements.length) await env.DB.batch(statements);
 }
 
-async function setOperationStatus(
-  env: Env,
-  operationId: string | undefined,
-  userId: string,
-  status: 'running' | 'completed' | 'failed' | 'queued',
-  result?: Record<string, unknown>,
-  error?: string
-): Promise<void> {
-  if (!operationId) return;
-  const now = new Date().toISOString();
-  await env.DB.prepare(
-    `UPDATE github_operation_jobs SET status = ?, result = ?, error_message = ?,
-       attempts = CASE WHEN ? = 'running' THEN attempts + 1 ELSE attempts END,
-       updated_at = ?, completed_at = ?
-     WHERE id = ? AND user_id = ? AND type = 'github-sync-all'`
-  ).bind(status, result ? JSON.stringify(result) : null, error ?? null, status,
-    now, status === 'completed' || status === 'failed' ? now : null, operationId, userId).run();
-}
-
 async function completeNoop(
   env: Env,
   userId: string,
@@ -120,7 +102,7 @@ async function completeNoop(
     await dispatchGitHubSessionSync(env, userId);
     return;
   }
-  await setOperationStatus(env, operationId, userId, 'completed', {
+  await updateGitHubSyncOperationStatus(env, operationId, userId, 'completed', {
     success: true, message: 'GitHub Markdown is already in sync.', sessionCount: 0,
   });
 }
@@ -319,7 +301,7 @@ async function enqueueFullSyncContinuation(
        WHERE user_id = ? AND lease_token = ?`
     ).bind(userId, leaseToken).run();
   }
-  await setOperationStatus(env, operationId, userId, 'queued');
+  await updateGitHubSyncOperationStatus(env, operationId, userId, 'queued');
   return dispatchGitHubSessionSync(env, userId, {
     immediate: true,
     operationId,
@@ -343,7 +325,7 @@ async function handleSyncFailure(
            last_error = 'session_limit_exceeded'
        WHERE user_id = ? AND (? IS NULL OR lease_token = ?)`
     ).bind(userId, leaseToken, leaseToken).run();
-    await setOperationStatus(env, operationId, userId, 'failed', undefined, 'session_limit_exceeded');
+    await updateGitHubSyncOperationStatus(env, operationId, userId, 'failed', undefined, 'session_limit_exceeded');
     message.ack();
     return;
   }
@@ -356,7 +338,7 @@ async function handleSyncFailure(
      WHERE user_id = ? AND (? IS NULL OR lease_token = ?)`
   ).bind(new Date(Date.now() + 60_000).toISOString(), userId, leaseToken, leaseToken).run();
   const terminal = message.attempts >= 5;
-  await setOperationStatus(env, operationId, userId,
+  await updateGitHubSyncOperationStatus(env, operationId, userId,
     terminal ? 'failed' : 'queued', undefined, terminal ? 'github_sync_failed' : undefined);
   if (terminal) {
     message.ack();
@@ -400,7 +382,7 @@ async function handleMissingSyncContext(
   installation: GitHubInstallation | null
 ): Promise<void> {
   if (operationId) {
-    await setOperationStatus(env, operationId, userId, 'failed', undefined,
+    await updateGitHubSyncOperationStatus(env, operationId, userId, 'failed', undefined,
       installation ? 'sync_state_missing' : 'github_connection_missing');
   }
   message.ack();
@@ -426,7 +408,7 @@ async function handleUnavailableLease(
   operationId: string | undefined
 ): Promise<void> {
   if (operationId) {
-    await setOperationStatus(env, operationId, userId, 'queued');
+    await updateGitHubSyncOperationStatus(env, operationId, userId, 'queued');
     message.retry({ delaySeconds: 15 });
     return;
   }
@@ -502,7 +484,7 @@ export async function processGitHubSessionSyncMessage(
   try {
     const prepared = await prepareSync(env, message, now, userId, operationId, leaseRef);
     if (!prepared) return;
-    await setOperationStatus(env, operationId, userId, 'running');
+    await updateGitHubSyncOperationStatus(env, operationId, userId, 'running');
     if (prepared.installation.repository_id !== prepared.repositoryId) {
       throw new Error('GitHub repository changed during sync');
     }
@@ -547,13 +529,13 @@ export async function processGitHubSessionSyncMessage(
          WHERE user_id = ? AND repository_id = ?`
       ).bind(userId, prepared.repositoryId).first<{ session_count: number }>();
       const sessionCount = manifest?.session_count ?? synced.length;
-      await setOperationStatus(env, operationId, userId, 'completed', {
+      await updateGitHubSyncOperationStatus(env, operationId, userId, 'completed', {
         success: true,
         message: `Synced ${sessionCount} training session(s) to GitHub Markdown.`,
         sessionCount,
       });
     } else {
-      await setOperationStatus(env, operationId, userId, 'queued');
+      await updateGitHubSyncOperationStatus(env, operationId, userId, 'queued');
       await dispatchGitHubSessionSync(env, userId, { operationId });
     }
     message.ack();

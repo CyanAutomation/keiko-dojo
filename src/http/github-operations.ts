@@ -7,6 +7,12 @@ import {
 import { isJsonObject } from '../domain/session';
 import type { GitHubInstallation } from '../domain/github-installation';
 import {
+  updateGitHubOperationStatus,
+  type GitHubOperationJob,
+  type GitHubOperationMessage,
+  type GitHubOperationType,
+} from '../application/github-operation-jobs';
+import {
   checkSelectedGitHubRepository,
   listSelectedGitHubSessionMarkdown,
   updateSelectedGitHubMarkdown,
@@ -16,24 +22,10 @@ import { authFailureResponse } from './auth-errors';
 import { readJsonBodyLimited } from './request-body';
 import { jsonError, jsonResponse } from './responses';
 
-type GitHubOperationType = 'github-health' | 'log-doctor-scan' | 'log-doctor-fix' | 'github-sync-all';
 type GitHubFixPayload = {
   branch?: string;
   mode: 'dry-run' | 'apply';
   paths: string[];
-};
-type GitHubOperationMessage = { kind: 'github-operation'; jobId: string; userId: string };
-type OperationJob = {
-  id: string;
-  user_id: string;
-  type: GitHubOperationType;
-  status: 'queued' | 'running' | 'completed' | 'failed';
-  payload: string;
-  result: string | null;
-  error_message: string | null;
-  attempts: number;
-  created_at: string;
-  updated_at: string;
 };
 const MAX_FIX_FILES = 25;
 
@@ -60,7 +52,7 @@ function readBranch(body: Record<string, unknown>): string | undefined | null {
   return branch;
 }
 
-function jobResponse(job: OperationJob): Record<string, unknown> {
+function jobResponse(job: GitHubOperationJob): Record<string, unknown> {
   let result: unknown;
   if (job.result !== null) {
     try { result = JSON.parse(job.result) as unknown; } catch { result = undefined; }
@@ -111,7 +103,7 @@ async function enqueueOperation(
   const job = await env.DB.prepare(
     `SELECT id, user_id, type, status, payload, result, error_message, attempts, created_at, updated_at
      FROM github_operation_jobs WHERE id = ? AND user_id = ?`
-  ).bind(id, userId).first<OperationJob>();
+  ).bind(id, userId).first<GitHubOperationJob>();
   return jsonResponse(job ? jobResponse(job) : { id, type, status: 'queued', createdAt: now, updatedAt: now, attempts: 0 }, 202);
 }
 
@@ -128,14 +120,23 @@ function validFixOptions(options: unknown): boolean {
     Object.values(options).every((value) => value === true);
 }
 
+function fixMode(value: unknown): GitHubFixPayload['mode'] | null {
+  return value === 'dry-run' || value === 'apply' ? value : null;
+}
+
+function validFixConfirmation(mode: GitHubFixPayload['mode'], value: unknown): boolean {
+  return mode === 'apply' ? value === true : value !== true;
+}
+
 function validateFixPayload(body: Record<string, unknown>): GitHubFixPayload | null {
+  if (!exactKeys(body, ['branch', 'mode', 'paths', 'confirmApply', 'options'])) return null;
+
   const branch = readBranch(body);
-  if (branch === null || !exactKeys(body, ['branch', 'mode', 'paths', 'confirmApply', 'options'])) return null;
-  if (body.mode !== 'dry-run' && body.mode !== 'apply') return null;
-  if (!validFixPaths(body.paths)) return null;
-  if (body.mode === 'apply' ? body.confirmApply !== true : body.confirmApply === true) return null;
+  const mode = fixMode(body.mode);
+  if (branch === null || !mode) return null;
+  if (!validFixPaths(body.paths) || !validFixConfirmation(mode, body.confirmApply)) return null;
   if (!validFixOptions(body.options)) return null;
-  return { ...(branch ? { branch } : {}), mode: body.mode, paths: body.paths };
+  return { ...(branch ? { branch } : {}), mode, paths: body.paths };
 }
 
 async function createSyncJob(request: Request, env: Env, requestId: string): Promise<Response> {
@@ -191,7 +192,7 @@ async function getJob(request: Request, env: Env, jobId: string, requestId: stri
   const job = await env.DB.prepare(
     `SELECT id, user_id, type, status, payload, result, error_message, attempts, created_at, updated_at
      FROM github_operation_jobs WHERE id = ? AND user_id = ?`
-  ).bind(jobId, principal.userId).first<OperationJob>();
+  ).bind(jobId, principal.userId).first<GitHubOperationJob>();
   return job ? jsonResponse(jobResponse(job)) : jsonError(requestId, 404, 'not_found', 'GitHub job not found');
 }
 
@@ -334,7 +335,7 @@ async function runFix(
 }
 
 async function processOperation(
-  job: OperationJob,
+  job: GitHubOperationJob,
   installation: GitHubInstallation,
   env: Env
 ): Promise<unknown> {
@@ -376,31 +377,31 @@ export async function processGitHubOperationMessage(
   const job = await env.DB.prepare(
     `SELECT id, user_id, type, status, payload, result, error_message, attempts, created_at, updated_at
      FROM github_operation_jobs WHERE id = ? AND user_id = ?`
-  ).bind(jobId, userId).first<OperationJob>();
+  ).bind(jobId, userId).first<GitHubOperationJob>();
   if (!job || job.status === 'completed') { message.ack(); return; }
-  const now = new Date().toISOString();
-  await env.DB.prepare(
-    `UPDATE github_operation_jobs SET status = 'running', error_message = NULL, attempts = attempts + 1, updated_at = ?
-     WHERE id = ? AND user_id = ? AND status IN ('queued', 'running')`
-  ).bind(now, jobId, userId).run();
+  await updateGitHubOperationStatus(env, jobId, userId, 'running', {
+    errorMessage: null,
+    incrementAttempts: true,
+    onlyIfActive: true,
+  });
   try {
     const installation = await connectedInstallation(userId, env);
     if (!installation) throw new Error('GitHub App connection was removed');
     const result = await processOperation(job, installation, env);
-    const completedAt = new Date().toISOString();
-    await env.DB.prepare(
-      `UPDATE github_operation_jobs SET status = 'completed', result = ?, error_message = NULL, updated_at = ?, completed_at = ?
-       WHERE id = ? AND user_id = ?`
-    ).bind(JSON.stringify(result), completedAt, completedAt, jobId, userId).run();
+    await updateGitHubOperationStatus(env, jobId, userId, 'completed', {
+      result: JSON.stringify(result),
+      errorMessage: null,
+      completedAt: 'now',
+    });
     message.ack();
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'GitHub operation failed';
     const terminal = message.attempts >= 5;
-    const updatedAt = new Date().toISOString();
-    await env.DB.prepare(
-      `UPDATE github_operation_jobs SET status = ?, error_message = ?, updated_at = ?, completed_at = ?
-       WHERE id = ? AND user_id = ? AND status != 'completed'`
-    ).bind(terminal ? 'failed' : 'queued', terminal ? errorMessage : null, updatedAt, terminal ? updatedAt : null, jobId, userId).run();
+    await updateGitHubOperationStatus(env, jobId, userId, terminal ? 'failed' : 'queued', {
+      errorMessage: terminal ? errorMessage : null,
+      completedAt: terminal ? 'now' : null,
+      onlyIfNotCompleted: true,
+    });
     if (terminal) {
       message.ack();
     } else {

@@ -175,4 +175,44 @@ describe('GitHub operation routes', () => {
       await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
     }
   });
+
+  it('rejects invalid Log Doctor options, duplicate paths, and malformed branches', async () => {
+    const userId = `github-fix-shape-${crypto.randomUUID()}`;
+    const send = vi.fn(async (_message: unknown, _options?: unknown) => {});
+    const operationEnv = Object.assign(Object.create(testEnv), {
+      BACKUP_QUEUE: { send },
+    }) as Env;
+    await env.DB.prepare(
+      `INSERT INTO github_installations
+       (user_id, installation_id, repository_owner, repository_name, repository_id, granted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId, 815, 'CyanAutomation', 'fix-shape', 885, new Date().toISOString()).run();
+
+    const path = 'data/2026/10/20261024-matmetrics-session-1.md';
+    const invalidBodies = [
+      { mode: 'dry-run', paths: [path, path] },
+      { mode: 'dry-run', paths: [path], options: { preserveUserContent: false } },
+      { mode: 'dry-run', paths: [path], options: { unexpected: true } },
+      { mode: 'dry-run', paths: [path], branch: '  ' },
+      { mode: 'dry-run', paths: [path], branch: 'feature\u0000branch' },
+      { mode: 'dry-run', paths: [path], extra: true },
+      { mode: 'unknown', paths: [path] },
+    ];
+
+    try {
+      for (const body of invalidBodies) {
+        const response = await callOperation('/v1/github/log-doctor/fix', userId, 'github:write', {
+          method: 'POST', body: JSON.stringify(body),
+        }, operationEnv);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: { code: 'bad_request' } });
+      }
+      expect(send).not.toHaveBeenCalled();
+      expect(await env.DB.prepare('SELECT id FROM github_operation_jobs WHERE user_id = ?').bind(userId).all())
+        .toMatchObject({ results: [] });
+    } finally {
+      await env.DB.prepare('DELETE FROM github_operation_jobs WHERE user_id = ?').bind(userId).run();
+      await env.DB.prepare('DELETE FROM github_installations WHERE user_id = ?').bind(userId).run();
+    }
+  });
 });

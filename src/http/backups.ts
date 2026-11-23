@@ -200,13 +200,45 @@ async function revokeGitHubInstallation(request: Request, env: Env): Promise<Res
   return new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store' } });
 }
 
+type BackupStatusInstallation = { owner: string; repository: string };
+type BackupStatusSync = {
+  generation: number;
+  completedGeneration: number;
+  fullSyncRequired: number;
+  nextSyncAt: string;
+  lastSyncedAt: string | null;
+  lastError: string | null;
+  hasPendingItems: number;
+};
+
+function hasPendingSync(sync: BackupStatusSync | null): boolean {
+  return Boolean(sync && (
+    sync.fullSyncRequired === 1 || sync.generation > sync.completedGeneration || sync.hasPendingItems === 1
+  ));
+}
+
+function backupStatusPayload(
+  installation: BackupStatusInstallation | null,
+  sync: BackupStatusSync | null
+): Record<string, unknown> {
+  const pending = hasPendingSync(sync);
+  return {
+    configured: Boolean(installation),
+    installation: installation ?? null,
+    pending,
+    nextSyncAt: pending ? sync?.nextSyncAt ?? null : null,
+    lastSyncedAt: sync?.lastSyncedAt ?? null,
+    error: sync?.lastError ?? null,
+  };
+}
+
 async function status(request: Request, env: Env): Promise<Response> {
   const principal = await authenticateRequest(request, env, 'backups:read');
   const [installation, sync] = await Promise.all([
     env.DB.prepare(
       `SELECT repository_owner AS owner, repository_name AS repository
        FROM github_installations WHERE user_id = ? AND revoked_at IS NULL`
-    ).bind(principal.userId).first<{ owner: string; repository: string }>(),
+    ).bind(principal.userId).first<BackupStatusInstallation>(),
     env.DB.prepare(
       `SELECT state.generation, state.completed_generation AS completedGeneration,
          state.full_sync_required AS fullSyncRequired, state.next_sync_at AS nextSyncAt,
@@ -214,27 +246,9 @@ async function status(request: Request, env: Env): Promise<Response> {
          EXISTS (SELECT 1 FROM github_session_sync_items AS item WHERE item.user_id = state.user_id)
            AS hasPendingItems
        FROM github_session_sync_state AS state WHERE state.user_id = ?`
-    ).bind(principal.userId).first<{
-      generation: number;
-      completedGeneration: number;
-      fullSyncRequired: number;
-      nextSyncAt: string;
-      lastSyncedAt: string | null;
-      lastError: string | null;
-      hasPendingItems: number;
-    }>(),
+    ).bind(principal.userId).first<BackupStatusSync>(),
   ]);
-  const pending = Boolean(sync && (
-    sync.fullSyncRequired === 1 || sync.generation > sync.completedGeneration || sync.hasPendingItems === 1
-  ));
-  return jsonResponse({
-    configured: Boolean(installation),
-    installation: installation ?? null,
-    pending,
-    nextSyncAt: pending ? sync?.nextSyncAt ?? null : null,
-    lastSyncedAt: sync?.lastSyncedAt ?? null,
-    error: sync?.lastError ?? null,
-  });
+  return jsonResponse(backupStatusPayload(installation, sync));
 }
 
 export async function handleBackupRequest(

@@ -85,6 +85,29 @@ describe('backup HTTP routes', () => {
         lastSyncedAt: '2026-10-26T11:00:00.000Z',
         error: 'current-error',
       });
+
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM github_session_sync_items WHERE user_id = ?').bind(userId),
+        env.DB.prepare(
+          `UPDATE github_session_sync_state SET completed_generation = generation,
+           full_sync_required = 0, last_error = NULL WHERE user_id = ?`
+        ).bind(userId),
+      ]);
+      const idleResponse = await handleBackupRequest(
+        new Request('https://keiko.example.test/v1/backups/status', {
+          headers: { authorization: `Bearer ${statusToken}` },
+        }),
+        testEnv,
+        'backup-status-idle'
+      );
+      expect(await idleResponse.json()).toEqual({
+        configured: true,
+        installation: { owner: currentOwner, repository: currentRepository },
+        pending: false,
+        nextSyncAt: null,
+        lastSyncedAt: '2026-10-26T11:00:00.000Z',
+        error: null,
+      });
     } finally {
       await env.DB.batch([
         env.DB.prepare('DELETE FROM github_session_sync_items WHERE user_id IN (?, ?)').bind(userId, otherUserId),
