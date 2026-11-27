@@ -36,7 +36,7 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.1",
-    "@redocly/cli": "2.79.0",
+    "@redocly/cli": "2.82.0",
     "@types/node": "^26.6.6",
     "fallow": "3.42.0",
     "typescript": "7.0.2",
