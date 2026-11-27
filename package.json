@@ -35,7 +35,7 @@
     "jose": "6.2.17"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "^1.8.1",
+    "@cloudflare/vitest-plugin": "^1.8.5",
     "@redocly/cli": "2.79.0",
     "@types/node": "^26.6.6",
     "fallow": "3.42.0",
